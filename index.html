@@ -403,7 +403,7 @@ function setSyncStatus(s,msg){
 }
 function scheduleSave(){setSyncStatus('saving');clearTimeout(syncTimer);syncTimer=setTimeout(pushSave,1400)}
 async function pushSave(){
-  try{await api({action:'save',accounts,transactions,coa,activityLog,tabs,staffPayables,dsrEntries,roster,shifts,holidays,payables,kpiTargets,payrollSettings,payrollAdjustments,payrollRuns,payrollPools,auditLog,periodLocks,openingCashState,cashVarianceHistory,monthlyOpeningBalances,treasuryEvents,weeklyTargets,monthlyBudget,positions});setSyncStatus('ok')}
+  try{await api({action:'save',accounts,transactions,coa,activityLog,tabs,staffPayables,dsrEntries,roster,shifts,holidays,payables,kpiTargets,payrollSettings,payrollAdjustments,payrollRuns,payrollPools,auditLog,periodLocks,openingCashState,cashVarianceHistory,monthlyOpeningBalances,treasuryEvents,weeklyTargets,monthlyBudget,positions,cashCounts,dailyCloseSnapshots});setSyncStatus('ok')}
   catch(e){setSyncStatus('error');toast('Sync failed','error')}
 }
 
@@ -488,6 +488,8 @@ async function loadApp(){
     cashVarianceHistory=data.cashVarianceHistory||[];
     monthlyOpeningBalances=data.monthlyOpeningBalances||[];
     treasuryEvents=data.treasuryEvents||[];
+    cashCounts=Array.isArray(data.cashCounts)?data.cashCounts:[];
+    dailyCloseSnapshots=Array.isArray(data.dailyCloseSnapshots)?data.dailyCloseSnapshots:[];
     positions=(Array.isArray(data.positions)&&data.positions.length)?data.positions:getDefaultPositions();
     rebuildAccountBalances(); // derive balances from transaction history
     validateLedgerIntegrity();
@@ -1573,8 +1575,9 @@ const treasuryService={
           break;
         }
         case 'sc_paid':
-        case 'tip_paid': {
-          /* SC/Tip liability settlement — cash leaves operational pool. */
+        case 'tip_paid':
+        case 'liability_payment': {
+          /* SC/Tip settlement or liability remittance (VAT/SSS/etc) — cash leaves pool. */
           const acct=t.account||t.sourceAccountId;
           if(opIds.has(acct)) outflows+=amt;
           break;
@@ -1722,33 +1725,21 @@ const treasuryService={
     const payrollLiability=(payrollRuns||[])
       .filter(r=>r.status!=='paid')
       .reduce((s,r)=>s+(r.totalPayroll||0),0);
-    /* Outstanding liability = collected (DSR) minus paid out (payroll finalize).
-       Pre-Tier-2: only sc_collected existed → liability grew forever. Tier 2
-       adds sc_paid / tip_paid so we can compute the true outstanding balance. */
-    const scCollectedSum=(transactions||[])
-      .filter(t=>t.type==='sc_collected'&&!t.voided)
+    /* Outstanding liability = collected (DSR) minus paid out (payroll finalize)
+       minus any manual remittance (type 'liability_payment' via the Settle modal).
+       Helper sums non-voided txs of a type that reference a given liability COA. */
+    const sumTx=(typ,coaId)=>(transactions||[])
+      .filter(t=>t&&!t.voided&&t.type===typ&&t.coaId===coaId)
       .reduce((s,t)=>s+(Number(t.amount)||0),0);
-    const scPaidSum=(transactions||[])
-      .filter(t=>t.type==='sc_paid'&&!t.voided)
-      .reduce((s,t)=>s+(Number(t.amount)||0),0);
-    const scLiability=Math.max(0,scCollectedSum-scPaidSum);
-    const tipCollectedSum=(transactions||[])
-      .filter(t=>t.type==='tip_collected'&&!t.voided)
-      .reduce((s,t)=>s+(Number(t.amount)||0),0);
-    const tipPaidSum=(transactions||[])
-      .filter(t=>t.type==='tip_paid'&&!t.voided)
-      .reduce((s,t)=>s+(Number(t.amount)||0),0);
-    const tipsLiability=Math.max(0,tipCollectedSum-tipPaidSum);
-    /* Output VAT owed to BIR = collected (DSR dsr_adjustment postings to l2100)
-       minus remitted (any non-dsr_adjustment tx against l2100, e.g. a BIR payment
-       posted DR l2100 / CR cash). */
+    const liabPay=(coaId)=>sumTx('liability_payment',coaId);
+    const scLiability=Math.max(0, sumTx('sc_collected','l2210') - sumTx('sc_paid','l2210') - liabPay('l2210'));
+    const tipsLiability=Math.max(0, sumTx('tip_collected','l2220') - sumTx('tip_paid','l2220') - liabPay('l2220'));
+    /* Output VAT owed to BIR = collected (DSR dsr_adjustment to l2100) minus
+       remittances (liability_payment to l2100 via the Settle modal). */
     const vatCollectedSum=(transactions||[])
       .filter(t=>!t.voided&&t.type==='dsr_adjustment'&&(t.coaId==='l2100'||t.category==='VAT Payable'))
       .reduce((s,t)=>s+(Number(t.amount)||0),0);
-    const vatRemittedSum=(transactions||[])
-      .filter(t=>!t.voided&&t.type!=='dsr_adjustment'&&(t.coaId==='l2100'||t.category==='VAT Payable'))
-      .reduce((s,t)=>s+(Number(t.amount)||0),0);
-    const vatLiability=Math.max(0,vatCollectedSum-vatRemittedSum);
+    const vatLiability=Math.max(0, vatCollectedSum - liabPay('l2100'));
     const totalLiabilities=totalPayables+payrollLiability+scLiability+tipsLiability+vatLiability;
     return {
       totalAssets:assets,
@@ -2697,7 +2688,7 @@ function handleImport(file){
 
       /* Transaction integrity */
       const txIds=new Set();
-      const validTypes=new Set(['sale','expense','transfer','deposit','withdrawal','sc_collected','tip_collected','sc_paid','tip_paid','dsr_adjustment']);
+      const validTypes=new Set(['sale','expense','transfer','deposit','withdrawal','sc_collected','tip_collected','sc_paid','tip_paid','liability_payment','dsr_adjustment']);
       const dateRe=/^\d{4}-\d{2}-\d{2}$/;
       d.transactions.forEach((t,i)=>{
         if(!t.id)  { errs.push(`Tx[${i}] missing id`); return; }
@@ -3215,7 +3206,7 @@ function normalizeTx(tx){
     /* Amount */
     amount:        tx.amount||0,
     /* Accounts — normalized */
-    sourceAccountId:      tx.type==='expense'||tx.type==='withdrawal'||tx.type==='transfer'||tx.type==='sc_paid'||tx.type==='tip_paid'
+    sourceAccountId:      tx.type==='expense'||tx.type==='withdrawal'||tx.type==='transfer'||tx.type==='sc_paid'||tx.type==='tip_paid'||tx.type==='liability_payment'
                             ? (tx.sourceAccountId||tx.fromAccount||tx.account||null)
                             : null,
     destinationAccountId: tx.type==='sale'||tx.type==='deposit'||tx.type==='transfer'||tx.type==='sc_collected'||tx.type==='tip_collected'
@@ -3267,6 +3258,7 @@ function deriveSubtype(tx){
   if(tx.type==='tip_collected')return 'tip_collected';
   if(tx.type==='sc_paid')return 'sc_paid';
   if(tx.type==='tip_paid')return 'tip_paid';
+  if(tx.type==='liability_payment')return 'liability_payment';
   if(tx.type==='transfer')return 'transfer';
   if(tx.type==='payroll')return 'payroll_release';
   return tx.type;
@@ -3516,13 +3508,13 @@ function areaChart(data){
    BADGE / AMOUNT
 ═══════════════════════════════════════════════ */
 const BS={sale:`background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd)`,dsr_adjustment:`background:var(--bg3);color:var(--muted);border:1px solid var(--border)`,expense:`background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd)`,transfer:`background:var(--amber-bg);color:var(--amber);border:1px solid var(--amber-bd)`,deposit:`background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue-bd)`,withdrawal:`background:var(--purple-bg);color:var(--purple);border:1px solid var(--purple-bd)`};
-const TL={sale:'Sale',expense:'Expense',transfer:'Transfer',deposit:'Deposit',withdrawal:'Withdrawal',sc_collected:'SC',tip_collected:'Tips',sc_paid:'SC Out',tip_paid:'Tips Out',dsr_adjustment:'Adjustment'};
+const TL={sale:'Sale',expense:'Expense',transfer:'Transfer',deposit:'Deposit',withdrawal:'Withdrawal',sc_collected:'SC',tip_collected:'Tips',sc_paid:'SC Out',tip_paid:'Tips Out',liability_payment:'Remittance',dsr_adjustment:'Adjustment'};
 const badge=type=>`<span class="badge" style="${BS[type]||''}">${TL[type]||type}</span>`;
 function amountCell(tx){
   const v=`${fmt(tx.amount)}${tx.voided?'<span style="font-size:.68rem;color:var(--muted2);margin-left:4px">[voided]</span>':''}`;
   const s=tx.voided?'text-decoration:line-through;opacity:.5;':'';
   if(tx.type==='sale'||tx.type==='deposit'||tx.type==='sc_collected'||tx.type==='tip_collected')return`<span class="green mono" style="${s}">+${v}</span>`;
-  if(tx.type==='expense'||tx.type==='withdrawal'||tx.type==='sc_paid'||tx.type==='tip_paid')return`<span class="red mono" style="${s}">−${v}</span>`;
+  if(tx.type==='expense'||tx.type==='withdrawal'||tx.type==='sc_paid'||tx.type==='tip_paid'||tx.type==='liability_payment')return`<span class="red mono" style="${s}">−${v}</span>`;
   return`<span class="amber mono" style="${s}">↕ ${v}</span>`;
 }
 const an=id=>esc(accounts.find(a=>a.id===id)?.name??id);
@@ -3593,6 +3585,7 @@ const MT={
   addPayrollAdj:'Add Payroll Adjustment',
   payrollSettings:'Payroll Settings',
   finalizePayroll:'Finalize Payroll',
+  settleLiability:'Remit / Settle Liability',
   addPosition:'Add Position',
 };
 
@@ -3773,6 +3766,39 @@ function renderModal(){
     body=`<div class="form-row"><div class="form-group"><label>Date</label><input id="m-hol-date" type="date" value="${today()}"></div><div class="form-group"><label>Type</label><select id="m-hol-type"><option value="regular">Regular Holiday (200%)</option><option value="special">Special Non-Working (+30%)</option></select></div></div>
     <div class="form-group" style="margin-bottom:4px"><label>Holiday Name</label><input id="m-hol-name" placeholder="e.g. Fiesta Holiday"></div>
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="submitAddHoliday()">Add Holiday</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
+
+  }else if(type==='settleLiability'){
+    /* #7: record a remittance / settlement that draws down a liability
+       (DR liability, CR cash). For VAT/SC/Tips we show the current outstanding
+       balance from the balance-sheet snapshot. */
+    const bs=treasuryService.getBalanceSheetSnapshot().breakdown;
+    /* Only genuinely-accrued pass-through liabilities are settled here: VAT (DSR),
+       SC, Tips. Statutory contributions (SSS/PhilHealth/HDMF/withholding) aren't
+       accrued in this build — remit those via Expense → Payroll Taxes & Benefits. */
+    const liabCoaIds=['l2100','l2210','l2220'];
+    const liabOutstanding={l2100:bs.vatLiability||0,l2210:bs.serviceChargeLiability||0,l2220:bs.tipsLiability||0};
+    const liabOpts=liabCoaIds.map(id=>{
+      const c=coa.find(x=>x.id===id); if(!c) return '';
+      const out=liabOutstanding[id]||0;
+      return `<option value="${id}">${esc(c.name)} — outstanding ${fmt(out)}</option>`;
+    }).join('');
+    const payAcctOpts=(accounts||[]).filter(a=>a&&a.type!=='clearing').map(a=>`<option value="${esc(a.id)}">${esc(a.name)}</option>`).join('');
+    body=`<div class="info-box" style="margin-bottom:10px">Records paying down a pass-through liability: VAT (to BIR), Service Charge or Tips. Posts DR liability / CR the paying account — no P&amp;L impact.<br><span style="color:var(--muted2)">For SSS/PhilHealth/Pag-IBIG/withholding remittances, use Log Expense → Payroll Taxes &amp; Benefits instead.</span></div>
+    <div class="form-row">
+      <div class="form-group" style="grid-column:1/-1"><label>Liability</label><select id="m-set-coa">${liabOpts}</select></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Pay From</label><select id="m-set-acct">${payAcctOpts}</select></div>
+      <div class="form-group"><label>Amount (₱)</label><input id="m-set-amt" type="number" step="0.01" min="0.01" placeholder="0.00"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Date</label><input id="m-set-date" type="date" value="${today()}"></div>
+      <div class="form-group"><label>Reference / Note</label><input id="m-set-note" placeholder="e.g. BIR 2550M Apr"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" style="flex:1" onclick="submitSettleLiability()">Record Payment</button>
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+    </div>`;
 
   }else if(type==='payrollSettings'){
     body=`<div class="form-row">
@@ -5050,7 +5076,7 @@ function pgFunds(){
     /* Inflow types: sale, deposit, sc_collected, tip_collected, transfer-in.
        Outflow types: expense (paid), withdrawal, sc_paid, tip_paid, transfer-out. */
     const inflow=transactions.filter(t=>!t.voided&&(t.type==='sale'||t.type==='deposit'||t.type==='sc_collected'||t.type==='tip_collected')&&t.account===a.id).reduce((s,t)=>s+t.amount,0)+transactions.filter(t=>!t.voided&&t.type==='transfer'&&t.toAccount===a.id).reduce((s,t)=>s+t.amount,0);
-    const outflow=transactions.filter(t=>!t.voided&&((t.type==='expense'||t.type==='withdrawal')&&t.status!=='unpaid'||t.type==='sc_paid'||t.type==='tip_paid')&&t.account===a.id).reduce((s,t)=>s+t.amount,0)+transactions.filter(t=>!t.voided&&t.type==='transfer'&&t.fromAccount===a.id).reduce((s,t)=>s+t.amount,0);
+    const outflow=transactions.filter(t=>!t.voided&&((t.type==='expense'||t.type==='withdrawal')&&t.status!=='unpaid'||t.type==='sc_paid'||t.type==='tip_paid'||t.type==='liability_payment')&&t.account===a.id).reduce((s,t)=>s+t.amount,0)+transactions.filter(t=>!t.voided&&t.type==='transfer'&&t.fromAccount===a.id).reduce((s,t)=>s+t.amount,0);
     const p=total>0?(a.balance/total*100):0;
     return`<div class="card"><div style="display:flex;align-items:start;justify-content:space-between;margin-bottom:11px"><div style="display:flex;align-items:center;gap:7px"><span class="acct-dot" style="background:${a.color};width:9px;height:9px"></span><div><div style="font-weight:600;font-size:.875rem">${esc(a.name)}</div><div style="font-size:.69rem;color:var(--muted2)">${{cash:'💵 Cash',bank:'🏦 Bank',ewallet:'📱 GCash'}[a.type]||a.type}</div></div></div><button class="btn btn-danger btn-xs" onclick="deleteAccount('${a.id}')">Remove</button></div><div style="font-family:var(--fm);font-size:1.2rem;font-weight:500;margin-bottom:8px">${fmt(a.balance)}</div><div class="progress-bar"><div class="progress-fill" style="width:${Math.min(100,p)}%;background:${a.color}"></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;font-size:.76rem;margin:9px 0"><div><div class="stat-label" style="font-size:.62rem">Total In</div><div class="green">${fmt(inflow)}</div></div><div><div class="stat-label" style="font-size:.62rem">Total Out</div><div class="red">${fmt(outflow)}</div></div><div><div class="stat-label" style="font-size:.62rem">Transactions</div><div>${txAll.length}</div></div><div><div class="stat-label" style="font-size:.62rem">Share</div><div>${p.toFixed(1)}%</div></div></div><div style="display:flex;gap:5px"><button class="btn btn-ghost btn-xs" style="flex:1" onclick="openModal('deposit')">↓ Deposit</button><button class="btn btn-ghost btn-xs" style="flex:1" onclick="openModal('withdrawal')">↑ Withdraw</button></div></div>`;
   }).join('');
@@ -5205,9 +5231,9 @@ function rebuildAccountBalances(){
         break;
       }
       case 'sc_paid':
-      case 'tip_paid': {
-        // SC/Tip liability settlement — cash leaves the payout account.
-        // Always treated as paid (no unpaid state for settlements).
+      case 'tip_paid':
+      case 'liability_payment': {
+        // SC/Tip settlement or liability remittance — cash leaves the paying account.
         const acct = t.account||t.sourceAccountId;
         if(acct) accounts = accounts.map(a=>a.id===acct?{...a,balance:a.balance-amt}:a);
         break;
@@ -5617,6 +5643,15 @@ function recalcDSR(date){
     arEl.textContent=arPct>0?arPct.toFixed(1)+'%':'—';
     arEl.style.color=arPct>=75?'var(--green)':arPct>=60?'var(--amber)':'var(--red)';
   }
+  /* Live shift-based labor estimate — full computed pay (base + OT + ND + holiday
+     premium − tardiness) for staff who worked this date ÷ the day's net sales.
+     Updates as sales inputs change. */
+  const dayShiftCost=dayLaborCostFromShifts(date);
+  const shiftLaborEl=document.getElementById('dsr-out-shiftlabor');
+  if(shiftLaborEl){
+    shiftLaborEl.innerHTML=`<span class="mono" style="font-size:.82rem">${fmt(dayShiftCost)}</span>`+
+      (dayShiftCost>0&&tNet>0?pctBadge(dayShiftCost/tNet*100,'labor'):'<span style="color:var(--muted2);font-size:.72rem">—</span>');
+  }
   const tx=transactions.filter(t=>t.date===date&&!t.voided);
   const pm=calcMetrics(tx);
   const pmEl=document.getElementById('dsr-out-prime');
@@ -5653,10 +5688,8 @@ function pgDSR(){
   // Day expenses: from manually posted transactions (for reference)
   const dayExpTx=transactions.filter(t=>t.date===dsrDate&&t.type==='expense'&&!t.voided&&!(t.note&&t.note.startsWith(DSR_TAG)));
   const dayExpTotal=dayExpTx.reduce((s,t)=>s+t.amount,0);
-  // Labor cost: from shifts logged for this date
-  const dayShiftCost=shifts.filter(s=>s.date===dsrDate).reduce((s,x)=>{
-    const e=roster.find(r=>r.id===x.employeeId);return s+(e?.dailyRate||0);
-  },0);
+  // Labor cost: full computed pay from shifts logged for this date (incl OT/ND/holiday)
+  const dayShiftCost=dayLaborCostFromShifts(dsrDate);
 
   /* Bestsellers */
   const bsFood=e.bsFood||Array(7).fill(null).map(()=>({item:'',qty:''}));
@@ -5985,6 +6018,15 @@ function pgDSR(){
         <div><div class="stat-label" style="font-size:.63rem">Net Profit</div><div class="mono ${pm.netProfit>=0?'green':'red'}">${fmt(pm.netProfit)}</div></div>
       </div>
     </div>
+    <div style="margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div class="stat-label" style="font-size:.63rem">Labor (Shifts) <span style="color:var(--muted2);font-weight:400;text-transform:none">· live est. from rostered daily rates ÷ net sales</span></div>
+        <div id="dsr-out-shiftlabor" style="display:flex;align-items:center;gap:8px">
+          <span class="mono" style="font-size:.82rem">${fmt(dayShiftCost)}</span>
+          ${dayShiftCost>0&&tNet>0?pctBadge(dayShiftCost/tNet*100,'labor'):'<span style="color:var(--muted2);font-size:.72rem">—</span>'}
+        </div>
+      </div>
+    </div>
   </div>
 
 </div>
@@ -6268,7 +6310,7 @@ function pgReports(){
         </tbody></table>
       </div>
       <div class="card-flush">
-        <div style="padding:9px 14px;background:var(--bg3);border-bottom:1px solid var(--border)"><span class="sec-title">Liabilities & Equity</span></div>
+        <div style="padding:9px 14px;background:var(--bg3);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span class="sec-title">Liabilities & Equity</span><button class="btn btn-ghost btn-xs" onclick="openModal('settleLiability')">↑ Remit / Settle</button></div>
         <table><tbody>
           <tr><td style="font-size:.8rem">Accounts Payable</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.accountsPayable)}</td><td></td></tr>
           <tr><td style="font-size:.8rem">Payroll Liability</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.payrollLiability)}</td><td></td></tr>
@@ -6381,29 +6423,63 @@ function getCutoffPeriod(date){
   else{return{period:2,from:`${y}-${String(m).padStart(2,'0')}-11`,to:`${y}-${String(m).padStart(2,'0')}-25`,payDay:`${y}-${String(m).padStart(2,'0')}-${new Date(y,m,0).getDate()}`,label:`${new Date(y,m-1,11).toLocaleDateString('en-US',{month:'short',day:'numeric'})} – ${new Date(y,m-1,25).toLocaleDateString('en-US',{month:'short',day:'numeric'})}`};}
 }
 function getCutoffDates(from,to){const dates=[];let d=new Date(from+'T12:00:00');const end=new Date(to+'T12:00:00');while(d<=end){dates.push(d.toISOString().split('T')[0]);d.setDate(d.getDate()+1)}return dates}
-function applyTardinessBracket(m){if(!m||m<=0)return 0;if(m<30)return 30;if(m<60)return 60;return 240}
-function calcNDHours(ti,to){if(!ti||!to)return 0;const toM=t=>{const[h,m]=t.split(':').map(Number);return h*60+m};let inM=toM(ti),outM=toM(to);if(outM<=inM)outM+=1440;let nd=0;const zA1=Math.max(inM,1320),zA2=Math.min(outM,1440);if(zA2>zA1)nd+=zA2-zA1;const zB1=Math.max(inM,1440),zB2=Math.min(outM,1800);if(zB2>zB1)nd+=zB2-zB1;return Math.max(0,nd/60)}
+function applyTardinessBracket(m){const g=Number(payrollSettings.tardinessGraceMinutes)||0;if(!m||m<=g)return 0;if(m<30)return 30;if(m<60)return 60;return 240}
+function calcNDHours(ti,to){if(!ti||!to)return 0;const toM=t=>{const[h,m]=t.split(':').map(Number);return h*60+m};
+  /* Night-diff window is configurable via payrollSettings.ndStart / ndEnd (defaults
+     22:00–06:00). End time wraps past midnight (+1440). */
+  const ndS=toM(payrollSettings.ndStart||'22:00');const ndE=toM(payrollSettings.ndEnd||'06:00')+1440;
+  let inM=toM(ti),outM=toM(to);if(outM<=inM)outM+=1440;let nd=0;
+  const zA1=Math.max(inM,ndS),zA2=Math.min(outM,1440);if(zA2>zA1)nd+=zA2-zA1;
+  const zB1=Math.max(inM,1440),zB2=Math.min(outM,ndE);if(zB2>zB1)nd+=zB2-zB1;return Math.max(0,nd/60)}
 function calcOTHours(h){return{regular:Math.min(h,8),ot:Math.max(0,h-8)}}
 function computeShiftPay(shift,emp){
   if(!emp)return null;const dr=emp.dailyRate||0,hr=dr/8;
   const{hoursWorked=0,breakMins=0,lateMinutes=0,timeIn,timeOut,date}=shift;
-  const hol=getHoliday(date);const dow=new Date(date+'T12:00:00').getDay();const isRest=dow===0;
+  const hol=getHoliday(date);const dow=new Date(date+'T12:00:00').getDay();
+  /* Rest-day premium applies only when the employee works their OWN configured
+     rest day (not a hardcoded Sunday). A restaurant is open weekends, so staff
+     typically rest on a weekday and work Sundays as normal days. */
+  const REST_DAY_NAMES=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const isRest=REST_DAY_NAMES[dow]===(emp.restDay||'Sunday');
   const tardDeduct=hr*(applyTardinessBracket(lateMinutes||0)/60);
   const{ot:otHrs}=calcOTHours(hoursWorked);const ndHrs=calcNDHours(timeIn,timeOut);
   /* PH Labor Code Art. 82: managerial employees are exempt from premium pay.
      When emp.exemptFromPremiumPay is true: pay flat daily rate regardless of
      OT, night work, holiday, or rest day. Tardiness still applies (no work, no pay). */
   const exempt=emp.exemptFromPremiumPay===true;
+  /* #4: pay multipliers now read from configurable payrollSettings (PH legal
+     defaults shown). base = the FULL applicable day rate, so holidayPremium is no
+     longer a separate add-on (that previously double-counted: regular holiday was
+     paying 200% base + 100% premium = 300%; now base alone = 200%). REST_MULT and
+     OT_PREMIUM are PH statutory constants with no UI control. */
+  const otM=Number(payrollSettings.otMultiplier)||1.25;
+  const ndM=Number(payrollSettings.ndMultiplier)||0.10;
+  const rhM=Number(payrollSettings.regularHolidayMultiplier)||2;
+  const shM=Number(payrollSettings.specialHolidayMultiplier)||1.30;
+  const REST_MULT=1.30, OT_PREMIUM=1.30;
   let base=0,otPay=0,ndPay=0,holPrem=0,holNote='';
   if(exempt){
     base=dr;
     if(hol) holNote=`${hol.type==='regular'?'Regular':'Special'} Holiday — ${hol.name} (exempt: flat rate)`;
     else if(isRest) holNote='Rest Day (exempt: flat rate)';
   }
-  else if(!hol){if(!isRest){base=dr;otPay=otHrs*hr*1.25;ndPay=ndHrs*hr*0.10;}else{base=dr*1.30;otPay=otHrs*hr*1.30*1.30;ndPay=ndHrs*hr*0.10;holNote='Rest Day (+30%)';}}
-  else if(hol.type==='regular'){base=dr*2.00;otPay=otHrs*hr*2.00*1.30;ndPay=ndHrs*hr*0.10;holPrem=dr;holNote=`Regular Holiday — ${hol.name} (200%)`;}
-  else{base=dr*1.30;otPay=otHrs*hr*1.30*1.30;ndPay=ndHrs*hr*0.10;holPrem=dr*0.30;holNote=`Special Holiday — ${hol.name} (+30%)`;}
+  else if(!hol){if(!isRest){base=dr;otPay=otHrs*hr*otM;ndPay=ndHrs*hr*ndM;}else{base=dr*REST_MULT;otPay=otHrs*hr*REST_MULT*OT_PREMIUM;ndPay=ndHrs*hr*ndM;holNote=`Rest Day (+${Math.round((REST_MULT-1)*100)}%)`;}}
+  else if(hol.type==='regular'){base=dr*rhM;otPay=otHrs*hr*rhM*OT_PREMIUM;ndPay=ndHrs*hr*ndM;holNote=`Regular Holiday — ${hol.name} (${Math.round(rhM*100)}%)`;}
+  else{base=dr*shM;otPay=otHrs*hr*shM*OT_PREMIUM;ndPay=ndHrs*hr*ndM;holNote=`Special Holiday — ${hol.name} (${Math.round(shM*100)}%)`;}
   return{date,employeeId:emp.id,name:emp.name,position:emp.position,dailyRate:dr,hourlyRate:hr,hoursWorked,otHrs:exempt?0:otHrs,ndHrs:exempt?0:ndHrs,lateMinutes:lateMinutes||0,tardinessBracketMins:applyTardinessBracket(lateMinutes||0),tardinessDeduction:tardDeduct,basePay:base,otPay,ndPay,holidayPremium:holPrem,holidayNote:holNote,grossPay:Math.max(0,base+otPay+ndPay-tardDeduct),isHoliday:!!hol,isRestDay:isRest,holiday:hol,exemptFromPremiumPay:exempt};
+}
+/* Accurate per-day labor cost from shift records — sums each shift's full
+   computed pay (base + OT + ND + holiday/rest-day premium − tardiness), matching
+   how computePayroll accrues per shift. Used for the DSR live labor estimate.
+   Excludes absent-holiday pay and period-level adjustments (not per-day). */
+function dayLaborCostFromShifts(date){
+  return shifts.filter(s=>s.date===date).reduce((sum,x)=>{
+    const e=roster.find(r=>r.id===x.employeeId);
+    if(!e) return sum;
+    const p=computeShiftPay(x,e);
+    if(!p) return sum;
+    return sum + (p.basePay||0) + (p.otPay||0) + (p.ndPay||0) + (p.holidayPremium||0) - (p.tardinessDeduction||0);
+  },0);
 }
 /* ─── SC / TIP POOL HELPERS (Tier 1) ─── */
 function getPayrollPool(from,to){
@@ -6586,9 +6662,12 @@ function finalizePayroll({fromDate,toDate}){
                  BOH:{id:'x6040',name:'BOH Regular Wages',type:'variable'},
                  MGT:{id:'x6200',name:'Management Salaries',type:'fixed'}};
   const wageGroups={}, scByAcct={}, tipByAcct={};
+  /* Resolve a guaranteed payout account so no employee's wage is ever dropped:
+     row's own → first cash/register → first account. */
+  const fallbackAcct=accounts.find(a=>a.id==='register'||(a.type==='cash'&&a.type!=='clearing'))?.id||accounts.find(a=>a.type!=='clearing')?.id||accounts[0]?.id||'';
   rowsPreview.forEach(r=>{
-    const dept=deptOf(r); const acct=r.payoutAccount||'';
-    if(!acct) return; /* skip rows with unresolved payout account */
+    const dept=deptOf(r); const acct=r.payoutAccount||fallbackAcct;
+    if(!acct) return; /* only skipped if the system has zero accounts */
     const key=`${dept}|${acct}`;
     if(!wageGroups[key]) wageGroups[key]={dept,account:acct,total:0,count:0};
     wageGroups[key].total+=Number(r.grossPay||0);
@@ -6745,6 +6824,30 @@ function submitPayrollAdj(){
     note:document.getElementById('m-adj-note')?.value||''
   });
   closeModal();renderMain();toast('Adjustment added ✓');
+}
+
+/* ─── #7: LIABILITY REMITTANCE / SETTLEMENT ─── */
+function submitSettleLiability(){
+  const coaId=document.getElementById('m-set-coa')?.value;
+  const account=document.getElementById('m-set-acct')?.value;
+  const amount=parseFloat(document.getElementById('m-set-amt')?.value||0);
+  const date=document.getElementById('m-set-date')?.value||today();
+  const note=document.getElementById('m-set-note')?.value||'';
+  if(!coaId){toast('Select a liability','error');return}
+  if(!account){toast('Select an account to pay from','error');return}
+  if(!amount||amount<=0){toast('Enter a valid amount','error');return}
+  if(isPeriodLocked(date)){toast('Accounting period locked for '+fmtDate(date),'error');return}
+  const c=coa.find(x=>x.id===coaId);
+  /* DR liability (coaId) / CR cash (account). type 'liability_payment' is excluded
+     from P&L and draws down the liability on the balance sheet. */
+  createLedgerTransaction({
+    type:'liability_payment', coaId,
+    category:getCOAName(coaId,c?.name||'Liability'),
+    account, amount, date,
+    note:note||`Remittance — ${c?.name||coaId}`,
+    handler:currentUser, status:'paid'
+  });
+  closeModal();renderMain();toast(`Remittance recorded — ${fmt(amount)} ✓`,'success');
 }
 
 function addRosterMember(m){roster=[...roster,{id:uid(),status:'active',...m}];scheduleSave();render();closeModal();toast('Employee added ✓')}
@@ -7189,7 +7292,7 @@ function pgWeeklyCheck(){
   /* Cash flow — include SC/Tip collections (inflows) and settlements (outflows)
      so the expectedCash reconciliation matches actual account-balance movements. */
   const inflows=wTx.filter(t=>t.type==='sale'||t.type==='deposit'||t.type==='sc_collected'||t.type==='tip_collected').reduce((s,t)=>s+t.amount,0);
-  const outflows=wTx.filter(t=>((t.type==='expense'||t.type==='withdrawal')&&t.status!=='unpaid')||t.type==='sc_paid'||t.type==='tip_paid').reduce((s,t)=>s+t.amount,0);
+  const outflows=wTx.filter(t=>((t.type==='expense'||t.type==='withdrawal')&&t.status!=='unpaid')||t.type==='sc_paid'||t.type==='tip_paid'||t.type==='liability_payment').reduce((s,t)=>s+t.amount,0);
   const currentTotal=treasuryService.getOperationalLiquidity();
   const beginningCash=currentTotal-(inflows-outflows);
   const expectedCash=beginningCash+inflows-outflows;
