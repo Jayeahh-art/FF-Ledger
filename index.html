@@ -395,16 +395,89 @@ async function api(payload){
    SYNC
 ═══════════════════════════════════════════════ */
 let syncTimer=null;
+let pendingSave=false;          // true once a change is queued, false only after a confirmed save
+const LEDGER_CACHE_KEY='ledger_state_cache';
 function setSyncStatus(s,msg){
   const b=document.getElementById('sync-badge'),t=document.getElementById('sync-text');
   if(!b)return;
   b.className='sync-badge '+s;
   t.textContent=s==='saving'?'Saving…':s==='error'?(msg||'Error'):'Synced';
 }
-function scheduleSave(){setSyncStatus('saving');clearTimeout(syncTimer);syncTimer=setTimeout(pushSave,1400)}
+/* Single source of truth for the persisted payload — used by the remote save,
+   the local cache mirror, and the on-close flush so they can never drift apart. */
+function collectState(){
+  return {accounts,transactions,coa,activityLog,tabs,staffPayables,dsrEntries,roster,shifts,holidays,payables,kpiTargets,payrollSettings,payrollAdjustments,payrollRuns,payrollPools,auditLog,periodLocks,openingCashState,cashVarianceHistory,monthlyOpeningBalances,treasuryEvents,weeklyTargets,monthlyBudget,positions,cashCounts,dailyCloseSnapshots};
+}
+/* Instant local mirror written on every change. synced:false means the remote
+   save has not yet confirmed — if the tab closes mid-save, the next load can
+   recover from this so recent entries are never lost. */
+function writeLocalCache(){
+  try{ localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify({savedAt:Date.now(),synced:false,state:collectState()})); }
+  catch(e){ /* quota exceeded — remote sync remains the safety net */ }
+}
+function markCacheSynced(){
+  try{
+    const raw=localStorage.getItem(LEDGER_CACHE_KEY);
+    if(raw){const c=JSON.parse(raw);c.synced=true;localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify(c));}
+  }catch(e){}
+}
+function scheduleSave(){
+  setSyncStatus('saving');
+  pendingSave=true;
+  writeLocalCache();            // synchronous — survives an immediate reload/close
+  clearTimeout(syncTimer);
+  syncTimer=setTimeout(pushSave,1400);
+}
 async function pushSave(){
-  try{await api({action:'save',accounts,transactions,coa,activityLog,tabs,staffPayables,dsrEntries,roster,shifts,holidays,payables,kpiTargets,payrollSettings,payrollAdjustments,payrollRuns,payrollPools,auditLog,periodLocks,openingCashState,cashVarianceHistory,monthlyOpeningBalances,treasuryEvents,weeklyTargets,monthlyBudget,positions,cashCounts,dailyCloseSnapshots});setSyncStatus('ok')}
+  pendingSave=false;
+  try{
+    await api({action:'save',...collectState()});
+    setSyncStatus('ok');
+    if(!pendingSave)markCacheSynced();   // skip if a new change queued during the await
+  }
   catch(e){setSyncStatus('error');toast('Sync failed','error')}
+}
+/* Flush a queued-but-not-yet-sent change when the tab is hidden or closed.
+   sendBeacon survives page unload (a normal fetch would be cancelled). If the
+   payload is too large for a beacon it silently no-ops and the local cache
+   recovery on next load takes over. */
+function flushSaveBeacon(){
+  if(!pendingSave||!scriptUrl)return;
+  try{
+    const body=JSON.stringify({action:'save',pinHash,...collectState()});
+    const blob=new Blob([body],{type:'text/plain;charset=utf-8'});
+    if(navigator.sendBeacon(scriptUrl,blob)){pendingSave=false;markCacheSynced();}
+  }catch(e){}
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')flushSaveBeacon();});
+window.addEventListener('pagehide',flushSaveBeacon);
+/* On load, recover changes that were queued locally but never confirmed to the
+   server (tab closed within the save debounce, network drop, etc.). */
+function recoverUnsyncedCache(){
+  let cache;
+  try{cache=JSON.parse(localStorage.getItem(LEDGER_CACHE_KEY)||'null');}catch(e){return}
+  if(!cache||cache.synced||!cache.state)return;
+  const when=new Date(cache.savedAt).toLocaleString();
+  if(!confirm(`Unsynced changes from your last session (${when}) were found.\n\nOK = restore your local changes\nCancel = discard them and keep the server copy`)){
+    markCacheSynced();           // user discarded — don't ask again
+    return;
+  }
+  const s=cache.state;
+  accounts=s.accounts; transactions=s.transactions; coa=s.coa; activityLog=s.activityLog;
+  tabs=s.tabs; staffPayables=s.staffPayables; dsrEntries=s.dsrEntries; roster=s.roster;
+  shifts=s.shifts; holidays=s.holidays; payables=s.payables;
+  if(s.kpiTargets)kpiTargets=s.kpiTargets;
+  if(s.payrollSettings)payrollSettings=s.payrollSettings;
+  if(s.weeklyTargets)weeklyTargets=s.weeklyTargets;
+  if(s.monthlyBudget)monthlyBudget=s.monthlyBudget;
+  payrollAdjustments=s.payrollAdjustments; payrollRuns=s.payrollRuns; payrollPools=s.payrollPools;
+  auditLog=s.auditLog; periodLocks=s.periodLocks; openingCashState=s.openingCashState;
+  cashVarianceHistory=s.cashVarianceHistory; monthlyOpeningBalances=s.monthlyOpeningBalances;
+  treasuryEvents=s.treasuryEvents; positions=s.positions; cashCounts=s.cashCounts;
+  dailyCloseSnapshots=s.dailyCloseSnapshots;
+  rebuildAccountBalances();
+  scheduleSave();                // re-push the recovered state to the server
+  toast('Unsynced changes restored ✓','success');
 }
 
 /* ═══════════════════════════════════════════════
@@ -493,6 +566,7 @@ async function loadApp(){
     positions=(Array.isArray(data.positions)&&data.positions.length)?data.positions:getDefaultPositions();
     rebuildAccountBalances(); // derive balances from transaction history
     validateLedgerIntegrity();
+    recoverUnsyncedCache(); // restore any local changes that never confirmed to the server
     document.getElementById('pin-screen').style.display='none';
     document.getElementById('app-shell').style.display='flex';
     normalizeAllTransactions();
