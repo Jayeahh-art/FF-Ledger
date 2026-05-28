@@ -4777,6 +4777,14 @@ function pgDashboard(){
   const periodPrimeP = m.primeP||0;
   const grossProfitP = m.netRevenue>0 ? (m.grossProfit/m.netRevenue)*100 : 0;
 
+  /* Live labor from logged shifts (this/last week) — operational estimate that
+     updates before payroll is finalized. Posted labor (tw.laborP) stays the
+     accounting figure; this is shown as a separate row in Cost Controls. */
+  const twShiftLabor = thisWeekDates.reduce((s,d)=>s+dayLaborCostFromShifts(d),0);
+  const lwShiftLabor = lastWeekDates.reduce((s,d)=>s+dayLaborCostFromShifts(d),0);
+  const twShiftLaborP = tw.netRevenue>0 ? (twShiftLabor/tw.netRevenue*100) : 0;
+  const lwShiftLaborP = lw.netRevenue>0 ? (lwShiftLabor/lw.netRevenue*100) : 0;
+
   /* ops status bar */
   const close = getDailyCloseStatus();
   const unresolved = leanAlerts.length;
@@ -4907,7 +4915,8 @@ function pgDashboard(){
         <td colspan="6" style="padding:4px 10px;font-size:.63rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)">Cost Controls</td>
       </tr>
       ${wowRow('Food Cost (COGS%)', tw.cogsP, lw.cogsP, budgetCogsP, false, true)}
-      ${wowRow('Labor Cost %', tw.laborP, lw.laborP, budgetLaborP, false, true)}
+      ${wowRow('Labor Cost % (posted)', tw.laborP, lw.laborP, budgetLaborP, false, true)}
+      ${(twShiftLabor>0||lwShiftLabor>0)?wowRow('Labor Cost % (live · shifts)', twShiftLaborP, lwShiftLaborP, budgetLaborP, false, true):''}
       ${wowRow('Prime Cost %', tw.primeP, lw.primeP, budgetPrimeP, false, true)}
       ${wowRow('EBITDA', tw.ebitda, lw.ebitda, 0, true, false)}
     </tbody>
@@ -6463,9 +6472,11 @@ function computeShiftPay(shift,emp){
     if(hol) holNote=`${hol.type==='regular'?'Regular':'Special'} Holiday — ${hol.name} (exempt: flat rate)`;
     else if(isRest) holNote='Rest Day (exempt: flat rate)';
   }
-  else if(!hol){if(!isRest){base=dr;otPay=otHrs*hr*otM;ndPay=ndHrs*hr*ndM;}else{base=dr*REST_MULT;otPay=otHrs*hr*REST_MULT*OT_PREMIUM;ndPay=ndHrs*hr*ndM;holNote=`Rest Day (+${Math.round((REST_MULT-1)*100)}%)`;}}
-  else if(hol.type==='regular'){base=dr*rhM;otPay=otHrs*hr*rhM*OT_PREMIUM;ndPay=ndHrs*hr*ndM;holNote=`Regular Holiday — ${hol.name} (${Math.round(rhM*100)}%)`;}
-  else{base=dr*shM;otPay=otHrs*hr*shM*OT_PREMIUM;ndPay=ndHrs*hr*ndM;holNote=`Special Holiday — ${hol.name} (${Math.round(shM*100)}%)`;}
+  /* #1: ND is 10% of the APPLICABLE hourly rate — so on premium days it's 10% of
+     the premium-adjusted rate (dayMult×hr), not the plain base rate. */
+  else if(!hol){if(!isRest){base=dr;otPay=otHrs*hr*otM;ndPay=ndHrs*hr*ndM;}else{base=dr*REST_MULT;otPay=otHrs*hr*REST_MULT*OT_PREMIUM;ndPay=ndHrs*hr*REST_MULT*ndM;holNote=`Rest Day (+${Math.round((REST_MULT-1)*100)}%)`;}}
+  else if(hol.type==='regular'){base=dr*rhM;otPay=otHrs*hr*rhM*OT_PREMIUM;ndPay=ndHrs*hr*rhM*ndM;holNote=`Regular Holiday — ${hol.name} (${Math.round(rhM*100)}%)`;}
+  else{base=dr*shM;otPay=otHrs*hr*shM*OT_PREMIUM;ndPay=ndHrs*hr*shM*ndM;holNote=`Special Holiday — ${hol.name} (${Math.round(shM*100)}%)`;}
   return{date,employeeId:emp.id,name:emp.name,position:emp.position,dailyRate:dr,hourlyRate:hr,hoursWorked,otHrs:exempt?0:otHrs,ndHrs:exempt?0:ndHrs,lateMinutes:lateMinutes||0,tardinessBracketMins:applyTardinessBracket(lateMinutes||0),tardinessDeduction:tardDeduct,basePay:base,otPay,ndPay,holidayPremium:holPrem,holidayNote:holNote,grossPay:Math.max(0,base+otPay+ndPay-tardDeduct),isHoliday:!!hol,isRestDay:isRest,holiday:hol,exemptFromPremiumPay:exempt};
 }
 /* Accurate per-day labor cost from shift records — sums each shift's full
@@ -6749,6 +6760,11 @@ function finalizePayroll({fromDate,toDate}){
     if(!p||(p.type!=='sc'&&p.type!=='tip')) return p;
     if(p.status==='paid') return p;
     if(p.date<fromDate||p.date>toDate) return p;
+    /* #2: only settle a payable if its pool was actually distributed this run.
+       If there were no eligible hours (nothing distributed), leave it open so
+       the liability isn't falsely cleared. */
+    if(p.type==='sc'&&totalSC<=0) return p;
+    if(p.type==='tip'&&totalTip<=0) return p;
     flippedCount++;
     return {...p, status:'paid', paidAt:new Date().toISOString(), paidByPayrollRunId:payrollId};
   });
