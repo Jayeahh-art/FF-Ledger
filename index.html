@@ -406,7 +406,7 @@ function setSyncStatus(s,msg){
 /* Single source of truth for the persisted payload — used by the remote save,
    the local cache mirror, and the on-close flush so they can never drift apart. */
 function collectState(){
-  return {accounts,transactions,coa,activityLog,tabs,staffPayables,dsrEntries,roster,shifts,holidays,payables,kpiTargets,payrollSettings,payrollAdjustments,payrollRuns,payrollPools,auditLog,periodLocks,openingCashState,cashVarianceHistory,monthlyOpeningBalances,treasuryEvents,weeklyTargets,monthlyBudget,positions,cashCounts,dailyCloseSnapshots};
+  return {accounts,transactions,coa,activityLog,tabs,staffPayables,dsrEntries,roster,shifts,holidays,payables,kpiTargets,payrollSettings,payrollAdjustments,payrollRuns,payrollPools,cashAdvances,auditLog,periodLocks,openingCashState,cashVarianceHistory,monthlyOpeningBalances,treasuryEvents,weeklyTargets,monthlyBudget,positions,cashCounts,dailyCloseSnapshots};
 }
 /* Instant local mirror written on every change. synced:false means the remote
    save has not yet confirmed — if the tab closes mid-save, the next load can
@@ -471,6 +471,7 @@ function recoverUnsyncedCache(){
   if(s.weeklyTargets)weeklyTargets=s.weeklyTargets;
   if(s.monthlyBudget)monthlyBudget=s.monthlyBudget;
   payrollAdjustments=s.payrollAdjustments; payrollRuns=s.payrollRuns; payrollPools=s.payrollPools;
+  if(Array.isArray(s.cashAdvances)) cashAdvances=s.cashAdvances;
   auditLog=s.auditLog; periodLocks=s.periodLocks; openingCashState=s.openingCashState;
   cashVarianceHistory=s.cashVarianceHistory; monthlyOpeningBalances=s.monthlyOpeningBalances;
   treasuryEvents=s.treasuryEvents; positions=s.positions; cashCounts=s.cashCounts;
@@ -555,6 +556,7 @@ async function loadApp(){
     payrollAdjustments=data.payrollAdjustments||[];
     payrollRuns=data.payrollRuns||[];
     payrollPools=(data.payrollPools&&typeof data.payrollPools==='object')?data.payrollPools:{};
+    cashAdvances=Array.isArray(data.cashAdvances)?data.cashAdvances:[];
     auditLog=data.auditLog||[];
     periodLocks=data.periodLocks||[];
     openingCashState=data.openingCashState||openingCashState;
@@ -1063,6 +1065,11 @@ let payrollRuns=[];
    Each entry: { scPool, tipPool, payoutOverrides:{employeeId: accountId} }.
    Distribution is pure proportional-by-hours across eligible employees. */
 let payrollPools={};
+/* Cash advances (employee receivables). Each: {id, employeeId, date, amount,
+   balance, installment, account, note, status:'open'|'settled', createdAt, createdBy}.
+   Giving an advance is a loan (cash out → receivable), NOT a labor expense; it's
+   repaid by an installment auto-deducted from net pay each payday until balance=0. */
+let cashAdvances=[];
 let cashCounts=[];
 let dailyCloseSnapshots=[];
 let weeklyTargets={sales:0,laborP:32,primeP:65,netProfit:0};
@@ -1790,9 +1797,16 @@ const treasuryService={
 
   /* ── Phase 5B: Balance sheet snapshot ── */
   getBalanceSheetSnapshot(){
-    const assets=(accounts||[])
+    const cashAssets=(accounts||[])
       .filter(a=>!a.hiddenFromTreasury)
       .reduce((s,a)=>s+(Number(a.balance)||0),0);
+    /* Employee receivables = outstanding cash-advance balances (loans out to staff).
+       A real asset: giving an advance moved cash → receivable, so it must be added
+       back here or total assets would understate by the amount lent out. */
+    const employeeReceivables=round2((cashAdvances||[])
+      .filter(a=>a&&a.status!=='settled')
+      .reduce((s,a)=>s+(Number(a.balance)||0),0));
+    const assets=cashAssets+employeeReceivables;
     const totalPayables=(payables||[])
       .filter(p=>p.status!=='paid')
       .reduce((s,p)=>s+(Number(p.balance)||0),0);
@@ -1829,6 +1843,7 @@ const treasuryService={
         clearingAccounts:(accounts||[])
           .filter(a=>a.excludeFromLiquidity)
           .reduce((s,a)=>s+(Number(a.balance)||0),0),
+        employeeReceivables,
         accountsPayable:totalPayables,
         accruedExpenses,
         serviceChargeLiability:scLiability,
@@ -2757,7 +2772,7 @@ function exportJSON(){
     dailyCloseSnapshots, weeklyTargets, monthlyBudget, kpiTargets,
     // Labor
     roster, shifts, holidays, payrollSettings, payrollAdjustments, payrollRuns, payrollPools,
-    positions,
+    cashAdvances, positions,
   };
   dl(`ledger-backup-${today()}.json`, JSON.stringify(payload,null,2), 'application/json');
   toast('Backup saved ✓');
@@ -2844,6 +2859,7 @@ function handleImport(file){
       if(Array.isArray(migrated.payrollAdjustments)) payrollAdjustments=migrated.payrollAdjustments;
       if(Array.isArray(migrated.payrollRuns))    payrollRuns=migrated.payrollRuns;
       if(migrated.payrollPools&&typeof migrated.payrollPools==='object') payrollPools=migrated.payrollPools;
+      if(Array.isArray(migrated.cashAdvances))   cashAdvances=migrated.cashAdvances;
       if(Array.isArray(migrated.positions)&&migrated.positions.length) positions=migrated.positions;
 
       /* Hotfix H5: removed redundant rebuildAccountBalances() + validateLedgerIntegrity() —
@@ -3347,6 +3363,13 @@ function normalizeTx(tx){
     department:    tx.department||coaItem?.department||'',
     tags:          tx.tags||[],
     metadata:      tx.metadata||{},
+    /* Linkage tags — MUST be preserved through normalization. Without these,
+       unfinalizePayroll (filters by payrollRunId) and cash-advance void/undo
+       (filters by advanceId) silently match nothing. paidAt records when an
+       accrued/unpaid item was actually settled. */
+    payrollRunId:  tx.payrollRunId||null,
+    advanceId:     tx.advanceId||null,
+    paidAt:        tx.paidAt||null,
     /* Hotfix M6: removed duplicate createdAt/createdBy/voided/voidedAt definitions
        that were overwriting the earlier ones with weaker fallbacks. */
   };
@@ -3685,6 +3708,7 @@ const MT={
   addAccount:'Add Account',editCoa:'Edit COA Account',addCoa:'Add COA Account',
   forecastTargets:'Set Targets',
   addPayrollAdj:'Add Payroll Adjustment',
+  giveAdvance:'Give Cash Advance',
   payrollSettings:'Payroll Settings',
   finalizePayroll:'Finalize Payroll',
   settleLiability:'Remit / Settle Liability',
@@ -3954,6 +3978,26 @@ function renderModal(){
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
     </div>`;
 
+
+  }else if(type==='giveAdvance'){
+    const d=data||{};
+    const empOpts=(roster||[]).filter(r=>r.status!=='inactive').map(e=>{const bal=employeeAdvanceBalance(e.id);return `<option value="${e.id}" ${d.employeeId===e.id?'selected':''}>${esc(e.name)} — ${esc(e.position)}${bal>0?` (owes ${fmt(bal)})`:''}</option>`}).join('');
+    const acctOpts=(accounts||[]).filter(a=>a&&a.type!=='clearing').map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
+    body=`<div class="form-group" style="margin-bottom:8px"><label>Employee</label><select id="m-adv-emp">${empOpts}</select></div>
+    <div class="form-row">
+      <div class="form-group"><label>Advance Amount (₱)</label><input id="m-adv-amt" type="number" step="0.01" min="0" placeholder="0.00"></div>
+      <div class="form-group"><label>Repay per payday (₱)</label><input id="m-adv-inst" type="number" step="0.01" min="0" placeholder="blank = full next payday"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Cash From</label><select id="m-adv-acct">${acctOpts}</select></div>
+      <div class="form-group"><label>Date</label><input id="m-adv-date" type="date" value="${today()}"></div>
+    </div>
+    <div class="form-group" style="margin-bottom:6px"><label>Note</label><input id="m-adv-note" placeholder="e.g. medical, emergency"></div>
+    <div class="info-box" style="margin-bottom:4px;font-size:.76rem">This is a loan, not an expense: cash leaves now and books to Employee Receivables. The "repay per payday" amount is auto-deducted from net pay each payroll until repaid. Leave blank to repay the full amount on the next payday.</div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" style="flex:1" onclick="submitGiveAdvance()">Give Advance</button>
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+    </div>`;
 
   }else if(type==='addPosition'){
     /* Hotfix: in-app position management — replaces the prior hardcoded POSITIONS constant. */
@@ -6420,6 +6464,7 @@ function pgReports(){
             <td class="mono" style="text-align:right;font-size:.8rem">${fmt(a.balance||0)}</td>
             <td style="font-size:.7rem;color:var(--muted2)">${a.excludeFromLiquidity?'clearing':a.type}</td></tr>
           `).join('')}
+          ${bs.breakdown.employeeReceivables>0?`<tr><td style="font-size:.8rem">Employee Receivables <span style="font-size:.7rem;color:var(--muted2)">· cash advances</span></td><td class="mono" style="text-align:right;font-size:.8rem">${fmt(bs.breakdown.employeeReceivables)}</td><td style="font-size:.7rem;color:var(--muted2)">asset</td></tr>`:''}
           <tr style="background:var(--bg3);font-weight:700"><td style="padding:7px 12px">Total Assets</td><td class="mono" style="text-align:right;font-weight:700">${fmt(bs.totalAssets)}</td><td></td></tr>
         </tbody></table>
       </div>
@@ -6755,7 +6800,12 @@ function computePayroll(empId,from,to){
   const myDist=distAll.dist[empId]||{scShare:0,tipShare:0,hoursInPeriod:tHrs};
   const scShare=round2(myDist.scShare||0);
   const tipShare=round2(myDist.tipShare||0);
-  const netPay=round2(grossPay+scShare+tipShare);
+  /* Cash-advance repayment: this payday's scheduled installment(s), NOT a labor cost.
+     It reduces net pay (cash handed out) and clears the receivable — gross/labor is
+     untouched above. */
+  const advanceBalance=employeeAdvanceBalance(empId);
+  const advanceRepayment=Math.min(employeeAdvanceInstallment(empId), advanceBalance);
+  const netPay=round2(grossPay+scShare+tipShare-advanceRepayment);
   /* Resolve which account this employee's net pay comes out of for this period. */
   const payoutAccount=getEmployeePayoutAccount(empId,from,to);
   return{
@@ -6769,6 +6819,7 @@ function computePayroll(empId,from,to){
     additions,deductions,
     grossPay,
     scShare,tipShare,
+    advanceBalance,advanceRepayment,
     netPay,payoutAccount,
     shiftPays:pays
   };
@@ -6823,8 +6874,9 @@ function finalizePayroll({fromDate,toDate}){
   const totalWageGross=rowsPreview.reduce((s,p)=>s+Number(p.grossPay||0),0);
   const totalSC=rowsPreview.reduce((s,p)=>s+Number(p.scShare||0),0);
   const totalTip=rowsPreview.reduce((s,p)=>s+Number(p.tipShare||0),0);
-  const totalNet=totalWageGross+totalSC+totalTip;
-  if(totalNet<=0){toast('No payroll to finalize for this period','error');return}
+  const totalAdvanceRepay=round2(rowsPreview.reduce((s,p)=>s+Number(p.advanceRepayment||0),0));
+  const totalNet=round2(totalWageGross+totalSC+totalTip-totalAdvanceRepay);
+  if((totalWageGross+totalSC+totalTip)<=0){toast('No payroll to finalize for this period','error');return}
 
   /* Tier 2: group by (department × payoutAccount) for wage entries, and by
      payoutAccount alone for SC/Tip liability settlements. Date everything to
@@ -6857,17 +6909,20 @@ function finalizePayroll({fromDate,toDate}){
   if(!confirm(`Finalize payroll for ${fmtDate(fromDate)} – ${fmtDate(toDate)}?\n\n`+
     `• ${wageEntryCount} wage entr${wageEntryCount===1?'y':'ies'} accrued as PAYABLE (FOH/BOH/MGT) — no cash yet; pay on payday via Unpaid Expenses\n`+
     `• ${scEntryCount} SC settlement${scEntryCount===1?'':'s'} paid now (l2210)\n`+
-    `• ${tipEntryCount} Tip settlement${tipEntryCount===1?'':'s'} paid now (l2220)\n\n`+
-    `Wages payable: ${fmt(totalWageGross)} · Paid now (SC+Tips): ${fmt(totalSC+totalTip)} · Total net: ${fmt(totalNet)}`))return;
+    `• ${tipEntryCount} Tip settlement${tipEntryCount===1?'':'s'} paid now (l2220)\n`+
+    (totalAdvanceRepay>0?`• ${fmt(totalAdvanceRepay)} cash-advance repayment withheld from net pay\n`:'')+
+    `\nWages payable: ${fmt(totalWageGross)} · Paid now (SC+Tips−advances): ${fmt(totalSC+totalTip-totalAdvanceRepay)} · Total net: ${fmt(totalNet)}`))return;
 
   const payrollId=uid();
   /* Snapshot rows (already includes scShare/tipShare/payoutAccount from Tier 1).
      totalPayroll = totalNet so downstream consumers (liquidity, burn forecast)
      see the actual cash outflow including SC/Tip. totalWageGross keeps the
      wage-only number available for display/reporting that needs it separately. */
-  payrollRuns.push({id:payrollId,fromDate,toDate,finalizedAt:new Date().toISOString(),
+  const runObj={id:payrollId,fromDate,toDate,finalizedAt:new Date().toISOString(),
     finalizedBy:currentUser,rows:rowsPreview,
-    totalPayroll:totalNet, totalWageGross, totalSC, totalTip, totalNet});
+    totalPayroll:totalNet, totalWageGross, totalSC, totalTip, totalNet,
+    totalAdvanceRepay, advanceRepayments:[]};
+  payrollRuns.push(runObj);
 
   const entries=[];
   /* 1. Wage expense entries — one per (dept × payout account) */
@@ -6914,6 +6969,33 @@ function finalizePayroll({fromDate,toDate}){
     });
   });
 
+  /* 3b. Cash-advance repayments — withhold each employee's scheduled installment from
+     net pay and clear their loan. Posted as a deposit (cash returns to the payout
+     account) tagged to Employee Receivables (a1060): the employee "receives" full pay
+     then hands back the installment. NOT a labor expense. Recorded on the run so
+     unfinalize can restore the balances. */
+  const advByAcct={};
+  rowsPreview.forEach(r=>{
+    const rep=round2(r.advanceRepayment||0);
+    if(rep<=0||!r.emp) return;
+    const acct=r.payoutAccount||fallbackAcct;
+    const applied=applyAdvanceRepayment(r.emp.id, rep);
+    applied.forEach(x=>runObj.advanceRepayments.push({...x, employeeId:r.emp.id}));
+    const actual=round2(applied.reduce((s,x)=>s+x.amount,0));
+    if(actual>0 && acct) advByAcct[acct]=round2((advByAcct[acct]||0)+actual);
+  });
+  Object.entries(advByAcct).forEach(([acct,amt])=>{
+    if(amt<=0) return;
+    entries.push({
+      date:toDate, type:'deposit', coaId:'a1060',
+      category:getCOAName('a1060','Employee Receivables'),
+      account:acct, amount:amt,
+      note:`Cash-advance repayment ${fromDate} – ${toDate} via ${acctName(acct)}`,
+      status:'paid', handler:currentUser,
+      payrollRunId:payrollId
+    });
+  });
+
   if(entries.length) createLedgerBatch(entries,{skipRender:true});
 
   /* 4. Mark staffPayables (sc/tip) within the period as paid, tagged with the
@@ -6950,6 +7032,7 @@ function unfinalizePayroll(payrollId){
   if(!confirm(`Undo payroll finalize for ${fmtDate(run.fromDate)} – ${fmtDate(run.toDate)}?\n\n`+
     `• ${affectedTx.length} ledger tx${affectedTx.length===1?'':'s'} will be voided\n`+
     `• ${affectedPayables.length} staffPayable${affectedPayables.length===1?'':'s'} will revert to unpaid\n`+
+    ((run.advanceRepayments||[]).length?`• ${fmt((run.advanceRepayments||[]).reduce((s,r)=>s+(Number(r.amount)||0),0))} cash-advance repayment will be restored (re-owed)\n`:'')+
     `• Run will be removed from history`))return;
   if(affectedTx.length){
     ledgerReplaceTransactions(
@@ -6966,8 +7049,18 @@ function unfinalizePayroll(payrollId){
       return {...rest,status:'unpaid'};
     });
   }
+  /* Restore cash-advance balances cleared by this run (the voided deposit already
+     returned the cash; here we re-open the receivable so the employee owes it again). */
+  let restoredAdv=0;
+  (run.advanceRepayments||[]).forEach(rep=>{
+    const adv=(cashAdvances||[]).find(a=>a&&a.id===rep.advanceId);
+    if(!adv) return;
+    adv.balance=round2((Number(adv.balance)||0)+(Number(rep.amount)||0));
+    if(adv.balance>0) adv.status='open';
+    restoredAdv+=Number(rep.amount)||0;
+  });
   payrollRuns=payrollRuns.filter(r=>r&&r.id!==payrollId);
-  logActivity(`Payroll unfinalized: ${fmtDate(run.fromDate)}–${fmtDate(run.toDate)} · ${affectedTx.length} tx(s) voided · ${affectedPayables.length} staffPayable(s) reverted`);
+  logActivity(`Payroll unfinalized: ${fmtDate(run.fromDate)}–${fmtDate(run.toDate)} · ${affectedTx.length} tx(s) voided · ${affectedPayables.length} staffPayable(s) reverted${restoredAdv>0?` · ${fmt(restoredAdv)} advance restored`:''}`);
   scheduleSave();renderMain();
   toast(`Payroll unfinalized — ${affectedTx.length} entr${affectedTx.length===1?'y':'ies'} voided ✓`);
 }
@@ -7004,6 +7097,76 @@ function submitPayrollAdj(){
     note:document.getElementById('m-adj-note')?.value||''
   });
   closeModal();renderMain();toast('Adjustment added ✓');
+}
+
+/* ─── CASH ADVANCES (employee receivables) ───
+   A cash advance is a LOAN to the employee, not a labor expense: giving it moves
+   cash → Employee Receivables (asset); it's repaid by an installment auto-deducted
+   from net pay each payday until the balance hits 0. Labor cost is never touched. */
+function employeeAdvanceBalance(empId){
+  return round2((cashAdvances||[]).filter(a=>a&&a.employeeId===empId&&a.status!=='settled').reduce((s,a)=>s+(Number(a.balance)||0),0));
+}
+function employeeAdvanceInstallment(empId){
+  /* Amount scheduled to be deducted this payday = each open advance's installment,
+     capped at its remaining balance. */
+  return round2((cashAdvances||[]).filter(a=>a&&a.employeeId===empId&&a.status!=='settled'&&Number(a.balance)>0)
+    .reduce((s,a)=>s+Math.min(Number(a.installment)||Number(a.balance)||0, Number(a.balance)||0),0));
+}
+function giveAdvance({employeeId,amount,installment,account,date,note}){
+  const emp=roster.find(r=>r.id===employeeId);
+  if(!emp){toast('Select an employee','error');return}
+  const amt=round2(parseFloat(amount)||0);
+  if(amt<=0){toast('Enter a valid amount','error');return}
+  if(!account){toast('Select the account the cash comes from','error');return}
+  const d=date||today();
+  if(isPeriodLocked(d)){toast('Accounting period locked for '+fmtDate(d),'error');return}
+  let inst=round2(parseFloat(installment)||0); if(inst<=0||inst>amt) inst=amt; // default/clamp: full repayment next payday
+  const adv={id:uid(),employeeId,date:d,amount:amt,balance:amt,installment:inst,account,note:note||'',status:'open',createdAt:new Date().toISOString(),createdBy:currentUser};
+  cashAdvances=[adv,...cashAdvances];
+  /* Cash leaves now, recorded as a withdrawal tagged to Employee Receivables (a1060,
+     an asset) — debits cash but is NOT a labor/P&L expense. createLedgerTransaction
+     rebuilds balances, saves and renders. */
+  createLedgerTransaction({date:d,type:'withdrawal',coaId:'a1060',category:getCOAName('a1060','Employee Receivables'),account,amount:amt,note:`Cash advance — ${emp.name}${note?' · '+note:''}`,status:'paid',handler:currentUser,advanceId:adv.id});
+  logActivity(`Cash advance ${fmt(amt)} → ${emp.name} (repay ${fmt(inst)}/payday)`);
+  scheduleSave();closeModal();toast(`Advance ${fmt(amt)} given to ${emp.name} ✓`,'success');
+}
+function submitGiveAdvance(){
+  giveAdvance({
+    employeeId:document.getElementById('m-adv-emp')?.value,
+    amount:document.getElementById('m-adv-amt')?.value,
+    installment:document.getElementById('m-adv-inst')?.value,
+    account:document.getElementById('m-adv-acct')?.value,
+    date:document.getElementById('m-adv-date')?.value,
+    note:document.getElementById('m-adv-note')?.value
+  });
+}
+function deleteCashAdvance(id){
+  const adv=(cashAdvances||[]).find(a=>a&&a.id===id);
+  if(!adv)return;
+  if(round2(adv.balance)!==round2(adv.amount)){toast('Advance already has repayments — unfinalize the relevant payroll first','error');return}
+  if(!confirm(`Delete advance ${fmt(adv.amount)} to ${roster.find(r=>r.id===adv.employeeId)?.name||'employee'}? This voids the cash-out entry and returns the cash.`))return;
+  ledgerReplaceTransactions(transactions.map(t=>(t&&t.advanceId===id&&!t.voided)?{...t,voided:true,voidedAt:new Date().toISOString(),voidedBy:currentUser,voidReason:'Advance deleted'}:t),'delete_advance');
+  cashAdvances=cashAdvances.filter(a=>a.id!==id);
+  scheduleSave();render();toast('Advance deleted');
+}
+/* Apply an employee's scheduled installment against their open advances (oldest
+   first). Returns the list of {advanceId, amount} actually applied. Mutates balances. */
+function applyAdvanceRepayment(empId,totalRepay){
+  let remaining=round2(totalRepay);
+  const applied=[];
+  if(remaining<=0) return applied;
+  /* oldest first */
+  const open=(cashAdvances||[]).filter(a=>a&&a.employeeId===empId&&a.status!=='settled'&&Number(a.balance)>0)
+    .sort((a,b)=>(a.date||'').localeCompare(b.date||''));
+  for(const a of open){
+    if(remaining<=0) break;
+    const pay=Math.min(round2(a.balance), remaining);
+    a.balance=round2(a.balance-pay);
+    if(a.balance<=0.005){a.balance=0;a.status='settled';}
+    applied.push({advanceId:a.id, amount:round2(pay)});
+    remaining=round2(remaining-pay);
+  }
+  return applied;
 }
 
 /* ─── #7: LIABILITY REMITTANCE / SETTLEMENT ─── */
@@ -7237,6 +7400,7 @@ function renderPayrollTab(co){
           <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">Deductions</div>
           ${p.totalUndertimePay>0?`<div class="payslip-row"><span>Undertime (${(p.totalUndertimeHours||0).toFixed(1)}h)</span><span class="mono red">−${fmt(p.totalUndertimePay)}</span></div>`:''}
           ${p.totalTardinessDeduction>0?`<div class="payslip-row"><span>Tardiness</span><span class="mono red">−${fmt(p.totalTardinessDeduction)}</span></div>`:''}
+          ${p.advanceRepayment>0?`<div class="payslip-row"><span>Cash Advance Repayment</span><span class="mono red">−${fmt(p.advanceRepayment)}</span></div>${(p.advanceBalance-p.advanceRepayment)>0.005?`<div class="payslip-row"><span style="font-size:.72rem;color:var(--muted2)">Advance balance after</span><span class="mono" style="font-size:.72rem;color:var(--muted2)">${fmt(p.advanceBalance-p.advanceRepayment)}</span></div>`:''}`:''}
           ${deductionsTotal>0?`<div class="payslip-row" style="color:var(--red)"><span>Adjustments (−)</span><span class="mono">−${fmt(deductionsTotal)}</span></div>`:''}
           ${empAdjs.length?`<div style="margin-top:5px;border-top:1px solid var(--border);padding-top:5px">${empAdjs.map(a=>`<div class="payslip-row"><span style="font-size:.72rem;color:var(--muted2)">${esc(a.category.replace(/_/g,' '))}${a.note?' — '+a.note:''}</span><span class="mono" style="font-size:.72rem;color:${a.amount>=0?'var(--green)':'var(--red)'}">${a.amount>=0?'+':''}${fmt(a.amount)}</span></div>`).join('')}</div>`:''}
         </div>
@@ -7255,6 +7419,7 @@ function renderPayrollTab(co){
     <div style="display:flex;gap:6px;flex-wrap:wrap">
       <button class="btn btn-ghost btn-sm" onclick="window._payFrom='${toggleTarget.from}';window._payTo='${toggleTarget.to}';renderMain()">Switch: ${toggleTarget.label}</button>
       <button class="btn btn-ghost btn-sm" onclick="openModal('addPayrollAdj',{period:'${from}_${to}'})">+ Adjustment</button>
+      <button class="btn btn-ghost btn-sm" onclick="openModal('giveAdvance')">+ Cash Advance</button>
       ${alreadyFinalized?`<button class="btn btn-ghost btn-sm" disabled style="opacity:.6;cursor:not-allowed">✓ Finalized — undo in History</button>`:`<button class="btn btn-primary btn-sm" onclick="openModal('finalizePayroll',{from:'${from}',to:'${to}'})">✓ Finalize Payroll</button>`}
       <button class="btn btn-ghost btn-sm" onclick="roster.filter(r=>r.status!=='inactive').forEach(e=>printPayslip(e.id,'${from}','${to}'))">🖨 Print All</button>
     </div>
@@ -7389,13 +7554,15 @@ function renderRosterTab(){
       <div style="flex:1">
         <div style="font-weight:600;font-size:.87rem;display:flex;align-items:center;gap:6px;flex-wrap:wrap">${esc(e.name)}${e.employeeNo?` <span style="font-size:.68rem;color:var(--muted2);font-weight:400">#${esc(e.employeeNo)}</span>`:''} ${deptBadge(dept)}</div>
         <div style="font-size:.7rem;color:var(--muted2)">${esc(e.position||'—')}${e.station?' · '+esc(e.station):''} · <span style="color:${etc}">${(e.employmentType||'regular').replace(/_/g,' ')}</span></div>
-        <div style="font-size:.68rem;color:var(--muted2)">Rest: ${e.restDay||'Sun'} · ${e.scEligible===false?'No SC/tip':'SC+tip ✓'} · ${shifts.filter(s=>s.employeeId===e.id).length} shifts</div>
+        <div style="font-size:.68rem;color:var(--muted2)">Rest: ${e.restDay||'Sun'} · ${e.scEligible===false?'No SC':'SC ✓'} · ${e.tipsEligible===false?'No tips':'tips ✓'} · ${shifts.filter(s=>s.employeeId===e.id).length} shifts</div>
+        ${employeeAdvanceBalance(e.id)>0?`<div style="font-size:.68rem;color:var(--amber);font-weight:600;margin-top:2px">Advance owed: ${fmt(employeeAdvanceBalance(e.id))} · ${fmt(employeeAdvanceInstallment(e.id))}/payday</div>`:''}
       </div>
       <div style="text-align:right">
         <div class="mono" style="font-size:.88rem;font-weight:500;color:var(--green)">${fmt(e.dailyRate)}/day</div>
         <div style="font-size:.69rem;color:var(--muted2)">${fmt(e.dailyRate/8)}/hr</div>
       </div>
-      <div style="display:flex;gap:4px">
+      <div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end">
+        <button class="btn btn-ghost btn-xs" onclick="openModal('giveAdvance',{employeeId:'${e.id}'})">Advance</button>
         <button class="btn btn-ghost btn-xs" onclick="editRosterMember('${e.id}')">Edit</button>
         <button class="btn btn-danger btn-xs" onclick="deleteRosterMember('${e.id}')">✕</button>
       </div>
@@ -7462,6 +7629,7 @@ table{width:100%;border-collapse:collapse}td{padding:4px 0;border-bottom:1px sol
   <tr><td class="section" colspan="2">Deductions</td></tr>
   ${p.totalUndertimePay>0?`<tr><td>Undertime (${(p.totalUndertimeHours||0).toFixed(1)}h)</td><td class="r red">−${fmt(p.totalUndertimePay)}</td></tr>`:''}
   ${p.totalTardinessDeduction>0?`<tr><td>Tardiness</td><td class="r red">−${fmt(p.totalTardinessDeduction)}</td></tr>`:''}
+  ${p.advanceRepayment>0?`<tr><td>Cash Advance Repayment${(p.advanceBalance-p.advanceRepayment)>0.005?` <span class="muted">(bal ${fmt(p.advanceBalance-p.advanceRepayment)})</span>`:''}</td><td class="r red">−${fmt(p.advanceRepayment)}</td></tr>`:''}
   ${empAdjs.filter(a=>a.amount<0).map(a=>`<tr><td>${esc(a.category.replace(/_/g,' '))}${a.note?' — '+a.note:''}</td><td class="r red">−${fmt(Math.abs(a.amount))}</td></tr>`).join('')}
   <tr><td class="total">NET PAY</td><td class="r total green">${fmt(p.netPay||p.grossPay)}</td></tr>
 </table>
