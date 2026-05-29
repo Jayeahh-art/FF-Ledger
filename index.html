@@ -1796,9 +1796,14 @@ const treasuryService={
     const totalPayables=(payables||[])
       .filter(p=>p.status!=='paid')
       .reduce((s,p)=>s+(Number(p.balance)||0),0);
-    const payrollLiability=(payrollRuns||[])
-      .filter(r=>r.status!=='paid')
-      .reduce((s,r)=>s+(r.totalPayroll||0),0);
+    /* Accrued expenses payable = unpaid expense transactions (payroll wages accrued
+       at cutoff + any on-credit purchases). This is the balance-sheet counterpart to
+       accrual-basis P&L: every expense recognized but not yet paid sits here. Replaces
+       the old run-based payrollLiability, which counted every run forever (r.status was
+       never set) and double-counted SC/Tips (already in their own liability lines). */
+    const accruedExpenses=(transactions||[])
+      .filter(t=>t&&!t.voided&&t.type==='expense'&&t.status==='unpaid')
+      .reduce((s,t)=>s+(Number(t.amount)||0),0);
     /* Outstanding liability = collected (DSR) minus paid out (payroll finalize)
        minus any manual remittance (type 'liability_payment' via the Settle modal).
        Helper sums non-voided txs of a type that reference a given liability COA. */
@@ -1814,7 +1819,7 @@ const treasuryService={
       .filter(t=>!t.voided&&t.type==='dsr_adjustment'&&(t.coaId==='l2100'||t.category==='VAT Payable'))
       .reduce((s,t)=>s+(Number(t.amount)||0),0);
     const vatLiability=Math.max(0, vatCollectedSum - liabPay('l2100'));
-    const totalLiabilities=totalPayables+payrollLiability+scLiability+tipsLiability+vatLiability;
+    const totalLiabilities=totalPayables+accruedExpenses+scLiability+tipsLiability+vatLiability;
     return {
       totalAssets:assets,
       totalLiabilities,
@@ -1825,7 +1830,7 @@ const treasuryService={
           .filter(a=>a.excludeFromLiquidity)
           .reduce((s,a)=>s+(Number(a.balance)||0),0),
         accountsPayable:totalPayables,
-        payrollLiability,
+        accruedExpenses,
         serviceChargeLiability:scLiability,
         tipsLiability,
         vatLiability
@@ -1983,7 +1988,13 @@ function calcMetrics(txList){
 function _calcMetricsImpl(txList){
 
   const active = txList.filter(t => !t.voided);
-  const paid   = active.filter(t => t.status !== 'unpaid');
+  /* ACCRUAL BASIS for the P&L below: revenue & expenses are recognized when
+     INCURRED (transaction date), regardless of cash payment status. Unpaid items
+     are real income/expense for the period; their unpaid balance shows as a payable
+     on the balance sheet (getBalanceSheetSnapshot → accruedExpenses), so the P&L and
+     BS tie out. Cash-flow / liquidity / runway views stay cash-basis separately.
+     (`paid` kept as the variable name for historical reasons — now the accrual set.) */
+  const paid   = active;
 
   const coaMap = {};
   coa.forEach(c => {
@@ -2172,6 +2183,14 @@ function _calcMetricsImpl(txList){
   const ebitdaP = netRevenue > 0 ? (ebitda / netRevenue) * 100 : 0;
   const profitP = netRevenue > 0 ? (netProfit / netRevenue) * 100 : 0;
 
+  /* CASH-BASIS variants — used ONLY by the Cash Flow statement (everything above is
+     accrual). Paid-only costs; net operating cash ≈ net revenue − paid costs. */
+  const cashTx = active.filter(t => t.status !== 'unpaid');
+  const cogsCash  = cashTx.filter(isCogsTx).reduce((s,t)=>s+t.amount,0);
+  const laborCash = cashTx.filter(isLaborTx).reduce((s,t)=>s+t.amount,0);
+  const opexCash  = cashTx.filter(isOperatingExpenseTx).reduce((s,t)=>s+t.amount,0);
+  const netOperatingCash = netRevenue - cogsCash - laborCash - opexCash;
+
   return {
 
     // Revenue breakdown
@@ -2228,7 +2247,13 @@ function _calcMetricsImpl(txList){
     cogsP,
     laborP,
     primeP,
-    profitP
+    profitP,
+
+    // Cash-basis (Cash Flow statement only — everything else is accrual)
+    cogsCash,
+    laborCash,
+    opexCash,
+    netOperatingCash
   };
 }
 
@@ -2504,9 +2529,12 @@ const leanOpsService={
 
     const availableCash = treasuryService.getOperationalLiquidity();
 
-    const pendingPayroll=(payrollRuns||[])
-      .filter(r=>r.status!=='paid')
-      .reduce((s,r)=>s+(r.netPay||0),0);
+    /* Pending payroll = wages accrued at cutoff but not yet paid out (unpaid wage
+       expense txs tagged to a payroll run). SC/Tips settle at finalize so they're
+       already out of cash and not pending. */
+    const pendingPayroll=(transactions||[])
+      .filter(t=>t&&t.payrollRunId&&t.type==='expense'&&t.status==='unpaid'&&!t.voided)
+      .reduce((s,t)=>s+(parseFloat(t.amount)||0),0);
 
     if(pendingPayroll>0 && availableCash<pendingPayroll){
       alerts.push({
@@ -2549,9 +2577,9 @@ const leanOpsService={
     const runway=burn>0?cash/burn:0;
     /* Project 30/60/90 day cash assuming current burn continues */
     const project=(days)=>Math.max(0,cash-(burn*days));
-    const pendingPayroll=(payrollRuns||[])
-      .filter(r=>r.status!=='paid')
-      .reduce((s,r)=>s+(r.totalPayroll||0),0);
+    const pendingPayroll=(transactions||[])
+      .filter(t=>t&&t.payrollRunId&&t.type==='expense'&&t.status==='unpaid'&&!t.voided)
+      .reduce((s,t)=>s+(parseFloat(t.amount)||0),0);
     const pendingPayables=(payables||[])
       .filter(p=>p.status!=='paid')
       .reduce((s,p)=>s+(p.balance||0),0);
@@ -3800,7 +3828,10 @@ function renderModal(){
       <div class="form-group"><label>Rest Day</label><select id="m-emp-restday">${restDayOpts}</select></div>
       <div class="form-group" style="justify-content:flex-end;padding-top:18px">
         <label style="display:flex;align-items:center;gap:7px;cursor:pointer;text-transform:none;font-size:.82rem;font-weight:500;letter-spacing:0">
-          <input type="checkbox" id="m-emp-sc" ${(isEdit?d.scEligible!==false:currentDept!=='MGT')?'checked':''} style="width:auto"> Eligible for SC &amp; tips
+          <input type="checkbox" id="m-emp-sc" ${(isEdit?d.scEligible!==false:currentDept!=='MGT')?'checked':''} style="width:auto"> Eligible for Service Charge
+        </label>
+        <label style="display:flex;align-items:center;gap:7px;cursor:pointer;text-transform:none;font-size:.82rem;font-weight:500;letter-spacing:0;margin-top:6px">
+          <input type="checkbox" id="m-emp-tips" ${(isEdit?d.tipsEligible!==false:currentDept!=='MGT')?'checked':''} style="width:auto"> Eligible for Tips
         </label>
         ${!isEdit&&currentDept==='MGT'?'<div style="font-size:.68rem;color:var(--muted2);margin-top:2px">Default off for MGT — RA 11360 excludes managerial employees from SC pool.</div>':''}
       </div>
@@ -3821,8 +3852,8 @@ function renderModal(){
     }else{
     body=`<div class="form-row"><div class="form-group"><label>Employee</label><select id="m-shift-emp">${empOpts}</select></div><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${window._laborDate||today()}"></div></div>
     <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="09:00"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="18:00"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="120" step="15" value="60"></div></div>
-    <div class="form-row"><div class="form-group"><label>Minutes Late (actual)</label><input id="m-shift-late" type="number" min="0" max="480" value="0"></div><div class="form-group"><label>Note</label><input id="m-shift-note" placeholder="e.g. double shift, OT…"></div></div>
-    <div class="info-box" style="margin-bottom:4px;font-size:.76rem">Tardiness: 1–29min→30min deducted · 30–59min→1hr · 60+min→4hrs</div>
+    <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="09:00"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="8"></div><div class="form-group"><label>Note</label><input id="m-shift-note" placeholder="e.g. OT, half-day…"></div></div>
+    <div class="info-box" style="margin-bottom:4px;font-size:.76rem">Tardiness is auto-detected: clock-in after Scheduled In is docked per policy (1–29m→30m · 30–59m→1h · 60m+→4h). Leaving early / a short day shows as Undertime. Set Scheduled hrs to 4 for a half-day.</div>
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="submitAddShift()">Log Shift</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
     setTimeout(()=>{const upd=()=>{const e=roster.find(r=>r.id===document.getElementById('m-shift-emp')?.value);const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;const hrs=calcShiftHours(ti,to,br);const el=document.getElementById('sp-hours');const re=document.getElementById('sp-rate');if(el)el.textContent=hrs.toFixed(2)+'h';if(re)re.textContent=e?fmt(e.dailyRate):'-';};['m-shift-emp','m-shift-in','m-shift-out','m-shift-break'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',upd)});upd()},80);
     }
@@ -3832,8 +3863,8 @@ function renderModal(){
     }else{
       body=`<div style="font-size:.82rem;color:var(--muted2);margin-bottom:12px">${esc(emp?.name||'Unknown')} · ${fmtDate(s.date)}</div>
       <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="${s.timeIn}"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="${s.timeOut}"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="240" step="15" value="${s.breakMins||0}"></div></div>
-      <div class="form-row"><div class="form-group"><label>Minutes Late (actual)</label><input id="m-shift-late" type="number" min="0" max="480" step="1" value="${s.lateMinutes||0}"></div><div class="form-group"><label>Note</label><input id="m-shift-note" value="${esc(s.note||'')}"></div></div>
-      <div class="info-box" style="margin-bottom:8px">Tardiness policy: 1–29min→30min deducted · 30–59min→1hr · 60+min→4hrs</div>
+      <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="${s.scheduledIn||s.timeIn||'09:00'}"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="${s.scheduledHours||8}"></div><div class="form-group"><label>Note</label><input id="m-shift-note" value="${esc(s.note||'')}"></div></div>
+      <div class="info-box" style="margin-bottom:8px">Tardiness is auto-detected: clock-in after Scheduled In is docked per policy (1–29m→30m · 30–59m→1h · 60m+→4h). Leaving early / a short day shows as Undertime.</div>
       <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="saveEditShift('${sid}')">Save Changes</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
     }
   }else if(type==='addHoliday'){
@@ -6396,7 +6427,7 @@ function pgReports(){
         <div style="padding:9px 14px;background:var(--bg3);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span class="sec-title">Liabilities & Equity</span><button class="btn btn-ghost btn-xs" onclick="openModal('settleLiability')">↑ Remit / Settle</button></div>
         <table><tbody>
           <tr><td style="font-size:.8rem">Accounts Payable</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.accountsPayable)}</td><td></td></tr>
-          <tr><td style="font-size:.8rem">Payroll Liability</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.payrollLiability)}</td><td></td></tr>
+          <tr><td style="font-size:.8rem">Accrued Expenses (unpaid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.accruedExpenses)}</td><td></td></tr>
           <tr><td style="font-size:.8rem">Service Charge Payable</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.serviceChargeLiability)}</td><td></td></tr>
           <tr><td style="font-size:.8rem">Tips Payable</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.tipsLiability||0)}</td><td></td></tr>
           <tr><td style="font-size:.8rem">VAT Payable</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.vatLiability||0)}</td><td></td></tr>
@@ -6413,10 +6444,10 @@ function pgReports(){
       <table><tbody>
         <tr style="background:var(--bg3)"><td colspan="2" style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:8px 12px">Operating Activities</td></tr>
         <tr><td style="font-size:.8rem;padding-left:24px">Net Revenue</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--green)">${fmt(m.netRevenue)}</td></tr>
-        <tr><td style="font-size:.8rem;padding-left:24px">Less: COGS (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.cogs)}</td></tr>
-        <tr><td style="font-size:.8rem;padding-left:24px">Less: Labor (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.labor)}</td></tr>
-        <tr><td style="font-size:.8rem;padding-left:24px">Less: OpEx (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.opex||0)}</td></tr>
-        <tr style="font-weight:700;background:var(--bg3)"><td>Net Operating Cash Flow</td><td class="mono" style="text-align:right;color:${m.netProfit>=0?'var(--green)':'var(--red)'}">${fmt(m.netProfit)}</td></tr>
+        <tr><td style="font-size:.8rem;padding-left:24px">Less: COGS (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.cogsCash)}</td></tr>
+        <tr><td style="font-size:.8rem;padding-left:24px">Less: Labor (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.laborCash)}</td></tr>
+        <tr><td style="font-size:.8rem;padding-left:24px">Less: OpEx (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.opexCash||0)}</td></tr>
+        <tr style="font-weight:700;background:var(--bg3)"><td>Net Operating Cash Flow</td><td class="mono" style="text-align:right;color:${m.netOperatingCash>=0?'var(--green)':'var(--red)'}">${fmt(m.netOperatingCash)}</td></tr>
         <tr style="background:var(--bg3)"><td colspan="2" style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:8px 12px">Reconciliation</td></tr>
         <tr><td style="font-size:.8rem;padding-left:24px">Expected Cash</td><td class="mono" style="text-align:right;font-size:.8rem">${fmt(recon.expectedCash)}</td></tr>
         <tr><td style="font-size:.8rem;padding-left:24px">Actual Cash (ledger)</td><td class="mono" style="text-align:right;font-size:.8rem">${fmt(recon.actualCash)}</td></tr>
@@ -6512,23 +6543,36 @@ function calcNDHours(ti,to){if(!ti||!to)return 0;const toM=t=>{const[h,m]=t.spli
      22:00–06:00). End time wraps past midnight (+1440). */
   const ndS=toM(payrollSettings.ndStart||'22:00');const ndE=toM(payrollSettings.ndEnd||'06:00')+1440;
   let inM=toM(ti),outM=toM(to);if(outM<=inM)outM+=1440;let nd=0;
-  const zA1=Math.max(inM,ndS),zA2=Math.min(outM,1440);if(zA2>zA1)nd+=zA2-zA1;
-  const zB1=Math.max(inM,1440),zB2=Math.min(outM,ndE);if(zB2>zB1)nd+=zB2-zB1;return Math.max(0,nd/60)}
+  const zA1=Math.max(inM,ndS),zA2=Math.min(outM,1440);if(zA2>zA1)nd+=zA2-zA1;        // 22:00 → midnight
+  const zB1=Math.max(inM,1440),zB2=Math.min(outM,ndE);if(zB2>zB1)nd+=zB2-zB1;          // post-midnight (wrapped shift)
+  /* Same-day early-morning window (00:00 → ndEnd) — a shift that starts AFTER
+     midnight without wrapping (e.g. 04:00–08:00) lives at minutes 240–480, so it
+     never reaches the 1440-based zone above. Catch its overlap with [0, ndEnd−1440]. */
+  const zC1=Math.max(inM,0),zC2=Math.min(outM,ndE-1440);if(zC2>zC1)nd+=zC2-zC1;
+  return Math.max(0,nd/60)}
 function calcOTHours(h){return{regular:Math.min(h,8),ot:Math.max(0,h-8)}}
+/* Round pesos to 2 decimal places (centavos) — prevents sub-centavo float drift
+   from hourly-rate math (e.g. dailyRate/8) propagating into payslips and the ledger. */
+function round2(n){return Math.round((Number(n)||0)*100)/100}
 function computeShiftPay(shift,emp){
   if(!emp)return null;const dr=emp.dailyRate||0,hr=dr/8;
-  const{hoursWorked=0,breakMins=0,lateMinutes=0,timeIn,timeOut,date}=shift;
+  const{hoursWorked=0,breakMins=0,timeIn,timeOut,date,scheduledIn}=shift;
+  /* Tardiness auto-detected from the clock: minutes late = actual clock-in −
+     scheduled start. Legacy shifts with no scheduledIn fall back to timeIn (= on time). */
+  const _toMin=t=>{const[h,m]=String(t||'0:0').split(':').map(Number);return (h||0)*60+(m||0)};
+  const lateMinutes=Math.max(0,_toMin(timeIn)-_toMin(scheduledIn||timeIn));
   const hol=getHoliday(date);const dow=new Date(date+'T12:00:00').getDay();
   /* Rest-day premium applies only when the employee works their OWN configured
      rest day (not a hardcoded Sunday). A restaurant is open weekends, so staff
      typically rest on a weekday and work Sundays as normal days. */
   const REST_DAY_NAMES=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
   const isRest=REST_DAY_NAMES[dow]===(emp.restDay||'Sunday');
-  const tardDeduct=hr*(applyTardinessBracket(lateMinutes||0)/60);
+  const tardDeduct=hr*(applyTardinessBracket(lateMinutes)/60);
   const{ot:otHrs}=calcOTHours(hoursWorked);const ndHrs=calcNDHours(timeIn,timeOut);
-  /* PH Labor Code Art. 82: managerial employees are exempt from premium pay.
-     When emp.exemptFromPremiumPay is true: pay flat daily rate regardless of
-     OT, night work, holiday, or rest day. Tardiness still applies (no work, no pay). */
+  /* PH Labor Code Art. 82: managerial employees are exempt from PREMIUM pay.
+     When emp.exemptFromPremiumPay is true: pay the plain regular rate with NO
+     OT / night / holiday / rest-day premium. Undertime ("no work, no pay") still
+     applies and reduces their pay — handled in the exempt branch below. */
   const exempt=emp.exemptFromPremiumPay===true;
   /* #4: pay multipliers now read from configurable payrollSettings (PH legal
      defaults shown). base = the FULL applicable day rate, so holidayPremium is no
@@ -6539,19 +6583,53 @@ function computeShiftPay(shift,emp){
   const ndM=Number(payrollSettings.ndMultiplier)||0.10;
   const rhM=Number(payrollSettings.regularHolidayMultiplier)||2;
   const shM=Number(payrollSettings.specialHolidayMultiplier)||1.30;
-  const REST_MULT=1.30, OT_PREMIUM=1.30;
-  let base=0,otPay=0,ndPay=0,holPrem=0,holNote='';
+  const REST_MULT=1.30, OT_PREMIUM=1.30, SPECIAL_REST_ADD=0.20; // PH: special holiday on rest day = 150% (130% + 20%)
+  /* Base pay represents a FULL SCHEDULED day; undertime (working fewer hours than
+     scheduled) is shown as a separate explicit deduction so the payslip makes the
+     reduction visible. A planned half-day shift (scheduledHours = 4) is NOT
+     undertime — its base is simply hr×4. Net (base − undertime) always equals
+     hourlyRate × actual hours worked. */
+  const regHrs=Math.min(hoursWorked,8);                                          // paid regular hours worked (cap 8; beyond = OT)
+  const schedHrs=Math.min(Number(shift.scheduledHours)>0?Number(shift.scheduledHours):8,8); // scheduled paid hours (half day = 4)
+  const baseHrs=Math.max(schedHrs,regHrs);                                       // base line baseline — never penalize working past schedule
+  /* Undertime = shortfall vs schedule MINUS the late-arrival portion — lateness is
+     charged via the tardiness bracket instead, so it's never deducted twice. This
+     leaves undertime to capture early departures / planned short days only. */
+  const undertimeHrs=Math.max(0,Math.round(((baseHrs-regHrs)-(lateMinutes/60))*100)/100);
+  let base=0,otPay=0,ndPay=0,holPrem=0,holNote='',undertimePay=0;
   if(exempt){
-    base=dr;
-    if(hol) holNote=`${hol.type==='regular'?'Regular':'Special'} Holiday — ${hol.name} (exempt: flat rate)`;
-    else if(isRest) holNote='Rest Day (exempt: flat rate)';
+    /* Art. 82: managerial staff earn NO premium pay (OT / ND / holiday / rest day),
+       but "no work, no pay" still applies — undertime reduces their pay like anyone
+       else, computed on the plain regular rate (no premium multiplier). */
+    base=hr*baseHrs; undertimePay=hr*undertimeHrs;
+    if(hol) holNote=`${hol.type==='regular'?'Regular':'Special'} Holiday — ${hol.name} (exempt: no premium)`;
+    else if(isRest) holNote='Rest Day (exempt: no premium)';
+  } else {
+    /* One combined day multiplier folds holiday AND rest-day premiums together so
+       they STACK: a regular holiday worked on the employee's own rest day = 200% ×
+       130% = 260%; a special holiday on a rest day = 150%. ND is 10% of the
+       applicable (premium-adjusted) hourly rate; ordinary OT = 125%, premium-day OT
+       carries the +30% statutory OT premium on top of the day multiplier. */
+    let dayMult=1;
+    if(!hol){
+      dayMult = isRest ? REST_MULT : 1;
+      if(isRest) holNote=`Rest Day (+${Math.round((REST_MULT-1)*100)}%)`;
+    } else if(hol.type==='regular'){
+      dayMult = isRest ? rhM*REST_MULT : rhM;
+      holNote=`Regular Holiday — ${hol.name} (${Math.round(dayMult*100)}%)${isRest?' · Rest Day':''}`;
+    } else {
+      dayMult = isRest ? (shM+SPECIAL_REST_ADD) : shM;
+      holNote=`Special Holiday — ${hol.name} (${Math.round(dayMult*100)}%)${isRest?' · Rest Day':''}`;
+    }
+    base=hr*baseHrs*dayMult;
+    undertimePay=hr*undertimeHrs*dayMult;
+    otPay=otHrs*hr*dayMult*(dayMult===1?otM:OT_PREMIUM);
+    ndPay=ndHrs*hr*dayMult*ndM;
   }
-  /* #1: ND is 10% of the APPLICABLE hourly rate — so on premium days it's 10% of
-     the premium-adjusted rate (dayMult×hr), not the plain base rate. */
-  else if(!hol){if(!isRest){base=dr;otPay=otHrs*hr*otM;ndPay=ndHrs*hr*ndM;}else{base=dr*REST_MULT;otPay=otHrs*hr*REST_MULT*OT_PREMIUM;ndPay=ndHrs*hr*REST_MULT*ndM;holNote=`Rest Day (+${Math.round((REST_MULT-1)*100)}%)`;}}
-  else if(hol.type==='regular'){base=dr*rhM;otPay=otHrs*hr*rhM*OT_PREMIUM;ndPay=ndHrs*hr*rhM*ndM;holNote=`Regular Holiday — ${hol.name} (${Math.round(rhM*100)}%)`;}
-  else{base=dr*shM;otPay=otHrs*hr*shM*OT_PREMIUM;ndPay=ndHrs*hr*shM*ndM;holNote=`Special Holiday — ${hol.name} (${Math.round(shM*100)}%)`;}
-  return{date,employeeId:emp.id,name:emp.name,position:emp.position,dailyRate:dr,hourlyRate:hr,hoursWorked,otHrs:exempt?0:otHrs,ndHrs:exempt?0:ndHrs,lateMinutes:lateMinutes||0,tardinessBracketMins:applyTardinessBracket(lateMinutes||0),tardinessDeduction:tardDeduct,basePay:base,otPay,ndPay,holidayPremium:holPrem,holidayNote:holNote,grossPay:Math.max(0,base+otPay+ndPay-tardDeduct),isHoliday:!!hol,isRestDay:isRest,holiday:hol,exemptFromPremiumPay:exempt};
+  /* Round each peso component to centavos, then derive grossPay from the rounded
+     parts so the payslip lines always sum exactly to gross (no 1-centavo drift). */
+  const _b=round2(base),_ot=round2(otPay),_nd=round2(ndPay),_ut=round2(undertimePay),_td=round2(tardDeduct);
+  return{date,employeeId:emp.id,name:emp.name,position:emp.position,dailyRate:dr,hourlyRate:hr,hoursWorked,scheduledHours:schedHrs,otHrs:exempt?0:otHrs,ndHrs:exempt?0:ndHrs,undertimeHrs,undertimePay:_ut,lateMinutes:lateMinutes||0,tardinessBracketMins:applyTardinessBracket(lateMinutes||0),tardinessDeduction:_td,basePay:_b,otPay:_ot,ndPay:_nd,holidayPremium:round2(holPrem),holidayNote:holNote,grossPay:Math.max(0,round2(_b+_ot+_nd-_td-_ut)),isHoliday:!!hol,isRestDay:isRest,holiday:hol,exemptFromPremiumPay:exempt};
 }
 /* Accurate per-day labor cost from shift records — sums each shift's full
    computed pay (base + OT + ND + holiday/rest-day premium − tardiness), matching
@@ -6563,7 +6641,7 @@ function dayLaborCostFromShifts(date){
     if(!e) return sum;
     const p=computeShiftPay(x,e);
     if(!p) return sum;
-    return sum + (p.basePay||0) + (p.otPay||0) + (p.ndPay||0) + (p.holidayPremium||0) - (p.tardinessDeduction||0);
+    return sum + (p.basePay||0) + (p.otPay||0) + (p.ndPay||0) + (p.holidayPremium||0) - (p.tardinessDeduction||0) - (p.undertimePay||0);
   },0);
 }
 /* ─── SC / TIP POOL HELPERS (Tier 1) ─── */
@@ -6657,6 +6735,8 @@ function computePayroll(empId,from,to){
   const tOT=pays.reduce((s,p)=>s+p.otPay,0);
   const tND=pays.reduce((s,p)=>s+p.ndPay,0);
   const tTard=pays.reduce((s,p)=>s+p.tardinessDeduction,0);
+  const tUndertime=pays.reduce((s,p)=>s+(p.undertimePay||0),0);
+  const tUndertimeHrs=pays.reduce((s,p)=>s+(p.undertimeHrs||0),0);
   const tHolPrem=pays.reduce((s,p)=>s+p.holidayPremium,0);
   /* Art. 82: exempt employees don't accrue holiday pay for unworked regular holidays
      (their monthly salary already covers all calendar days). */
@@ -6668,14 +6748,14 @@ function computePayroll(empId,from,to){
   const adjList=(payrollAdjustments||[]).filter(a=>a.employeeId===empId&&a.payrollPeriod===periodKey);
   const additions=adjList.filter(a=>a.amount>=0).reduce((s,a)=>s+a.amount,0);
   const deductions=adjList.filter(a=>a.amount<0).reduce((s,a)=>s+Math.abs(a.amount),0);
-  const grossPay=Math.max(0,tBase+tOT+tND+tHolPrem+absentHolPay+additions-tTard-deductions);
+  const grossPay=Math.max(0,round2(tBase+tOT+tND+tHolPrem+absentHolPay+additions-tTard-tUndertime-deductions));
   /* Tier 1: SC + Tip pool shares for this period — pure proportional by hours.
      netPay = wage subtotal + pool shares = actual cash handed to the employee. */
   const distAll=buildPoolDistribution(from,to);
   const myDist=distAll.dist[empId]||{scShare:0,tipShare:0,hoursInPeriod:tHrs};
-  const scShare=myDist.scShare||0;
-  const tipShare=myDist.tipShare||0;
-  const netPay=grossPay+scShare+tipShare;
+  const scShare=round2(myDist.scShare||0);
+  const tipShare=round2(myDist.tipShare||0);
+  const netPay=round2(grossPay+scShare+tipShare);
   /* Resolve which account this employee's net pay comes out of for this period. */
   const payoutAccount=getEmployeePayoutAccount(empId,from,to);
   return{
@@ -6685,6 +6765,7 @@ function computePayroll(empId,from,to){
     totalHolidayPremium:tHolPrem,
     absentHolidayDays:absentHolDays.length,absentHolidayPay:absentHolPay,
     totalTardinessDeduction:tTard,
+    totalUndertimePay:tUndertime,totalUndertimeHours:tUndertimeHrs,
     additions,deductions,
     grossPay,
     scShare,tipShare,
@@ -6730,6 +6811,12 @@ function finalizePayroll({fromDate,toDate}){
   if(!fromDate||!toDate){toast('Enter from and to dates','error');return}
   /* Phase 1A: period lock on payroll date */
   if(isPeriodLocked(toDate)){toast('Accounting period locked for payroll period end date','error');return}
+  /* Guard against double-finalize: a second run for the same period would post a
+     duplicate set of wage/SC/tip entries (SC/Tip pools are summed status-agnostically,
+     so they don't self-limit) — double-debiting cash. Require an explicit unfinalize first. */
+  if((payrollRuns||[]).some(r=>r&&r.fromDate===fromDate&&r.toDate===toDate)){
+    toast('This period is already finalized — unfinalize it first (Payroll History) before re-running','error');return;
+  }
   const activeEmployees=roster.filter(r=>r.status!=='inactive');
   if(!activeEmployees.length){toast('No active employees on roster','error');return}
   const rowsPreview=activeEmployees.map(emp=>computePayroll(emp.id,fromDate,toDate)).filter(Boolean);
@@ -6768,10 +6855,10 @@ function finalizePayroll({fromDate,toDate}){
   const acctName=id=>accounts.find(a=>a.id===id)?.name||id||'(unset)';
 
   if(!confirm(`Finalize payroll for ${fmtDate(fromDate)} – ${fmtDate(toDate)}?\n\n`+
-    `• ${wageEntryCount} wage expense entr${wageEntryCount===1?'y':'ies'} (FOH/BOH/MGT × payout account)\n`+
-    `• ${scEntryCount} SC liability settlement${scEntryCount===1?'':'s'} (l2210)\n`+
-    `• ${tipEntryCount} Tip liability settlement${tipEntryCount===1?'':'s'} (l2220)\n\n`+
-    `Total net pay: ${fmt(totalNet)} (Wages ${fmt(totalWageGross)} + SC ${fmt(totalSC)} + Tips ${fmt(totalTip)})`))return;
+    `• ${wageEntryCount} wage entr${wageEntryCount===1?'y':'ies'} accrued as PAYABLE (FOH/BOH/MGT) — no cash yet; pay on payday via Unpaid Expenses\n`+
+    `• ${scEntryCount} SC settlement${scEntryCount===1?'':'s'} paid now (l2210)\n`+
+    `• ${tipEntryCount} Tip settlement${tipEntryCount===1?'':'s'} paid now (l2220)\n\n`+
+    `Wages payable: ${fmt(totalWageGross)} · Paid now (SC+Tips): ${fmt(totalSC+totalTip)} · Total net: ${fmt(totalNet)}`))return;
 
   const payrollId=uid();
   /* Snapshot rows (already includes scShare/tipShare/payoutAccount from Tier 1).
@@ -6792,7 +6879,10 @@ function finalizePayroll({fromDate,toDate}){
       category:getCOAName(c.id,c.name),
       account:g.account, amount:g.total,
       note:`Payroll ${g.dept} ${fromDate} – ${toDate} · ${g.count} employee${g.count===1?'':'s'} via ${acctName(g.account)}`,
-      status:'paid', expenseType:c.type, handler:currentUser,
+      /* Accrual: wages are recognized as expense at cutoff but cash leaves only on
+         payday. Posted unpaid → shows in "Unpaid Expenses (On Credit)"; click Pay
+         Now on payday to debit cash (Wages Payable → Cash). */
+      status:'unpaid', expenseType:c.type, handler:currentUser,
       payrollRunId:payrollId
     });
   });
@@ -6845,7 +6935,7 @@ function finalizePayroll({fromDate,toDate}){
 
   logActivity(`Payroll finalized: ${fmtDate(fromDate)}–${fmtDate(toDate)} · Net ${fmt(totalNet)} (Wages ${fmt(totalWageGross)} + SC ${fmt(totalSC)} + Tips ${fmt(totalTip)}) · ${rowsPreview.length} employees · ${entries.length} ledger entr${entries.length===1?'y':'ies'} · ${flippedCount} staffPayable${flippedCount===1?'':'s'} settled`);
   scheduleSave();renderMain();
-  toast(`Payroll finalized — ${fmt(totalNet)} posted across ${entries.length} entr${entries.length===1?'y':'ies'} ✓`,'success');
+  toast(`Payroll finalized — wages ${fmt(totalWageGross)} payable (pay on payday), ${fmt(totalSC+totalTip)} SC/Tips paid now ✓`,'success');
 }
 
 /* Undo a finalized payroll. Voids every ledger tx tagged with payrollRunId
@@ -6962,7 +7052,7 @@ function saveEditRoster(id){
     payrollType:document.getElementById('m-emp-payrolltype')?.value||r.payrollType||'daily',
     restDay:document.getElementById('m-emp-restday')?.value||r.restDay||'Sunday',
     scEligible:document.getElementById('m-emp-sc')?.checked??r.scEligible,
-    tipsEligible:document.getElementById('m-emp-sc')?.checked??r.tipsEligible,
+    tipsEligible:document.getElementById('m-emp-tips')?.checked??r.tipsEligible,
     exemptFromPremiumPay:document.getElementById('m-emp-exempt')?.checked??r.exemptFromPremiumPay??false,
     payoutAccount:document.getElementById('m-emp-payoutacct')?.value||r.payoutAccount||'',
     payoutAccountNo:document.getElementById('m-emp-payoutacctno')?.value||r.payoutAccountNo||''
@@ -6985,17 +7075,19 @@ function deleteShift(id){
   scheduleSave();render();toast('Shift deleted');
 }
 function calcShiftHours(ti,to,br){if(!ti||!to)return 0;const[ih,im]=ti.split(':').map(Number);const[oh,om]=to.split(':').map(Number);let mins=(oh*60+om)-(ih*60+im);if(mins<0)mins+=1440;mins-=(br||0);return Math.max(0,Math.round(mins*100/60)/100)}
-function calcSCTipDistribution(date){const ds=shifts.filter(s=>s.date===date);if(!ds.length)return[];const elig=ds.filter(s=>{const e=roster.find(r=>r.id===s.employeeId);return e?.scEligible!==false});const totH=elig.reduce((s,x)=>s+x.hoursWorked,0);const scT=staffPayables.filter(p=>p.date===date&&p.type==='sc'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);const tipT=staffPayables.filter(p=>p.date===date&&p.type==='tip'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);const pot=scT+tipT;return elig.map(s=>{const e=roster.find(r=>r.id===s.employeeId);const share=totH>0?(s.hoursWorked/totH)*pot:0;return{employeeId:s.employeeId,name:e?.name||'Unknown',position:e?.position||'',hoursWorked:s.hoursWorked,sharePct:totH>0?(s.hoursWorked/totH*100):0,scShare:totH>0?(s.hoursWorked/totH)*scT:0,tipShare:totH>0?(s.hoursWorked/totH)*tipT:0,totalShare:share,dailyRate:e?.dailyRate||0}}).sort((a,b)=>b.hoursWorked-a.hoursWorked)}
+function calcSCTipDistribution(date){const ds=shifts.filter(s=>s.date===date);if(!ds.length)return[];const empOf=s=>roster.find(r=>r.id===s.employeeId);const scT=staffPayables.filter(p=>p.date===date&&p.type==='sc'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);const tipT=staffPayables.filter(p=>p.date===date&&p.type==='tip'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);const pot=scT+tipT;/* SC and tips distribute over their OWN eligible-hours denominators (the two flags can differ). */const scH=ds.filter(s=>empOf(s)?.scEligible!==false).reduce((s,x)=>s+x.hoursWorked,0);const tipH=ds.filter(s=>empOf(s)?.tipsEligible!==false).reduce((s,x)=>s+x.hoursWorked,0);return ds.filter(s=>{const e=empOf(s);return e?.scEligible!==false||e?.tipsEligible!==false}).map(s=>{const e=empOf(s);const scShare=(e?.scEligible!==false&&scH>0)?(s.hoursWorked/scH)*scT:0;const tipShare=(e?.tipsEligible!==false&&tipH>0)?(s.hoursWorked/tipH)*tipT:0;const totalShare=scShare+tipShare;return{employeeId:s.employeeId,name:e?.name||'Unknown',position:e?.position||'',hoursWorked:s.hoursWorked,sharePct:pot>0?(totalShare/pot*100):0,scShare,tipShare,totalShare,dailyRate:e?.dailyRate||0}}).sort((a,b)=>b.hoursWorked-a.hoursWorked)}
 function saveEditShift(id){
   const s=shifts.find(x=>x.id===id);if(!s)return;
   const ti=document.getElementById('m-shift-in')?.value||s.timeIn;
   const to=document.getElementById('m-shift-out')?.value||s.timeOut;
   const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;
-  const late=parseInt(document.getElementById('m-shift-late')?.value||0)||0;
+  const sched=parseFloat(document.getElementById('m-shift-sched')?.value)||8;
+  const schedIn=document.getElementById('m-shift-schedin')?.value||ti;
   const note=document.getElementById('m-shift-note')?.value||'';
   const hrs=calcShiftHours(ti,to,br);
-  // Phase 2.7: no direct tx manipulation — shift records only
-  shifts=shifts.map(x=>x.id===id?{...x,timeIn:ti,timeOut:to,breakMins:br,lateMinutes:late,note,hoursWorked:hrs}:x);
+  // Phase 2.7: no direct tx manipulation — shift records only.
+  // Tardiness is derived in computeShiftPay from scheduledIn vs timeIn — no stored lateMinutes.
+  shifts=shifts.map(x=>x.id===id?{...x,timeIn:ti,timeOut:to,breakMins:br,scheduledHours:sched,scheduledIn:schedIn,note,hoursWorked:hrs}:x);
   scheduleSave();render();closeModal();toast('Shift updated ✓');
 }
 function submitAddRoster(){
@@ -7017,14 +7109,14 @@ function submitAddRoster(){
     payrollType:document.getElementById('m-emp-payrolltype')?.value||'daily',
     restDay:document.getElementById('m-emp-restday')?.value||'Sunday',
     scEligible:document.getElementById('m-emp-sc')?.checked!==false,
-    tipsEligible:document.getElementById('m-emp-sc')?.checked!==false,
+    tipsEligible:document.getElementById('m-emp-tips')?.checked!==false,
     exemptFromPremiumPay:document.getElementById('m-emp-exempt')?.checked===true,
     payoutAccount:document.getElementById('m-emp-payoutacct')?.value||'',
     payoutAccountNo:document.getElementById('m-emp-payoutacctno')?.value||'',
     status:'active'
   });
 }
-function submitAddShift(){const empId=document.getElementById('m-shift-emp')?.value;if(!empId){toast('Select an employee','error');return}const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;if(!ti||!to){toast('Enter shift times','error');return}addShift({employeeId:empId,date:document.getElementById('m-shift-date')?.value||today(),timeIn:ti,timeOut:to,breakMins:parseInt(document.getElementById('m-shift-break')?.value||0)||0,lateMinutes:parseInt(document.getElementById('m-shift-late')?.value||0)||0,note:document.getElementById('m-shift-note')?.value||''})}
+function submitAddShift(){const empId=document.getElementById('m-shift-emp')?.value;if(!empId){toast('Select an employee','error');return}const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;if(!ti||!to){toast('Enter shift times','error');return}addShift({employeeId:empId,date:document.getElementById('m-shift-date')?.value||today(),timeIn:ti,timeOut:to,breakMins:parseInt(document.getElementById('m-shift-break')?.value||0)||0,scheduledHours:parseFloat(document.getElementById('m-shift-sched')?.value)||8,scheduledIn:document.getElementById('m-shift-schedin')?.value||ti,note:document.getElementById('m-shift-note')?.value||''})}
 function submitAddHoliday(){const date=document.getElementById('m-hol-date')?.value;const name=(document.getElementById('m-hol-name')?.value||'').trim();const type=document.getElementById('m-hol-type')?.value||'special';if(!date||!name){toast('Date and name required','error');return}if(holidays.some(h=>h.date===date)){toast('Holiday already exists','error');return}holidays=[...holidays,{date,name,type}].sort((a,b)=>a.date.localeCompare(b.date));scheduleSave();renderMain();closeModal();toast('Holiday added ✓')}
 function deleteHoliday(date){if(!confirm('Remove this holiday?'))return;holidays=holidays.filter(h=>h.date!==date);scheduleSave();renderMain();toast('Removed')}
 let _laborTab='shifts';
@@ -7042,19 +7134,21 @@ function pgLabor(){
 function renderShiftsTab(vd,co){
   const ws=isoWeekStart(new Date(vd+'T12:00:00'));const wd=Array.from({length:7},(_,i)=>addDays(ws,i));
   const wShifts=shifts.filter(s=>wd.includes(s.date));
-  const wCost=wShifts.reduce((s,x)=>{const e=roster.find(r=>r.id===x.employeeId);return s+(e?.dailyRate||0)},0);
+  /* Labor cost = sum of each day's actual prorated shift pay (base+OT+ND+premium
+     −tardiness), so partial shifts no longer overstate cost. Matches payroll. */
+  const wCost=wd.reduce((s,date)=>s+dayLaborCostFromShifts(date),0);
   const wHrs=wShifts.reduce((s,x)=>s+x.hoursWorked,0);
   const wSales=transactions.filter(t=>wd.includes(t.date)&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);
   const lPct=wSales>0?(wCost/wSales*100):0;
   const dShifts=shifts.filter(s=>s.date===vd);
   const dSales=transactions.filter(t=>t.date===vd&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);
-  const dCost=dShifts.reduce((s,x)=>{const e=roster.find(r=>r.id===x.employeeId);return s+(e?.dailyRate||0)},0);
+  const dCost=dayLaborCostFromShifts(vd);
   const dayScPayable=staffPayables.filter(p=>p.date===vd&&p.type==='sc'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);
   const dayTipPayable=staffPayables.filter(p=>p.date===vd&&p.type==='tip'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);
   const dist=calcSCTipDistribution(vd);
   const distRows=dist.map(d=>`<tr><td style="font-size:.8rem;font-weight:500">${esc(d.name)}</td><td style="font-size:.75rem;color:var(--muted2)">${esc(d.position)}</td><td class="mono" style="text-align:right;font-size:.79rem">${d.hoursWorked.toFixed(1)}h</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--muted2)">${d.sharePct.toFixed(1)}%</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--purple)">${fmt(d.scShare)}</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--amber)">${fmt(d.tipShare)}</td><td class="mono" style="text-align:right;font-size:.82rem;font-weight:600">${fmt(d.totalShare)}</td></tr>`).join('');
-  const wRows=wd.map(date=>{const ds=shifts.filter(s=>s.date===date);const dc=ds.reduce((s,x)=>{const e=roster.find(r=>r.id===x.employeeId);return s+(e?.dailyRate||0)},0);const dh=ds.reduce((s,x)=>s+x.hoursWorked,0);const dS=transactions.filter(t=>t.date===date&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);const dp=dS>0?(dc/dS*100):0;const hol=getHoliday(date);return`<tr style="${date===vd?'background:rgba(41,37,36,.06)':''}cursor:pointer" onclick="window._laborDate='${date}';renderMain()"><td style="font-size:.79rem;white-space:nowrap">${new Date(date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})}${date===today()?'<span style="font-size:.63rem;color:var(--amber);margin-left:3px">today</span>':''}${hol?`<span class="holiday-badge ${hol.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${hol.type==='regular'?'RH':'SH'}</span>`:''}</td><td style="text-align:center;font-size:.79rem">${ds.length}</td><td class="mono" style="text-align:right;font-size:.79rem">${dh.toFixed(1)}h</td><td class="mono" style="text-align:right;font-size:.79rem">${fmt(dc)}</td><td class="mono" style="text-align:right;font-size:.79rem;color:${dS>0?(dp<=32?'var(--green)':dp<=38?'var(--amber)':'var(--red)'):'var(--muted2)'}">${dS>0?dp.toFixed(1)+'%':'—'}</td></tr>`;}).join('');
-  const dRows=dShifts.length?dShifts.map(s=>{const e=roster.find(r=>r.id===s.employeeId);const pay=computeShiftPay(s,e);const lb=applyTardinessBracket(s.lateMinutes||0);return`<div class="shift-row"><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:.83rem">${esc(e?.name||'Unknown')}</div><div style="font-size:.69rem;color:var(--muted2)">${esc(e?.position||'')} · ${s.timeIn}–${s.timeOut}${s.breakMins?` · ${s.breakMins}m break`:''}${s.lateMinutes>0?`<span class="late-badge" style="margin-left:4px">${s.lateMinutes}min late → ${lb}min deducted</span>`:''}${pay?.isHoliday?`<span class="holiday-badge ${pay.holiday?.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${pay.holidayNote}</span>`:''}</div></div><span class="mono" style="font-size:.8rem;color:var(--muted2);white-space:nowrap">${s.hoursWorked.toFixed(1)}h</span>${pay&&pay.otHrs>0?`<span style="font-size:.72rem;color:var(--blue);white-space:nowrap">OT:${pay.otHrs.toFixed(1)}h</span>`:''}${pay&&pay.ndHrs>0?`<span style="font-size:.72rem;color:var(--purple);white-space:nowrap">ND:${pay.ndHrs.toFixed(1)}h</span>`:''}<span class="mono" style="font-size:.82rem;color:var(--green);white-space:nowrap">${fmt(pay?.grossPay||0)}</span><button class="row-btn" onclick="openModal('editShift','${s.id}')" title="Edit">✎</button><button class="row-btn del" onclick="deleteShift('${s.id}')" title="Delete">✕</button></div>`}).join(''):`<div class="empty" style="padding:14px">No shifts logged. <button class="btn btn-ghost btn-sm" onclick="openModal('addShift')">+ Log Shift</button></div>`;
+  const wRows=wd.map(date=>{const ds=shifts.filter(s=>s.date===date);const dc=dayLaborCostFromShifts(date);const dh=ds.reduce((s,x)=>s+x.hoursWorked,0);const dS=transactions.filter(t=>t.date===date&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);const dp=dS>0?(dc/dS*100):0;const hol=getHoliday(date);return`<tr style="${date===vd?'background:rgba(41,37,36,.06)':''}cursor:pointer" onclick="window._laborDate='${date}';renderMain()"><td style="font-size:.79rem;white-space:nowrap">${new Date(date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})}${date===today()?'<span style="font-size:.63rem;color:var(--amber);margin-left:3px">today</span>':''}${hol?`<span class="holiday-badge ${hol.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${hol.type==='regular'?'RH':'SH'}</span>`:''}</td><td style="text-align:center;font-size:.79rem">${ds.length}</td><td class="mono" style="text-align:right;font-size:.79rem">${dh.toFixed(1)}h</td><td class="mono" style="text-align:right;font-size:.79rem">${fmt(dc)}</td><td class="mono" style="text-align:right;font-size:.79rem;color:${dS>0?(dp<=32?'var(--green)':dp<=38?'var(--amber)':'var(--red)'):'var(--muted2)'}">${dS>0?dp.toFixed(1)+'%':'—'}</td></tr>`;}).join('');
+  const dRows=dShifts.length?dShifts.map(s=>{const e=roster.find(r=>r.id===s.employeeId);const pay=computeShiftPay(s,e);return`<div class="shift-row"><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:.83rem">${esc(e?.name||'Unknown')}</div><div style="font-size:.69rem;color:var(--muted2)">${esc(e?.position||'')} · ${s.timeIn}–${s.timeOut}${s.breakMins?` · ${s.breakMins}m break`:''}${pay&&pay.lateMinutes>0?`<span class="late-badge" style="margin-left:4px">${pay.lateMinutes}m late → ${pay.tardinessBracketMins}m</span>`:''}${pay&&pay.undertimeHrs>0?`<span class="late-badge" style="margin-left:4px">UT ${pay.undertimeHrs.toFixed(1)}h</span>`:''}${pay?.isHoliday?`<span class="holiday-badge ${pay.holiday?.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${pay.holidayNote}</span>`:''}</div></div><span class="mono" style="font-size:.8rem;color:var(--muted2);white-space:nowrap">${s.hoursWorked.toFixed(1)}h</span>${pay&&pay.otHrs>0?`<span style="font-size:.72rem;color:var(--blue);white-space:nowrap">OT:${pay.otHrs.toFixed(1)}h</span>`:''}${pay&&pay.ndHrs>0?`<span style="font-size:.72rem;color:var(--purple);white-space:nowrap">ND:${pay.ndHrs.toFixed(1)}h</span>`:''}<span class="mono" style="font-size:.82rem;color:var(--green);white-space:nowrap">${fmt(pay?.grossPay||0)}</span><button class="row-btn" onclick="openModal('editShift','${s.id}')" title="Edit">✎</button><button class="row-btn del" onclick="deleteShift('${s.id}')" title="Delete">✕</button></div>`}).join(''):`<div class="empty" style="padding:14px">No shifts logged. <button class="btn btn-ghost btn-sm" onclick="openModal('addShift')">+ Log Shift</button></div>`;
   return`<div class="g5" style="margin-bottom:12px"><div class="card"><div class="stat-label">Week Labor Cost</div><div class="stat-value red">${fmt(wCost)}</div><div class="stat-sub">${wHrs.toFixed(1)}h total</div></div><div class="card"><div class="stat-label">Labor % (Week)</div><div class="stat-value">${wSales>0?lPct.toFixed(1):'—'}%</div>${wSales>0?pctBadge(lPct,'labor'):''}</div><div class="card"><div class="stat-label">Today Labor Cost</div><div class="stat-value red">${fmt(dCost)}</div><div class="stat-sub">Labor %: ${dSales>0?(dCost/dSales*100).toFixed(1)+'%':'—'}</div></div><div class="card"><div class="stat-label">SC Pool</div><div class="stat-value" style="color:var(--purple)">${fmt(dayScPayable)}</div><div class="stat-sub">${fmtDate(vd)}</div></div><div class="card"><div class="stat-label">Tips Pool</div><div class="stat-value" style="color:var(--amber)">${fmt(dayTipPayable)}</div><div class="stat-sub">${fmtDate(vd)}</div></div></div>
 <div style="display:grid;grid-template-columns:1fr 1.4fr;gap:12px;margin-bottom:12px">
 <div class="card-flush"><div style="padding:8px 12px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border)"><span class="sec-title">Week Overview</span><div style="display:flex;gap:4px"><button class="btn btn-ghost btn-xs" onclick="window._laborDate=addDays('${ws}',-7);renderMain()">← Prev</button><button class="btn btn-ghost btn-xs" onclick="window._laborDate=addDays('${ws}',7);renderMain()">Next →</button></div></div><table class="labor-table"><thead><tr><th>Date</th><th style="text-align:center">Staff</th><th style="text-align:right">Hrs</th><th style="text-align:right">Cost</th><th style="text-align:right">Labor%</th></tr></thead><tbody>${wRows}</tbody><tfoot><tr style="font-weight:700;background:var(--bg3)"><td>Total</td><td style="text-align:center">${wShifts.length}</td><td class="mono" style="text-align:right">${wHrs.toFixed(1)}h</td><td class="mono" style="text-align:right">${fmt(wCost)}</td><td class="mono" style="text-align:right;color:${lPct<=32?'var(--green)':lPct<=38?'var(--amber)':'var(--red)'}">${wSales>0?lPct.toFixed(1)+'%':'—'}</td></tr></tfoot></table></div>
@@ -7088,6 +7182,7 @@ function renderPayrollTab(co){
   const totalTipDist=payrolls.reduce((s,p)=>s+(p.tipShare||0),0);
   const totalNet=payrolls.reduce((s,p)=>s+(p.netPay||p.grossPay),0);
   const periodKey=`${from}_${to}`;
+  const alreadyFinalized=(payrollRuns||[]).some(r=>r&&r.fromDate===from&&r.toDate===to);
   const periodAdjs=(payrollAdjustments||[]).filter(a=>a.payrollPeriod===periodKey);
   const pool=getPayrollPool(from,to);
   /* DSR-detected pool sums for this period — these are the auto values used when
@@ -7140,7 +7235,8 @@ function renderPayrollTab(co){
         </div>
         <div>
           <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">Deductions</div>
-          ${p.totalTardinessDeduction>0?`<div class="payslip-row"><span>Tardiness</span><span class="mono red">−${fmt(p.totalTardinessDeduction)}</span></div>`:`<div class="payslip-row"><span>Tardiness</span><span class="mono green">None ✓</span></div>`}
+          ${p.totalUndertimePay>0?`<div class="payslip-row"><span>Undertime (${(p.totalUndertimeHours||0).toFixed(1)}h)</span><span class="mono red">−${fmt(p.totalUndertimePay)}</span></div>`:''}
+          ${p.totalTardinessDeduction>0?`<div class="payslip-row"><span>Tardiness</span><span class="mono red">−${fmt(p.totalTardinessDeduction)}</span></div>`:''}
           ${deductionsTotal>0?`<div class="payslip-row" style="color:var(--red)"><span>Adjustments (−)</span><span class="mono">−${fmt(deductionsTotal)}</span></div>`:''}
           ${empAdjs.length?`<div style="margin-top:5px;border-top:1px solid var(--border);padding-top:5px">${empAdjs.map(a=>`<div class="payslip-row"><span style="font-size:.72rem;color:var(--muted2)">${esc(a.category.replace(/_/g,' '))}${a.note?' — '+a.note:''}</span><span class="mono" style="font-size:.72rem;color:${a.amount>=0?'var(--green)':'var(--red)'}">${a.amount>=0?'+':''}${fmt(a.amount)}</span></div>`).join('')}</div>`:''}
         </div>
@@ -7159,17 +7255,17 @@ function renderPayrollTab(co){
     <div style="display:flex;gap:6px;flex-wrap:wrap">
       <button class="btn btn-ghost btn-sm" onclick="window._payFrom='${toggleTarget.from}';window._payTo='${toggleTarget.to}';renderMain()">Switch: ${toggleTarget.label}</button>
       <button class="btn btn-ghost btn-sm" onclick="openModal('addPayrollAdj',{period:'${from}_${to}'})">+ Adjustment</button>
-      <button class="btn btn-primary btn-sm" onclick="openModal('finalizePayroll',{from:'${from}',to:'${to}'})">✓ Finalize Payroll</button>
+      ${alreadyFinalized?`<button class="btn btn-ghost btn-sm" disabled style="opacity:.6;cursor:not-allowed">✓ Finalized — undo in History</button>`:`<button class="btn btn-primary btn-sm" onclick="openModal('finalizePayroll',{from:'${from}',to:'${to}'})">✓ Finalize Payroll</button>`}
       <button class="btn btn-ghost btn-sm" onclick="roster.filter(r=>r.status!=='inactive').forEach(e=>printPayslip(e.id,'${from}','${to}'))">🖨 Print All</button>
     </div>
   </div>
   <div class="g3" style="margin-bottom:10px">
-    <div class="card"><div class="stat-label">Wage Gross</div><div class="stat-value red">${fmt(totalWageGross)}</div><div class="stat-sub">Posts to FOH/BOH/MGT expense</div></div>
+    <div class="card"><div class="stat-label">Wage Gross</div><div class="stat-value red">${fmt(totalWageGross)}</div><div class="stat-sub">Accrues as payable · pay on payday</div></div>
     <div class="card"><div class="stat-label">SC Distributed</div><div class="stat-value" style="color:var(--purple)">${fmt(totalSCDist)}</div><div class="stat-sub">${fmt(effectiveSC)} pool · ${scIsManual?'manual':'from DSR'}</div></div>
     <div class="card"><div class="stat-label">Tips Distributed</div><div class="stat-value" style="color:var(--amber)">${fmt(totalTipDist)}</div><div class="stat-sub">${fmt(effectiveTip)} pool · ${tipIsManual?'manual':'from DSR'}</div></div>
   </div>
   <div class="g3" style="margin-bottom:14px">
-    <div class="card"><div class="stat-label">Total Net Pay</div><div class="stat-value green">${fmt(totalNet)}</div><div class="stat-sub">${payrolls.length} employees · what leaves cash/bank</div></div>
+    <div class="card"><div class="stat-label">Total Net Pay</div><div class="stat-value green">${fmt(totalNet)}</div><div class="stat-sub">${payrolls.length} employees · SC/Tips now, wages on payday</div></div>
     <div class="card"><div class="stat-label">Days Worked</div><div class="stat-value">${payrolls.reduce((s,p)=>s+p.daysWorked,0)}</div></div>
     <div class="card"><div class="stat-label">Total OT Hours</div><div class="stat-value" style="color:var(--blue)">${payrolls.reduce((s,p)=>s+p.totalOTHours,0).toFixed(1)}h</div></div>
   </div>
@@ -7230,7 +7326,7 @@ function renderPayrollHistoryTab(){
     const rowHtml=rows.map(p=>`<tr>
       <td style="font-size:.8rem;font-weight:500">${esc(p.emp?.name||p.employeeName||'—')}</td>
       <td style="font-size:.75rem;color:var(--muted2)">${p.daysWorked} days · ${(p.totalHours||0).toFixed(1)}h</td>
-      <td class="mono" style="text-align:right;font-size:.8rem">${fmt(p.totalBasePay)}</td>
+      <td class="mono" style="text-align:right;font-size:.8rem">${fmt((p.totalBasePay||0)-(p.totalUndertimePay||0))}</td>
       <td class="mono" style="text-align:right;font-size:.78rem;color:var(--blue)">${p.totalOTPay>0?fmt(p.totalOTPay):'—'}</td>
       <td class="mono" style="text-align:right;font-size:.78rem;color:var(--purple)">${p.totalNDPay>0?fmt(p.totalNDPay):'—'}</td>
       <td class="mono" style="text-align:right;font-size:.78rem;color:var(--purple)">${p.scShare>0?fmt(p.scShare):'—'}</td>
@@ -7364,7 +7460,8 @@ table{width:100%;border-collapse:collapse}td{padding:4px 0;border-bottom:1px sol
   ${p.scShare>0?`<tr><td class="purple">Service Charge</td><td class="r purple">${fmt(p.scShare)}</td></tr>`:''}
   ${p.tipShare>0?`<tr><td class="amber">Tips</td><td class="r amber">${fmt(p.tipShare)}</td></tr>`:''}
   <tr><td class="section" colspan="2">Deductions</td></tr>
-  ${p.totalTardinessDeduction>0?`<tr><td>Tardiness</td><td class="r red">−${fmt(p.totalTardinessDeduction)}</td></tr>`:'<tr><td>Tardiness</td><td class="r muted">None ✓</td></tr>'}
+  ${p.totalUndertimePay>0?`<tr><td>Undertime (${(p.totalUndertimeHours||0).toFixed(1)}h)</td><td class="r red">−${fmt(p.totalUndertimePay)}</td></tr>`:''}
+  ${p.totalTardinessDeduction>0?`<tr><td>Tardiness</td><td class="r red">−${fmt(p.totalTardinessDeduction)}</td></tr>`:''}
   ${empAdjs.filter(a=>a.amount<0).map(a=>`<tr><td>${esc(a.category.replace(/_/g,' '))}${a.note?' — '+a.note:''}</td><td class="r red">−${fmt(Math.abs(a.amount))}</td></tr>`).join('')}
   <tr><td class="total">NET PAY</td><td class="r total green">${fmt(p.netPay||p.grossPay)}</td></tr>
 </table>
