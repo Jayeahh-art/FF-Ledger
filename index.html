@@ -3501,7 +3501,14 @@ function deleteTransaction(id){
 
 function voidTransaction(id,reason='Manual void'){
   const tx=transactions.find(t=>t.id===id);
-  if(!tx||!confirm('Void this transaction? It will remain in the log marked as voided.'))return;
+  if(!tx)return;
+  /* Integrity guard: system-generated entries are owned by a payroll run or a cash
+     advance. Voiding them directly would desync payrollRuns / cashAdvances (e.g. a
+     run still reads "finalized" with its ledger gone, or a phantom receivable). Route
+     the user to the proper undo, which reverses the ledger AND the linked state. */
+  if(tx.payrollRunId){toast('This entry belongs to a finalized payroll — reverse it via Payroll History → Unfinalize (keeps history in sync)','error');return;}
+  if(tx.advanceId){toast('This entry belongs to a cash advance — delete the advance instead so the balance stays correct','error');return;}
+  if(!confirm('Void this transaction? It will remain in the log marked as voided.'))return;
   if(isPeriodLocked(tx.date)){toast('Accounting period locked','error');return;}
   /* Mark void then rebuild via the gateway.
      Hotfix H5/H6: gateway rebuilds; skipAudit:true so only the per-tx 'void'
@@ -4196,6 +4203,9 @@ function settleTab(id){
 function confirmSettleTab(id){
   const tab=tabs.find(t=>t.id===id);
   if(!tab)return;
+  /* Idempotency guard: never settle an already-closed tab twice (double-click /
+     double-submit race) — that would post a second ledger entry. */
+  if(tab.paid||tab.closed||tab.status==='closed'){toast('This tab is already settled','error');closeModal();return;}
   const method=document.getElementById('m-settle-method')?.value||'cash';
   const date=document.getElementById('m-settle-date')?.value||today();
   const note=document.getElementById('m-settle-note')?.value||'';
@@ -5414,6 +5424,9 @@ function rebuildAccountBalances(){
 function markExpensePaid(id){
   const tx=transactions.find(t=>t.id===id);
   if(!tx||tx.status==='paid')return;
+  /* Paying flips unpaid→paid which moves cash — block if the tx date sits in a
+     locked accounting period (consistent with edit/void). */
+  if(isPeriodLocked(tx.date)){toast('Accounting period locked for '+fmtDate(tx.date),'error');return;}
   /* Hotfix H5: removed redundant rebuildAccountBalances() — gateway rebuilds.
      The status flip from 'unpaid' to 'paid' is what causes the cash debit
      in rebuildAccountBalances() (case 'expense' early-return on unpaid). */
