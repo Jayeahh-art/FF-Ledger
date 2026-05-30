@@ -320,14 +320,18 @@ textarea{resize:vertical;min-height:64px}
    UTILS
 ═══════════════════════════════════════════════ */
 const uid=()=>Math.random().toString(36).slice(2,9);
-const today=()=>new Date().toISOString().split('T')[0];
+/* LOCAL calendar date as YYYY-MM-DD. Must NOT use toISOString() (that returns UTC,
+   which rolls the "business day" at 08:00 in UTC+8 and shifts week boundaries — the
+   cause of the dashboard day-shift). All date keys in this app are local-day strings. */
+const localISO=(d=new Date())=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+const today=()=>localISO();
 const fmt=n=>new Intl.NumberFormat('en-PH',{style:'currency',currency:'PHP'}).format(n??0);
 const fmtDate=iso=>new Date(iso+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
 const fmtShort=iso=>new Date(iso+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'});
 const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 const pct=(a,b)=>b>0?((a/b)*100).toFixed(1):'—';
-const isoWeekStart=(d=new Date())=>{const dt=new Date(d);dt.setDate(dt.getDate()-((dt.getDay()+6)%7));return dt.toISOString().split('T')[0]};
-const addDays=(iso,n)=>{const d=new Date(iso+'T12:00:00');d.setDate(d.getDate()+n);return d.toISOString().split('T')[0]};
+const isoWeekStart=(d=new Date())=>{const dt=new Date(d);dt.setDate(dt.getDate()-((dt.getDay()+6)%7));return localISO(dt)};
+const addDays=(iso,n)=>{const d=new Date(iso+'T12:00:00');d.setDate(d.getDate()+n);return localISO(d)};
 
 /* ═══════════════════════════════════════════════
    PIN / AUTH
@@ -1084,7 +1088,7 @@ let reportTab='pl'; /* 'pl' | 'balance' | 'cashflow' */
 /* Global date filter — affects all pages */
 let globalDate={preset:'today',from:today(),to:today()};
 function setGlobalPreset(p){
-  const n=new Date(),iso=d=>d.toISOString().split('T')[0];
+  const n=new Date(),iso=d=>localISO(d);
   globalDate.preset=p;
   if(p==='today'){globalDate.from=globalDate.to=today()}
   else if(p==='yesterday'){const d=new Date(n);d.setDate(d.getDate()-1);globalDate.from=globalDate.to=iso(d)}
@@ -1875,8 +1879,8 @@ function getWeekRevenue(offsetWeeks=0){
   const end=new Date(start);
   end.setDate(start.getDate()+6);
 
-  const startIso=start.toISOString().split('T')[0];
-  const endIso=end.toISOString().split('T')[0];
+  const startIso=localISO(start);
+  const endIso=localISO(end);
 
   return transactions
     .filter(t=>!t.voided)
@@ -2619,7 +2623,7 @@ function getWeekDates(offsetWeeks=0){
   const ws=new Date(isoWeekStart());
   ws.setDate(ws.getDate()+offsetWeeks*7);
   const dates=[];
-  for(let i=0;i<7;i++){const d=new Date(ws);d.setDate(d.getDate()+i);dates.push(d.toISOString().split('T')[0])}
+  for(let i=0;i<7;i++){const d=new Date(ws);d.setDate(d.getDate()+i);dates.push(localISO(d))}
   return dates;
 }
 
@@ -4709,8 +4713,8 @@ function renderWeeklyPerformanceSection(){
     const end=new Date(start);
     end.setDate(start.getDate()+6);
 
-    const startIso=start.toISOString().split('T')[0];
-    const endIso=end.toISOString().split('T')[0];
+    const startIso=localISO(start);
+    const endIso=localISO(end);
 
     return (transactions||[])
       .filter(t=>!t.voided)
@@ -6306,9 +6310,9 @@ function pgReports(){
 
   const periodDates={
     week:Array.from({length:7},(_,i)=>addDays(isoWeekStart(new Date()),i)),
-    month:(()=>{const n=new Date(),y=n.getFullYear(),m=n.getMonth();return Array.from({length:new Date(y,m+1,0).getDate()},(_,i)=>new Date(y,m,i+1).toISOString().split('T')[0])})(),
-    quarter:(()=>{const n=new Date(),q=Math.floor(n.getMonth()/3),y=n.getFullYear();const s=new Date(y,q*3,1),e=new Date(y,q*3+3,0);const ds=[];let d=new Date(s);while(d<=e){ds.push(d.toISOString().split('T')[0]);d.setDate(d.getDate()+1)}return ds})(),
-    year:(()=>{const y=new Date().getFullYear();return Array.from({length:365},(_,i)=>{const d=new Date(y,0,i+1);return d.getFullYear()===y?d.toISOString().split('T')[0]:null}).filter(Boolean)})(),
+    month:(()=>{const n=new Date(),y=n.getFullYear(),m=n.getMonth();return Array.from({length:new Date(y,m+1,0).getDate()},(_,i)=>localISO(new Date(y,m,i+1)))})(),
+    quarter:(()=>{const n=new Date(),q=Math.floor(n.getMonth()/3),y=n.getFullYear();const s=new Date(y,q*3,1),e=new Date(y,q*3+3,0);const ds=[];let d=new Date(s);while(d<=e){ds.push(localISO(d));d.setDate(d.getDate()+1)}return ds})(),
+    year:(()=>{const y=new Date().getFullYear();return Array.from({length:365},(_,i)=>{const d=new Date(y,0,i+1);return d.getFullYear()===y?localISO(d):null}).filter(Boolean)})(),
   };
 
   const dates=periodDates[reportPeriod]||periodDates.month;
@@ -6594,7 +6598,7 @@ function getCutoffPeriod(date){
   else if(day<=10){const pm=m===1?12:m-1,py=m===1?y-1:y;return{period:1,from:`${py}-${String(pm).padStart(2,'0')}-26`,to:`${y}-${String(m).padStart(2,'0')}-10`,payDay:`${y}-${String(m).padStart(2,'0')}-15`,label:`${new Date(py,pm-1,26).toLocaleDateString('en-US',{month:'short',day:'numeric'})} – ${new Date(y,m-1,10).toLocaleDateString('en-US',{month:'short',day:'numeric'})}`};}
   else{return{period:2,from:`${y}-${String(m).padStart(2,'0')}-11`,to:`${y}-${String(m).padStart(2,'0')}-25`,payDay:`${y}-${String(m).padStart(2,'0')}-${new Date(y,m,0).getDate()}`,label:`${new Date(y,m-1,11).toLocaleDateString('en-US',{month:'short',day:'numeric'})} – ${new Date(y,m-1,25).toLocaleDateString('en-US',{month:'short',day:'numeric'})}`};}
 }
-function getCutoffDates(from,to){const dates=[];let d=new Date(from+'T12:00:00');const end=new Date(to+'T12:00:00');while(d<=end){dates.push(d.toISOString().split('T')[0]);d.setDate(d.getDate()+1)}return dates}
+function getCutoffDates(from,to){const dates=[];let d=new Date(from+'T12:00:00');const end=new Date(to+'T12:00:00');while(d<=end){dates.push(localISO(d));d.setDate(d.getDate()+1)}return dates}
 function applyTardinessBracket(m){const g=Number(payrollSettings.tardinessGraceMinutes)||0;if(!m||m<=g)return 0;if(m<30)return 30;if(m<60)return 60;return 240}
 function calcNDHours(ti,to){if(!ti||!to)return 0;const toM=t=>{const[h,m]=t.split(':').map(Number);return h*60+m};
   /* Night-diff window is configurable via payrollSettings.ndStart / ndEnd (defaults
@@ -7344,7 +7348,7 @@ function renderPayrollTab(co){
   const lastDayOfStartMonth=new Date(mY,mM,0).getDate();
   const altCo=co.period===1
     ? { from:`${m}-11`, to:`${m}-25`, payDay:`${m}-${String(lastDayOfStartMonth).padStart(2,'0')}`, label:'11th–25th' }
-    : { from:(()=>{const d=new Date(co.from+'T12:00:00');d.setMonth(d.getMonth()-1);return d.toISOString().split('T')[0].slice(0,7)+'-26'})(),
+    : { from:(()=>{const d=new Date(co.from+'T12:00:00');d.setMonth(d.getMonth()-1);return localISO(d).slice(0,7)+'-26'})(),
         to:`${m}-10`, payDay:`${m}-15`, label:'26th–10th' };
   /* Bidirectional toggle: if currently viewing the alternate period, the Switch
      button flips back to the today-based period; otherwise it goes to the alt. */
@@ -7924,11 +7928,11 @@ function buildWeeklyTotals(dm){const w={};Object.entries(dm).forEach(([iso,d])=>
 function weightedMovingAvg(wt,field){const n=wt.length;if(!n)return 0;const weights=wt.map((_,i)=>Math.max(1,3-(n-1-i)));const sumW=weights.reduce((a,b)=>a+b,0);return wt.reduce((s,w,i)=>s+w[field]*weights[i],0)/sumW}
 function buildDOWIndex(dm){const ds=[0,0,0,0,0,0,0],dc=[0,0,0,0,0,0,0];Object.entries(dm).forEach(([iso,d])=>{const dow=new Date(iso+'T12:00:00').getDay();ds[dow]+=d.sales;dc[dow]++});const da=ds.map((s,i)=>dc[i]>0?s/dc[i]:null);const oa=da.filter(Boolean).reduce((a,b)=>a+b,0)/(da.filter(Boolean).length||1);return da.map(v=>v!=null?v/oa:1.0)}
 function buildStdDev(dm){const vals=Object.values(dm).map(d=>d.sales).filter(v=>v>0);if(vals.length<2)return 0;const mean=vals.reduce((a,b)=>a+b,0)/vals.length;return Math.sqrt(vals.reduce((s,v)=>s+(v-mean)**2,0)/vals.length)}
-function runForecast(days=30){const dm=buildDailyHistory(),wd=buildWeeklyTotals(dm);const tc=treasuryService.getOperationalLiquidity();if(!wd.length)return{days:[],hasEnoughData:false,weeksOfData:0,dowIndex:[1,1,1,1,1,1,1],totalCash:tc};const wmaS=weightedMovingAvg(wd,'sales'),wmaO=weightedMovingAvg(wd,'otherExp');const di=buildDOWIndex(dm),sd=buildStdDev(dm),ads=wmaS/7;const result=[];let rc=tc;for(let i=1;i<=days;i++){const d=new Date();d.setDate(d.getDate()+i);const iso=d.toISOString().split('T')[0],dow=d.getDay();const fs=ads*di[dow],fc=fs*(forecastTargets.cogsTarget/100),fl=fs*(forecastTargets.laborTarget/100),fo=wmaO/7;const fe=fc+fl+fo,fn=fs-fe;rc+=fn;result.push({iso,dow,label:d.toLocaleDateString('en-US',{month:'short',day:'numeric'}),dayLabel:d.toLocaleDateString('en-US',{weekday:'short'}),forecastedSales:fs,forecastedCogs:fc,forecastedLabor:fl,forecastedOther:fo,forecastedExp:fe,forecastedNet:fn,bestSales:fs+sd*di[dow],worstSales:Math.max(0,fs-sd*di[dow]),forecastedPrime:fs>0?(fc+fl)/fs*100:0,runningCash:rc,isWeekend:dow===0||dow===6})}return{days:result,hasEnoughData:wd.length>=2,weeksOfData:wd.length,wmaWeeklySales:wmaS,avgDailySales:ads,dowIndex:di,stdDev:sd,totalCash:tc}}
+function runForecast(days=30){const dm=buildDailyHistory(),wd=buildWeeklyTotals(dm);const tc=treasuryService.getOperationalLiquidity();if(!wd.length)return{days:[],hasEnoughData:false,weeksOfData:0,dowIndex:[1,1,1,1,1,1,1],totalCash:tc};const wmaS=weightedMovingAvg(wd,'sales'),wmaO=weightedMovingAvg(wd,'otherExp');const di=buildDOWIndex(dm),sd=buildStdDev(dm),ads=wmaS/7;const result=[];let rc=tc;for(let i=1;i<=days;i++){const d=new Date();d.setDate(d.getDate()+i);const iso=localISO(d),dow=d.getDay();const fs=ads*di[dow],fc=fs*(forecastTargets.cogsTarget/100),fl=fs*(forecastTargets.laborTarget/100),fo=wmaO/7;const fe=fc+fl+fo,fn=fs-fe;rc+=fn;result.push({iso,dow,label:d.toLocaleDateString('en-US',{month:'short',day:'numeric'}),dayLabel:d.toLocaleDateString('en-US',{weekday:'short'}),forecastedSales:fs,forecastedCogs:fc,forecastedLabor:fl,forecastedOther:fo,forecastedExp:fe,forecastedNet:fn,bestSales:fs+sd*di[dow],worstSales:Math.max(0,fs-sd*di[dow]),forecastedPrime:fs>0?(fc+fl)/fs*100:0,runningCash:rc,isWeekend:dow===0||dow===6})}return{days:result,hasEnoughData:wd.length>=2,weeksOfData:wd.length,wmaWeeklySales:wmaS,avgDailySales:ads,dowIndex:di,stdDev:sd,totalCash:tc}}
 function pgForecast(){
   const fc=runForecast(30);const targets=forecastTargets;
   const cut30=new Date();cut30.setDate(cut30.getDate()-30);
-  const past30=transactions.filter(t=>t.date>=cut30.toISOString().split('T')[0]&&t.date<today()&&!t.voided);
+  const past30=transactions.filter(t=>t.date>=localISO(cut30)&&t.date<today()&&!t.voided);
   const pastM=calcMetrics(past30);
   const nw=fc.days.slice(0,7);
   const nwSales=nw.reduce((s,d)=>s+d.forecastedSales,0);
