@@ -4104,7 +4104,14 @@ function renderModal(){
     }).sort((a,b)=>a.code.localeCompare(b.code)).map(c=>`<option value="${esc(c.name)}" data-coaid="${c.id}" ${data?.category===c.name?'selected':''}>${c.code} — ${esc(c.name)}</option>`).join('');
     let catField='', acctField='';
     if(txType==='transfer'){
-      catField=`<div class="form-row"><div class="form-group"><label>From Account</label><select id="m-from">${acctOpts}</select></div><div class="form-group"><label>To Account</label><select id="m-to">${acctOpts2}</select></div></div>`;
+      /* For transfers, allow clearing accounts (Card / Sales Clearing) as the FROM
+         dropdown so the user can drain them when settlements actually arrive (e.g.
+         card-processor deposit hits the bank → transfer Card Clearing → Bank). TO
+         stays restricted to non-clearing accounts: only DSR/system should ever post
+         INTO clearing, never a manual transfer. */
+      const fromList=accounts.filter(a=>a);
+      const fromOpts=fromList.map(a=>`<option value="${a.id}" ${(data?.fromAccount||data?.account||fromList[0]?.id)===a.id?'selected':''}>${esc(a.name)}${a.type==='clearing'?' · clearing':''}</option>`).join('');
+      catField=`<div class="form-row"><div class="form-group"><label>From Account</label><select id="m-from">${fromOpts}</select></div><div class="form-group"><label>To Account</label><select id="m-to">${acctOpts2}</select></div></div>`;
     }else{
       catField=`<div class="form-group"><label>Category</label><select id="m-cat"><option value="">— select —</option>${catOpts}</select></div>`;
       acctField=`<div class="form-group"><label>${txType==='expense'?'Paid From':'Deposit To'}</label><select id="m-acct">${acctOpts}</select></div>`;
@@ -5032,8 +5039,8 @@ function pgDashboard(){
 <!-- ═══ IMAGE 1 STYLE — WoW + Budget rows ══════ -->
 <div class="card-flush" style="margin-bottom:14px;overflow-x:auto">
   <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
-    <span class="sec-title">This Week vs Last Week vs Budget</span>
-    <span style="font-size:.71rem;color:var(--muted2)">Period: ${thisWeekDates[0]} – ${thisWeekDates[6]}</span>
+    <span class="sec-title">WoW Comparison <span style="font-size:.7rem;font-weight:500;color:var(--muted2);text-transform:none;letter-spacing:0;margin-left:4px">· fixed: this week vs last week · ignores the top filter</span></span>
+    <span style="font-size:.71rem;color:var(--muted2)">${thisWeekDates[0]} – ${thisWeekDates[6]}</span>
   </div>
   <table style="min-width:600px">
     <thead>
@@ -5252,12 +5259,21 @@ function pgFunds(){
     const p=total>0?(a.balance/total*100):0;
     return`<div class="card"><div style="display:flex;align-items:start;justify-content:space-between;margin-bottom:11px"><div style="display:flex;align-items:center;gap:7px"><span class="acct-dot" style="background:${a.color};width:9px;height:9px"></span><div><div style="font-weight:600;font-size:.875rem">${esc(a.name)}</div><div style="font-size:.69rem;color:var(--muted2)">${{cash:'💵 Cash',bank:'🏦 Bank',ewallet:'📱 GCash'}[a.type]||a.type}</div></div></div><button class="btn btn-danger btn-xs" onclick="deleteAccount('${a.id}')">Remove</button></div><div style="font-family:var(--fm);font-size:1.2rem;font-weight:500;margin-bottom:8px">${fmt(a.balance)}</div><div class="progress-bar"><div class="progress-fill" style="width:${Math.min(100,p)}%;background:${a.color}"></div></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:7px;font-size:.76rem;margin:9px 0"><div><div class="stat-label" style="font-size:.62rem">Total In</div><div class="green">${fmt(inflow)}</div></div><div><div class="stat-label" style="font-size:.62rem">Total Out</div><div class="red">${fmt(outflow)}</div></div><div><div class="stat-label" style="font-size:.62rem">Transactions</div><div>${txAll.length}</div></div><div><div class="stat-label" style="font-size:.62rem">Share</div><div>${p.toFixed(1)}%</div></div></div><div style="display:flex;gap:5px"><button class="btn btn-ghost btn-xs" style="flex:1" onclick="openModal('deposit')">↓ Deposit</button><button class="btn btn-ghost btn-xs" style="flex:1" onclick="openModal('withdrawal')">↑ Withdraw</button></div></div>`;
   }).join('');
-  /* Clearing accounts shown in a separate read-only reconciliation section */
+  /* Clearing accounts (Card Clearing, Sales Clearing) hold money in-flight — card
+     sales waiting for the processor to settle to bank, food-tab receivables waiting
+     for the guest to pay. Drain them when the real cash arrives: card processor
+     deposit → bank → click "Drain → account" → Transfer the matching amount. */
   const clearingAccts=accounts.filter(a=>a.excludeFromLiquidity||a.type==='clearing');
-  const clearingRows=clearingAccts.map(a=>`<tr><td style="font-size:.8rem">${esc(a.name)}</td><td style="font-size:.72rem;color:var(--muted2)">${a.type}</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--muted)">${fmt(a.balance)}</td><td style="font-size:.72rem;color:var(--muted2)">Accounting only</td></tr>`).join('');
-  return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Funds & Accounts</div><div class="page-sub">Operational cash — clearing accounts excluded</div></div></div>
+  const clearingRows=clearingAccts.map(a=>{
+    const bal=Number(a.balance)||0;
+    const action = bal>0.005
+      ? `<button class="btn btn-primary btn-xs" onclick="openModal('transfer',{fromAccount:'${a.id}'})">↕ Drain → account</button>`
+      : `<span style="font-size:.72rem;color:var(--muted2)">cleared</span>`;
+    return `<tr><td style="font-size:.8rem">${esc(a.name)}</td><td style="font-size:.72rem;color:var(--muted2)">${a.type}</td><td class="mono" style="text-align:right;font-size:.8rem;${bal>0.005?'color:var(--amber);font-weight:600':'color:var(--muted)'}">${fmt(bal)}</td><td style="text-align:right">${action}</td></tr>`;
+  }).join('');
+  return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Funds & Accounts</div><div class="page-sub">Operational cash — clearing accounts shown below</div></div></div>
 <div class="g3">${cards}<div class="card" style="display:flex;align-items:center;justify-content:center;cursor:pointer;border:1px dashed var(--border2);min-height:140px" onclick="openModal('addAccount')"><div style="text-align:center;color:var(--muted2)"><div style="font-size:1.3rem;margin-bottom:4px">+</div><div style="font-size:.79rem">Add Account</div></div></div></div>
-${clearingRows?`<div class="card-flush" style="margin-top:14px"><div style="padding:8px 14px;border-bottom:1px solid var(--border)"><span class="sec-title" style="font-size:.75rem">Clearing & System Accounts (accounting only)</span></div><table><thead><tr><th>Account</th><th>Type</th><th style="text-align:right">Balance</th><th>Note</th></tr></thead><tbody>${clearingRows}</tbody></table></div>`:''}`;
+${clearingRows?`<div class="card-flush" style="margin-top:14px"><div style="padding:8px 14px;border-bottom:1px solid var(--border)"><span class="sec-title" style="font-size:.75rem">Pending Settlements — Clearing Accounts</span><span style="font-size:.7rem;color:var(--muted2);margin-left:8px">Money in-flight · drain when real cash arrives</span></div><table><thead><tr><th>Account</th><th>Type</th><th style="text-align:right">Balance</th><th></th></tr></thead><tbody>${clearingRows}</tbody></table></div>`:''}`;
 }
 
 /* ═══════════════════════════════════════════════
@@ -6315,11 +6331,18 @@ function pgReports(){
     year:(()=>{const y=new Date().getFullYear();return Array.from({length:365},(_,i)=>{const d=new Date(y,0,i+1);return d.getFullYear()===y?localISO(d):null}).filter(Boolean)})(),
   };
 
-  const dates=periodDates[reportPeriod]||periodDates.month;
-  const filt=transactions.filter(t=>dates.includes(t.date)&&!t.voided);
+  /* Custom range pulls from the global top-bar date filter (globalDate.from / .to)
+     so the in-page Custom tab and the top filter stay in sync. Empty bound = open-ended. */
+  const customFrom = (reportPeriod==='custom') ? (globalDate.from||'') : '';
+  const customTo   = (reportPeriod==='custom') ? (globalDate.to  ||'') : '';
+  const dates = (reportPeriod==='custom') ? null : (periodDates[reportPeriod]||periodDates.month);
+  const inRange = t => reportPeriod==='custom'
+    ? (!customFrom||t.date>=customFrom) && (!customTo||t.date<=customTo)
+    : dates.includes(t.date);
+  const filt=transactions.filter(t=>inRange(t)&&!t.voided);
   const m=calcMetrics(filt);
 
-  const tabs=[['week','This Week'],['month','This Month'],['quarter','This Quarter'],['year','This Year']];
+  const tabs=[['week','This Week'],['month','This Month'],['quarter','This Quarter'],['year','This Year'],['custom','Custom']];
   const tabBar=tabs.map(([v,l])=>`<div class="tab ${reportPeriod===v?'active':''}" onclick="reportPeriod='${v}';renderMain()">${l}</div>`).join('');
 
   const paidTx=filt.filter(t=>t.status!=='unpaid');
@@ -6469,6 +6492,16 @@ function pgReports(){
       <div class="tab-bar">${reportTypeBar}</div>
       <div class="tab-bar">${tabBar}</div>
     </div>
+    ${reportPeriod==='custom'?`<div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap;padding:8px 12px;background:var(--bg3);border-radius:6px">
+      <span style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)">Custom Range</span>
+      <span style="font-size:.74rem;color:var(--muted2)">From</span>
+      <input type="date" value="${globalDate.from||''}" onchange="globalDate.from=this.value;globalDate.preset='custom';renderMain()" style="font-size:.78rem;padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg);width:150px">
+      <span style="font-size:.74rem;color:var(--muted2)">To</span>
+      <input type="date" value="${globalDate.to||''}" onchange="globalDate.to=this.value;globalDate.preset='custom';renderMain()" style="font-size:.78rem;padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg);width:150px">
+      ${(globalDate.from||globalDate.to)
+        ? `<span style="font-size:.72rem;color:var(--muted2);margin-left:6px">${globalDate.from||'(beginning)'} → ${globalDate.to||'(today)'}</span>`
+        : `<span style="font-size:.72rem;color:var(--amber);margin-left:6px">Pick dates here, or set them in the top filter — both stay in sync</span>`}
+    </div>`:''}
 
     ${reportTab==='balance'?`
     <!-- ═══ BALANCE SHEET ═══════════════════════ -->
