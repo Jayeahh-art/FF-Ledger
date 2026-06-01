@@ -4034,34 +4034,39 @@ function renderModal(){
       ['Financial','💳'],['Supplies','🧰'],['Repairs','🔧'],['Professional Fees','📑'],
       ['Compliance & Licenses','📜'],['Other Expenses','📉']
     ];
+    /* Render rows as a responsive 2-3 column grid so a typical P&L (~60 lines) is
+       scannable without endless scroll on a wider modal. */
+    const rowHtml=c=>`<div style="display:flex;align-items:center;gap:8px;padding:2px 0;min-width:0">
+        <div style="flex:1;font-size:.78rem;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(c.code||'')} ${esc(c.name)}"><span style="color:var(--muted2);font-family:var(--fm);font-size:.72rem">${esc(c.code||'')}</span> ${esc(c.name)}</div>
+        <input type="number" step="0.01" min="0" id="bf-${esc(c.id)}" placeholder="0.00" style="width:120px;flex-shrink:0;text-align:right;font-family:var(--fm);font-size:.82rem;padding:4px 8px;border:1px solid var(--border2);border-radius:5px;background:var(--bg)">
+      </div>`;
+    const sectionWrap=(label,rowsHtml)=>`<div style="margin-top:10px">
+        <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:5px 0;border-bottom:1px solid var(--border);margin-bottom:6px">${label}</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));column-gap:18px;row-gap:0">${rowsHtml}</div>
+      </div>`;
     const seen=new Set();
     const sectionsHtml=sectionOrder.map(([gName,emo])=>{
       const items=(groups[gName]||[]).sort((a,b)=>(a.code||'').localeCompare(b.code||''));
       if(!items.length) return ''; seen.add(gName);
-      const rows=items.map(c=>`<div style="display:flex;align-items:center;gap:8px;padding:3px 0">
-        <div style="flex:1;font-size:.78rem"><span style="color:var(--muted2)">${esc(c.code||'')}</span> ${esc(c.name)}</div>
-        <input type="number" step="0.01" min="0" id="bf-${esc(c.id)}" placeholder="0.00" style="width:140px;text-align:right;font-family:var(--fm);padding:4px 8px;border:1px solid var(--border2);border-radius:5px;background:var(--bg)">
-      </div>`).join('');
-      return `<div style="margin-top:10px"><div style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:6px 0;border-bottom:1px solid var(--border);margin-bottom:4px">${emo} ${gName}</div>${rows}</div>`;
+      return sectionWrap(`${emo} ${esc(gName)}`, items.map(rowHtml).join(''));
     }).join('');
     /* Catch-all for any custom groups not in sectionOrder. */
     const extraHtml=Object.keys(groups).filter(g=>!seen.has(g)).map(gName=>{
       const items=groups[gName].sort((a,b)=>(a.code||'').localeCompare(b.code||''));
-      const rows=items.map(c=>`<div style="display:flex;align-items:center;gap:8px;padding:3px 0">
-        <div style="flex:1;font-size:.78rem"><span style="color:var(--muted2)">${esc(c.code||'')}</span> ${esc(c.name)}</div>
-        <input type="number" step="0.01" min="0" id="bf-${esc(c.id)}" placeholder="0.00" style="width:140px;text-align:right;font-family:var(--fm);padding:4px 8px;border:1px solid var(--border2);border-radius:5px;background:var(--bg)">
-      </div>`).join('');
-      return `<div style="margin-top:10px"><div style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:6px 0;border-bottom:1px solid var(--border);margin-bottom:4px">${esc(gName)}</div>${rows}</div>`;
+      return sectionWrap(esc(gName), items.map(rowHtml).join(''));
     }).join('');
-    body=`<div class="info-box" style="margin-bottom:10px;font-size:.78rem;line-height:1.4">
-      Enter monthly aggregate totals for each P&L line you want to backfill. The system posts <b>one transaction per non-zero amount</b>, dated to the <b>last day of the selected month</b>. Revenue lines post as sales, COGS / Labor / OpEx as paid expenses — so cash also moves to reflect the period's net cash flow.
-      <br><br><b>Before posting:</b> if you previously deposited an "opening balance" that represents these months' accumulated profit (e.g. your May 1 deposits), <b>void those deposits</b> after backfilling so cash isn't double-counted.
+    body=`<div class="info-box" style="margin-bottom:10px;font-size:.76rem;line-height:1.45">
+      Enter monthly aggregate totals for each P&L line. The system posts <b>one transaction per non-zero amount</b>, dated to the <b>last day</b> of the selected month. Revenue → sales (cash in), COGS / Labor / OpEx → paid expenses (cash out), Contra-revenue → cash-neutral discounts.
+      <br><br><b>Before posting:</b> if you previously deposited an "opening balance" that represents these months' carry-forward (e.g. your May 1 deposits), void them after backfilling so cash isn't double-counted.
     </div>
-    <div class="form-row">
-      <div class="form-group"><label>Month</label><input id="bf-month" type="month" value="${defaultMonth}"></div>
-      <div class="form-group"><label>Account · where money lands / leaves</label><select id="bf-acct">${acctOpts}</select></div>
+    <div style="display:grid;grid-template-columns:180px 1fr;gap:14px;margin-bottom:6px;align-items:end">
+      <div class="form-group" style="margin:0"><label>Month</label><input id="bf-month" type="month" value="${defaultMonth}"></div>
+      <div class="form-group" style="margin:0">
+        <label>Cash account <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· where the period's net cash lands / leaves</span></label>
+        <select id="bf-acct">${acctOpts}</select>
+      </div>
     </div>
-    <div style="max-height:55vh;overflow-y:auto;padding-right:6px;margin-top:4px">
+    <div style="max-height:58vh;overflow-y:auto;padding-right:8px;border-top:1px solid var(--border);margin-top:6px;padding-top:2px">
       ${sectionsHtml}${extraHtml}
     </div>
     <div class="modal-footer">
@@ -4199,7 +4204,7 @@ function renderModal(){
     return;
   }
   /* Wider modal for data-dense previews (e.g. payroll finalize table). */
-  const wideModals=new Set(['finalizePayroll']);
+  const wideModals=new Set(['finalizePayroll','backfillMonth']);
   const modalCls=wideModals.has(type)?'modal modal-wide':'modal';
   ov.innerHTML=`<div class="modal-overlay" onclick="if(event.target===this)closeModal()"><div class="${modalCls}"><div class="modal-title">${MT[type]||type}</div>${body}</div></div>`;
 }
