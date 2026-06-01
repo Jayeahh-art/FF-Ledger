@@ -5264,12 +5264,18 @@ function pgFunds(){
      for the guest to pay. Drain them when the real cash arrives: card processor
      deposit → bank → click "Drain → account" → Transfer the matching amount. */
   const clearingAccts=accounts.filter(a=>a.excludeFromLiquidity||a.type==='clearing');
+  /* Per-account hint so users remember what each clearing pool is parking. */
+  const clearingHint={
+    cardclr:  'Card sales waiting for the processor to deposit to bank — drain manually when the settlement arrives',
+    salesclr: 'Open customer tabs (food tab receivables) — auto-drains when you Settle a Tab on the Tabs page',
+  };
   const clearingRows=clearingAccts.map(a=>{
     const bal=Number(a.balance)||0;
+    const hint=clearingHint[a.id]||'Money in-flight — drain when actual cash arrives';
     const action = bal>0.005
       ? `<button class="btn btn-primary btn-xs" onclick="openModal('transfer',{fromAccount:'${a.id}'})">↕ Drain → account</button>`
       : `<span style="font-size:.72rem;color:var(--muted2)">cleared</span>`;
-    return `<tr><td style="font-size:.8rem">${esc(a.name)}</td><td style="font-size:.72rem;color:var(--muted2)">${a.type}</td><td class="mono" style="text-align:right;font-size:.8rem;${bal>0.005?'color:var(--amber);font-weight:600':'color:var(--muted)'}">${fmt(bal)}</td><td style="text-align:right">${action}</td></tr>`;
+    return `<tr><td style="font-size:.8rem"><div style="font-weight:500">${esc(a.name)}</div><div style="font-size:.68rem;color:var(--muted2);font-weight:400;margin-top:1px">${hint}</div></td><td style="font-size:.72rem;color:var(--muted2)">${a.type}</td><td class="mono" style="text-align:right;font-size:.8rem;${bal>0.005?'color:var(--amber);font-weight:600':'color:var(--muted)'}">${fmt(bal)}</td><td style="text-align:right">${action}</td></tr>`;
   }).join('');
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Funds & Accounts</div><div class="page-sub">Operational cash — clearing accounts shown below</div></div></div>
 <div class="g3">${cards}<div class="card" style="display:flex;align-items:center;justify-content:center;cursor:pointer;border:1px dashed var(--border2);min-height:140px" onclick="openModal('addAccount')"><div style="text-align:center;color:var(--muted2)"><div style="font-size:1.3rem;margin-bottom:4px">+</div><div style="font-size:.79rem">Add Account</div></div></div></div>
