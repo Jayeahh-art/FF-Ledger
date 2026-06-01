@@ -3720,6 +3720,7 @@ const MT={
   forecastTargets:'Set Targets',
   addPayrollAdj:'Add Payroll Adjustment',
   giveAdvance:'Give Cash Advance',
+  backfillMonth:'Backfill Historical Month',
   payrollSettings:'Payroll Settings',
   finalizePayroll:'Finalize Payroll',
   settleLiability:'Remit / Settle Liability',
@@ -4007,6 +4008,64 @@ function renderModal(){
     <div class="info-box" style="margin-bottom:4px;font-size:.76rem">This is a loan, not an expense: cash leaves now and books to Employee Receivables. The "repay per payday" amount is auto-deducted from net pay each payroll until repaid. Leave blank to repay the full amount on the next payday.</div>
     <div class="modal-footer">
       <button class="btn btn-primary" style="flex:1" onclick="submitGiveAdvance()">Give Advance</button>
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+    </div>`;
+
+  }else if(type==='backfillMonth'){
+    /* One-shot monthly backfill — for populating P&L for months before daily DSR
+       tracking started. Posts one aggregate transaction per non-zero COA line,
+       dated to the last day of the selected month. */
+    const acctList=accounts.filter(a=>a&&a.type!=='clearing');
+    const acctOpts=acctList.map(a=>`<option value="${a.id}" ${a.id==='bank'?'selected':''}>${esc(a.name)}</option>`).join('');
+    /* Pre-fill month to the previous calendar month — the typical "next month to backfill". */
+    const _now=new Date(); const _prev=new Date(_now.getFullYear(),_now.getMonth()-1,1);
+    const defaultMonth=`${_prev.getFullYear()}-${String(_prev.getMonth()+1).padStart(2,'0')}`;
+    /* Group P&L COA accounts by their group field; show one input per account.
+       Skip balance-sheet types (asset/liability/equity) — backfill is P&L only. */
+    const pnlCoa=(coa||[]).filter(c=>c&&['revenue','cogs','expense','contra_revenue'].includes(c.type));
+    const groups={};
+    pnlCoa.forEach(c=>{(groups[c.group||c.type]=groups[c.group||c.type]||[]).push(c)});
+    /* Section ordering: revenue first, then COGS, then Labor, then everything else by code. */
+    const sectionOrder=[
+      ['Revenue','💰'],['Other Income','💰'],['Contra Revenue','◀'],
+      ['COGS','🍳'],['Inventory','📦'],
+      ['Labor','👥'],
+      ['Occupancy','🏠'],['Utilities','⚡'],['Marketing','📣'],['Administrative','📋'],
+      ['Financial','💳'],['Supplies','🧰'],['Repairs','🔧'],['Professional Fees','📑'],
+      ['Compliance & Licenses','📜'],['Other Expenses','📉']
+    ];
+    const seen=new Set();
+    const sectionsHtml=sectionOrder.map(([gName,emo])=>{
+      const items=(groups[gName]||[]).sort((a,b)=>(a.code||'').localeCompare(b.code||''));
+      if(!items.length) return ''; seen.add(gName);
+      const rows=items.map(c=>`<div style="display:flex;align-items:center;gap:8px;padding:3px 0">
+        <div style="flex:1;font-size:.78rem"><span style="color:var(--muted2)">${esc(c.code||'')}</span> ${esc(c.name)}</div>
+        <input type="number" step="0.01" min="0" id="bf-${esc(c.id)}" placeholder="0.00" style="width:140px;text-align:right;font-family:var(--fm);padding:4px 8px;border:1px solid var(--border2);border-radius:5px;background:var(--bg)">
+      </div>`).join('');
+      return `<div style="margin-top:10px"><div style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:6px 0;border-bottom:1px solid var(--border);margin-bottom:4px">${emo} ${gName}</div>${rows}</div>`;
+    }).join('');
+    /* Catch-all for any custom groups not in sectionOrder. */
+    const extraHtml=Object.keys(groups).filter(g=>!seen.has(g)).map(gName=>{
+      const items=groups[gName].sort((a,b)=>(a.code||'').localeCompare(b.code||''));
+      const rows=items.map(c=>`<div style="display:flex;align-items:center;gap:8px;padding:3px 0">
+        <div style="flex:1;font-size:.78rem"><span style="color:var(--muted2)">${esc(c.code||'')}</span> ${esc(c.name)}</div>
+        <input type="number" step="0.01" min="0" id="bf-${esc(c.id)}" placeholder="0.00" style="width:140px;text-align:right;font-family:var(--fm);padding:4px 8px;border:1px solid var(--border2);border-radius:5px;background:var(--bg)">
+      </div>`).join('');
+      return `<div style="margin-top:10px"><div style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);padding:6px 0;border-bottom:1px solid var(--border);margin-bottom:4px">${esc(gName)}</div>${rows}</div>`;
+    }).join('');
+    body=`<div class="info-box" style="margin-bottom:10px;font-size:.78rem;line-height:1.4">
+      Enter monthly aggregate totals for each P&L line you want to backfill. The system posts <b>one transaction per non-zero amount</b>, dated to the <b>last day of the selected month</b>. Revenue lines post as sales, COGS / Labor / OpEx as paid expenses — so cash also moves to reflect the period's net cash flow.
+      <br><br><b>Before posting:</b> if you previously deposited an "opening balance" that represents these months' accumulated profit (e.g. your May 1 deposits), <b>void those deposits</b> after backfilling so cash isn't double-counted.
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Month</label><input id="bf-month" type="month" value="${defaultMonth}"></div>
+      <div class="form-group"><label>Account · where money lands / leaves</label><select id="bf-acct">${acctOpts}</select></div>
+    </div>
+    <div style="max-height:55vh;overflow-y:auto;padding-right:6px;margin-top:4px">
+      ${sectionsHtml}${extraHtml}
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" style="flex:1" onclick="submitBackfillMonth()">Post All to Ledger</button>
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
     </div>`;
 
@@ -6489,6 +6548,7 @@ function pgReports(){
         <div class="page-sub">Restaurant Financial Statements · COA Driven</div>
       </div>
       <div style="display:flex;gap:6px">
+        <button class="btn btn-ghost btn-sm" onclick="openModal('backfillMonth')">📥 Backfill Month</button>
         <button class="btn btn-ghost btn-sm" onclick="exportCSV()">↓ CSV</button>
         <button class="btn btn-ghost btn-sm" onclick="exportJSON()">↓ Backup</button>
       </div>
@@ -7195,6 +7255,57 @@ function submitGiveAdvance(){
     date:document.getElementById('m-adv-date')?.value,
     note:document.getElementById('m-adv-note')?.value
   });
+}
+/* ─── HISTORICAL MONTH BACKFILL ───
+   Posts one aggregate transaction per non-zero COA line for the selected month,
+   dated to the last day. Used to populate P&L for periods before daily DSR tracking
+   started. Revenue → 'sale' txs; COGS/Labor/OpEx → 'expense' txs (status paid). */
+function submitBackfillMonth(){
+  const monthVal=document.getElementById('bf-month')?.value;
+  if(!monthVal){toast('Pick a month','error');return}
+  const acctId=document.getElementById('bf-acct')?.value;
+  if(!acctId){toast('Pick an account','error');return}
+  const [y,m]=monthVal.split('-').map(Number);
+  /* Last day of month: day 0 of (month+1) rolls back to last day of current month. */
+  const lastDay=new Date(y,m,0);
+  const date=`${y}-${String(m).padStart(2,'0')}-${String(lastDay.getDate()).padStart(2,'0')}`;
+  if(isPeriodLocked(date)){toast(`Period locked for ${fmtDate(date)} — unlock first`,'error');return}
+  const txs=[];
+  let totalRevenue=0, totalExpense=0;
+  (coa||[]).forEach(c=>{
+    if(!c||!['revenue','cogs','expense','contra_revenue'].includes(c.type)) return;
+    const el=document.getElementById('bf-'+c.id);
+    if(!el) return;
+    const amt=round2(parseFloat(el.value)||0);
+    if(amt<=0) return;
+    /* Revenue lines post as 'sale' (cash in); cost/expense lines post as 'expense'
+       paid (cash out). Contra-revenue (discounts/refunds/comps) is cash-NEUTRAL —
+       already netted at point of sale; posted as 'dsr_adjustment' so it shows in
+       the P&L (metrics filter by COA type) without moving cash. Matches how the
+       live DSR posts the same categories. */
+    const isContra=(c.type==='contra_revenue');
+    const txType=isContra ? 'dsr_adjustment' : (c.type==='revenue' ? 'sale' : 'expense');
+    if(c.type==='revenue') totalRevenue+=amt;
+    else if(c.type==='cogs'||c.type==='expense') totalExpense+=amt;
+    /* contra_revenue is informational for the totals shown in confirm; not added to either. */
+    txs.push({
+      date, type:txType, coaId:c.id, category:c.name,
+      account:acctId, amount:amt,
+      note:`Backfill — ${monthVal} aggregate`,
+      status:'paid', handler:currentUser
+    });
+  });
+  if(!txs.length){toast('Enter at least one amount','error');return}
+  const netProfit=round2(totalRevenue-totalExpense);
+  if(!confirm(`Post ${txs.length} aggregate transaction${txs.length===1?'':'s'} for ${monthVal} (dated ${fmtDate(date)})?\n\n`+
+    `• Revenue total: ${fmt(totalRevenue)}\n`+
+    `• Expense total: ${fmt(totalExpense)}\n`+
+    `• Net profit:    ${fmt(netProfit)}\n\n`+
+    `Net cash impact on ${accounts.find(a=>a.id===acctId)?.name||'account'}: ${netProfit>=0?'+':''}${fmt(netProfit)}`))return;
+  createLedgerBatch(txs);
+  logActivity(`Backfilled ${monthVal}: ${txs.length} entries · net ${fmt(netProfit)}`);
+  closeModal();
+  toast(`Backfilled ${monthVal} — ${txs.length} entries posted ✓`,'success');
 }
 function deleteCashAdvance(id){
   const adv=(cashAdvances||[]).find(a=>a&&a.id===id);
