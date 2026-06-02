@@ -408,9 +408,12 @@ function setSyncStatus(s,msg){
   t.textContent=s==='saving'?'Saving…':s==='error'?(msg||'Error'):'Synced';
 }
 /* Single source of truth for the persisted payload — used by the remote save,
-   the local cache mirror, and the on-close flush so they can never drift apart. */
+   the local cache mirror, and the on-close flush so they can never drift apart.
+   Includes stateVersion so the server tracks the schema level of the saved
+   data; without it, migrateState's version gate (data.stateVersion) would never
+   reach the server and every load would re-run every migration from v0. */
 function collectState(){
-  return {accounts,transactions,coa,activityLog,tabs,staffPayables,dsrEntries,roster,shifts,holidays,payables,kpiTargets,payrollSettings,payrollAdjustments,payrollRuns,payrollPools,cashAdvances,auditLog,periodLocks,openingCashState,cashVarianceHistory,monthlyOpeningBalances,treasuryEvents,weeklyTargets,monthlyBudget,positions,cashCounts,dailyCloseSnapshots};
+  return {accounts,transactions,coa,activityLog,tabs,staffPayables,dsrEntries,roster,shifts,holidays,payables,kpiTargets,payrollSettings,payrollAdjustments,payrollRuns,payrollPools,cashAdvances,auditLog,periodLocks,openingCashState,cashVarianceHistory,monthlyOpeningBalances,treasuryEvents,weeklyTargets,monthlyBudget,positions,cashCounts,dailyCloseSnapshots,dailyMetrics,weeklyMetrics,monthlyMetrics,forecastSnapshots,forecastTargets,stateVersion:LEDGER_STATE_VERSION};
 }
 /* Instant local mirror written on every change. synced:false means the remote
    save has not yet confirmed — if the tab closes mid-save, the next load can
@@ -480,6 +483,11 @@ function recoverUnsyncedCache(){
   cashVarianceHistory=s.cashVarianceHistory; monthlyOpeningBalances=s.monthlyOpeningBalances;
   treasuryEvents=s.treasuryEvents; positions=s.positions; cashCounts=s.cashCounts;
   dailyCloseSnapshots=s.dailyCloseSnapshots;
+  if(Array.isArray(s.dailyMetrics))    dailyMetrics=s.dailyMetrics;
+  if(Array.isArray(s.weeklyMetrics))   weeklyMetrics=s.weeklyMetrics;
+  if(Array.isArray(s.monthlyMetrics))  monthlyMetrics=s.monthlyMetrics;
+  if(Array.isArray(s.forecastSnapshots)) forecastSnapshots=s.forecastSnapshots;
+  if(s.forecastTargets&&typeof s.forecastTargets==='object') forecastTargets={...forecastTargets,...s.forecastTargets};
   rebuildAccountBalances();
   scheduleSave();                // re-push the recovered state to the server
   toast('Unsynced changes restored ✓','success');
@@ -569,6 +577,16 @@ async function loadApp(){
     treasuryEvents=data.treasuryEvents||[];
     cashCounts=Array.isArray(data.cashCounts)?data.cashCounts:[];
     dailyCloseSnapshots=Array.isArray(data.dailyCloseSnapshots)?data.dailyCloseSnapshots:[];
+    /* Metric history snapshots — persisted at end-of-day and on tx changes via
+       persistMetricsForDate. Empty defaults on fresh install. */
+    dailyMetrics=Array.isArray(data.dailyMetrics)?data.dailyMetrics:[];
+    weeklyMetrics=Array.isArray(data.weeklyMetrics)?data.weeklyMetrics:[];
+    monthlyMetrics=Array.isArray(data.monthlyMetrics)?data.monthlyMetrics:[];
+    forecastSnapshots=Array.isArray(data.forecastSnapshots)?data.forecastSnapshots:[];
+    /* Forecast targets: server value wins if present. Otherwise the in-memory
+       value (seeded from legacy localStorage 'ledger_targets' at script init)
+       sticks — preserves targets for users who set them before this was synced. */
+    if(data.forecastTargets&&typeof data.forecastTargets==='object') forecastTargets={...forecastTargets,...data.forecastTargets};
     positions=(Array.isArray(data.positions)&&data.positions.length)?data.positions:getDefaultPositions();
     rebuildAccountBalances(); // derive balances from transaction history
     validateLedgerIntegrity();
@@ -1084,6 +1102,9 @@ let treasuryEvents=[];
 const PAYROLL_ADJUSTMENT_TYPES=['bonus','incentive','allowance','sss_ee','philhealth_ee','pagibig_ee','withholding_tax','cash_advance','meal_deduction','penalty','uniform','other'];
 let currentPage='dashboard', currentModal=null;
 let filters={type:'',search:'',dateFrom:'',dateTo:''};
+/* Transactions-page pagination: derived view, no persistence. Reset to 1 on any
+   filter change so the user never finds themselves on "page 7 of 2" silently. */
+let txPage=1, txPerPage=50;
 let reportPeriod='month';
 let reportTab='pl'; /* 'pl' | 'balance' | 'cashflow' */
 /* Global date filter — affects all pages */
@@ -1927,12 +1948,16 @@ const treasuryService={
       .filter(a=>a&&a.status!=='settled')
       .reduce((s,a)=>s+(Number(a.balance)||0),0));
     /* Input VAT = VAT paid on purchases, claimable against Output VAT when remitting.
-       A current asset. Sums ALL non-voided txs tagged to a1080 regardless of type:
-       'withdrawal' (live expense modal + backfill — real cash paid for VAT) and
-       'dsr_adjustment' (any legacy/manual cash-neutral entry). Status-agnostic so
-       accrued (unpaid-invoice) VAT credit is recognized when invoiced, not paid. */
+       A current asset. Narrowed to the only two tx types that legitimately tag
+       a1080: 'withdrawal' (live expense modal + backfill — real cash paid for
+       VAT) and 'dsr_adjustment' (legacy/manual cash-neutral entry). Status-
+       agnostic so accrued (unpaid-invoice) VAT credit is recognized when invoiced,
+       not paid. Type-narrowed so a malformed deposit/sale tagged to a1080 (CSV
+       import, programmatic) can't double-credit (cash + asset) the books. */
     const inputVAT=round2((transactions||[])
-      .filter(t=>t&&!t.voided&&(t.coaId==='a1080'||t.category==='Input VAT'))
+      .filter(t=>t&&!t.voided
+        &&(t.type==='withdrawal'||t.type==='dsr_adjustment')
+        &&(t.coaId==='a1080'||t.category==='Input VAT'))
       .reduce((s,t)=>s+(Number(t.amount)||0),0));
     const assets=cashAssets+employeeReceivables+inputVAT;
     const totalPayables=(payables||[])
@@ -1990,11 +2015,9 @@ const treasuryService={
    PHASE 3 — CASH POSITION + WEEKLY PERFORMANCE
 ═══════════════════════════════════════════════ */
 
-let openingLiquidityState={
-  openingLiquidity:0,
-  history:[]
-};
-
+/* `openingLiquidityState` removed — was declared here with no readers and no writers
+   anywhere in the codebase. If you need a treasury-opening state, use the existing
+   `openingCashState` (which IS wired through every persistence path). */
 function getWeekRevenue(offsetWeeks=0){
   const now=new Date();
   const currentDay=(now.getDay()+6)%7;
@@ -2538,6 +2561,11 @@ function getDailyCloseStatus(date=today()){
 
 function ensureDailySnapshot(date=today()){
 
+  /* Forecast-vs-actual tracking: capture today's 30-day forecast once per day
+     (idempotent — persistForecastSnapshot no-ops if today's snapshot exists).
+     Later you can compare what you forecasted vs what actually happened. */
+  try{ persistForecastSnapshot(); }catch(e){ console.warn('persistForecastSnapshot failed',e); }
+
   const existing=(dailyCloseSnapshots||[]).find(d=>d.date===date);
 
   if(existing)return existing;
@@ -2902,6 +2930,10 @@ function exportJSON(){
     // Labor
     roster, shifts, holidays, payrollSettings, payrollAdjustments, payrollRuns, payrollPools,
     cashAdvances, positions,
+    // Metric snapshots (period summaries persisted for trend reports)
+    dailyMetrics, weeklyMetrics, monthlyMetrics, forecastSnapshots,
+    // Forecast assumptions
+    forecastTargets,
   };
   dl(`ledger-backup-${today()}.json`, JSON.stringify(payload,null,2), 'application/json');
   toast('Backup saved ✓');
@@ -2989,6 +3021,11 @@ function handleImport(file){
       if(Array.isArray(migrated.payrollRuns))    payrollRuns=migrated.payrollRuns;
       if(migrated.payrollPools&&typeof migrated.payrollPools==='object') payrollPools=migrated.payrollPools;
       if(Array.isArray(migrated.cashAdvances))   cashAdvances=migrated.cashAdvances;
+      if(Array.isArray(migrated.dailyMetrics))   dailyMetrics=migrated.dailyMetrics;
+      if(Array.isArray(migrated.weeklyMetrics))  weeklyMetrics=migrated.weeklyMetrics;
+      if(Array.isArray(migrated.monthlyMetrics)) monthlyMetrics=migrated.monthlyMetrics;
+      if(Array.isArray(migrated.forecastSnapshots)) forecastSnapshots=migrated.forecastSnapshots;
+      if(migrated.forecastTargets&&typeof migrated.forecastTargets==='object') forecastTargets={...forecastTargets,...migrated.forecastTargets};
       if(Array.isArray(migrated.positions)&&migrated.positions.length) positions=migrated.positions;
 
       /* Hotfix H5: removed redundant rebuildAccountBalances() + validateLedgerIntegrity() —
@@ -3070,13 +3107,11 @@ async function clearAllData(){
     payrollPools={};
     /* Phase: align client reset with server reset (apps-script.js) so the debounced
        save right after reset doesn't push stale local state back over the clean server.
-       Previously missing: cashAdvances (phantom receivables would persist),
-       dailySnapshots, forecastSnapshots. NOTE: kpiTargets and payrollSettings are
-       intentionally NOT reset — they're consumed via nested direct access
-       (e.g. kpiTargets.cogsP.target) so {} would crash render; the let-default
-       structure is the real source of truth and stays. */
+       NOTE: kpiTargets and payrollSettings are intentionally NOT reset — they're
+       consumed via nested direct access (e.g. kpiTargets.cogsP.target) so {} would
+       crash render; the let-default structure is the real source of truth and stays.
+       `dailySnapshots` exists only on the server (no client `let`) — skip it here. */
     cashAdvances=[];
-    dailySnapshots=[];
     forecastSnapshots=[];
     dailyMetrics=[];
     weeklyMetrics=[];
@@ -3510,6 +3545,7 @@ function normalizeTx(tx){
     payrollRunId:  tx.payrollRunId||null,
     advanceId:     tx.advanceId||null,
     linkedTxId:    tx.linkedTxId||null,
+    payableId:     tx.payableId||null,
     paidAt:        tx.paidAt||null,
     /* Hotfix M6: removed duplicate createdAt/createdBy/voided/voidedAt definitions
        that were overwriting the earlier ones with weaker fallbacks. */
@@ -3630,12 +3666,47 @@ function saveEditTx(id){
   if(!amt||amt<=0){toast('Enter a valid amount','error');return}
   const date=document.getElementById('m-date')?.value||today();
   const note=document.getElementById('m-note')?.value||'';
-  const category=document.getElementById('m-cat')?.value||tx.category||'';
+  const handler=document.getElementById('m-handler')?.value||tx.handler||currentUser;
+  /* Build the update payload reading ALL the fields the modal actually shows for
+     this tx type — was previously only persisting amount/date/note/category, so
+     edits to status / supplier / due date / expense type / accounts (transfer) /
+     payment account were silently dropped. */
+  const stamp=new Date().toISOString();
+  const payload={...tx, amount:amt, date, note, handler, modifiedAt:stamp, modifiedBy:currentUser};
+  if(tx.type==='transfer'){
+    const fromVal=document.getElementById('m-from')?.value;
+    const toVal  =document.getElementById('m-to')?.value;
+    if(fromVal && toVal && fromVal!==toVal){
+      payload.fromAccount=fromVal;
+      payload.toAccount  =toVal;
+    }
+  } else {
+    /* Category + COA id: prefer the data-coaid on the selected option, fall back
+       to looking up by name (parity with submitTx). */
+    const catSelect=document.getElementById('m-cat');
+    const category=catSelect?.value||tx.category||'';
+    const coaId=catSelect?.selectedOptions?.[0]?.dataset?.coaid||(coa||[]).find(c=>c.name===category)?.id||tx.coaId||'';
+    payload.category=category;
+    payload.coaId=coaId;
+    const acctVal=document.getElementById('m-acct')?.value;
+    if(acctVal) payload.account=acctVal;
+    if(tx.type==='expense'){
+      const sup=document.getElementById('m-supplier')?.value;
+      const expt=document.getElementById('m-exptype')?.value;
+      const st=document.getElementById('m-status')?.value;
+      const due=document.getElementById('m-duedate')?.value;
+      if(sup!==undefined) payload.supplier=sup;
+      if(expt!==undefined) payload.expenseType=expt;
+      if(st) payload.status=st;
+      if(due!==undefined) payload.dueDate=due;
+    }
+  }
   /* Phase 1: no direct mutation — rebuild will derive new state.
      Hotfix H5: removed redundant rebuildAccountBalances() — gateway rebuilds.
      Hotfix H6: skipAudit:true on the gateway so only the per-tx 'edit' audit
      row fires (it carries the full updated snapshot). */
-  const updated=normalizeTx({...tx,amount:amt,date,note,category,handler:document.getElementById('m-handler')?.value||tx.handler||currentUser,modifiedAt:new Date().toISOString(),modifiedBy:currentUser});
+  const updated=normalizeTx(payload);
+  const category=payload.category||tx.category;
   ledgerReplaceTransactions(transactions.map(t=>t.id===id?updated:t),'update_transaction',{skipAudit:true});
   appendAudit('edit',updated);
   logActivity(`Edited ${tx.type}: ${fmt(amt)} — ${category}`);
@@ -3670,6 +3741,17 @@ function voidTransaction(id,reason='Manual void'){
      audit row fires (carries the voided tx snapshot). */
   const stamp=new Date().toISOString();
   ledgerReplaceTransactions(transactions.map(t=>(t.id===id||t.linkedTxId===id)?{...t,voided:true,voidedAt:stamp,voidedBy:currentUser,voidReason:reason,modifiedAt:stamp,modifiedBy:currentUser}:t),'void_transaction',{skipAudit:true});
+  /* Payable linkage: voiding a payable-payment tx must restore the payable's
+     balance and reopen it, otherwise the payable shows status='paid' with cash
+     restored — drift. Adds the voided amount back to balance (capped at no
+     negative-paid case) and flips to 'open' if any balance remains. */
+  if(tx.payableId){
+    payables=payables.map(p=>{
+      if(p.id!==tx.payableId) return p;
+      const restoredBal=round2(Number(p.balance||0)+Number(tx.amount||0));
+      return {...p,balance:restoredBal,status:restoredBal>0?'open':p.status};
+    });
+  }
   appendAudit('void',tx);
   logActivity(`Voided ${tx.type}: ${fmt(tx.amount)}`);
   scheduleSave();render();toast('Transaction voided');
@@ -3737,6 +3819,12 @@ function addAccount(a){
 }
 function deleteAccount(id){
   if(transactions.some(t=>t.account===id||t.fromAccount===id||t.toAccount===id)){toast('Account has transactions','error');return}
+  /* Block if any employee uses this as their payout account — otherwise the
+     roster card points to a missing account and finalizePayroll silently falls
+     back to a different account on next run (the snapshot rate stays right but
+     pay routing changes unexpectedly). */
+  const refs=(roster||[]).filter(r=>r&&r.payoutAccount===id);
+  if(refs.length){toast(`Used as payout account for ${refs.length} employee(s) — reassign first`,'error');return}
   if(!confirm('Delete this account?'))return;
   const a=accounts.find(x=>x.id===id);
   accounts=accounts.filter(a=>a.id!==id);
@@ -3752,7 +3840,10 @@ function deleteCoaItem(id){
   const item=coa.find(c=>c.id===id);
   if(!item)return;
   if(item.isDefault){toast('Default accounts cannot be deleted','error');return}
-  if(transactions.some(t=>t.category===item.name)){toast('Category in use','error');return}
+  /* Two-key check: txs may reference a COA by name (legacy/manual) OR by coaId
+     (gateway-created). Checking only one orphans txs and silently breaks reports
+     that group/filter by COA. */
+  if(transactions.some(t=>t&&!t.voided&&(t.category===item.name||t.coaId===id))){toast('Category in use','error');return}
   if(!confirm(`Remove "${item.name}"?`))return;
   coa=coa.filter(c=>c.id!==id);scheduleSave();render();toast('Removed');
 }
@@ -3760,9 +3851,14 @@ function editCoaItem(id){openModal('editCoa',coa.find(c=>c.id===id))}
 function saveEditCoa(id){
   const name=(document.getElementById('m-coa-name')?.value||'').trim();
   const code=(document.getElementById('m-coa-code')?.value||'').trim();
+  const group=(document.getElementById('m-coa-group')?.value||'').trim();
+  const type=document.getElementById('m-coa-type')?.value||'expense';
   if(!name){toast('Name required','error');return}
   const old=coa.find(c=>c.id===id);
-  coa=coa.map(c=>c.id===id?{...c,name,code}:c);
+  /* Previously only saved name/code — group and type edits silently dropped.
+     Now persists all four so users can move accounts between groups (e.g. an
+     uncategorized account → Utilities) and re-classify type if needed. */
+  coa=coa.map(c=>c.id===id?{...c,name,code,group:group||c.group,type:type||c.type}:c);
   if(old&&old.name!==name)ledgerReplaceTransactions(transactions.map(t=>t.category===old.name?{...t,category:name}:t),'rename_category');
   scheduleSave();render();closeModal();toast('Saved ✓');
 }
@@ -3930,7 +4026,10 @@ function renderModal(){
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="${isEdit?`saveEditPayable('${d.id}')`:'submitAddPayable()'}">Save</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
   }else if(type==='payPayable'){
     const d=data||{};
-    const acctOpts=accounts.map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
+    /* Exclude clearing accounts — Sales Clearing / Card Clearing are transit
+       accounts only, never a payment source. Mirrors the filter used by every
+       other "Pay From" dropdown in the app. */
+    const acctOpts=(accounts||[]).filter(a=>a&&a.type!=='clearing').map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
     body=`<div style="background:var(--bg3);border-radius:7px;padding:10px 13px;margin-bottom:12px;font-size:.82rem"><div style="display:flex;justify-content:space-between"><span class="muted">Payable</span><span style="font-weight:600">${esc(d.name||'')}</span></div><div style="display:flex;justify-content:space-between;margin-top:3px"><span class="muted">Balance</span><span class="mono" style="font-weight:700;color:var(--red)">${fmt(d.balance||0)}</span></div></div>
     <div class="form-row"><div class="form-group"><label>Payment Amount (₱)</label><input id="m-payamt" type="number" step="0.01" min="0" value="${d.balance||''}"></div><div class="form-group"><label>Pay From</label><select id="m-payacct">${acctOpts}</select></div></div>
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="confirmPayPayable('${d.id}')">Confirm Payment</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
@@ -3960,11 +4059,29 @@ function renderModal(){
 
   }else if(type==='addCoa'||type==='editCoa'){
     const isEdit=type==='editCoa';const d=data||{};
-    const grpOpts=['Revenue','Cost of Sales','Food','Wine','Liquor','Beer','Other Beverage','Merchandise','Packaging','Consumables','Labor','Marketing','Travel','Supplies','Repairs','Professional Fees','Financial','Occupancy','Other','Current Assets','Current Liabilities','Equity'].map(g=>`<option value="${g}" ${d.group===g?'selected':''}>${g}</option>`).join('');
-    const typeOpts=['revenue','cogs','expense','asset','liability','equity'].map(t=>`<option value="${t}" ${(d.type||'expense')===t?'selected':''}>${t.charAt(0).toUpperCase()+t.slice(1)}</option>`).join('');
+    /* Groups: pull every distinct group already used in the COA so the dropdown
+       always reflects reality (the old hardcoded list missed Utilities, Inventory,
+       Administrative, Other Income, Other Expenses, Compliance & Licenses, etc.).
+       Use a datalist so the user can either pick an existing group OR type a new
+       one — no more "the option I need isn't in the list" frustration. */
+    const existingGroups=[...new Set((coa||[]).map(c=>c?.group).filter(Boolean))].sort();
+    const grpDatalist=existingGroups.map(g=>`<option value="${esc(g)}">`).join('');
+    /* Types: full canonical list including contra_revenue / contra_asset which are
+       used by the default COA (Discounts, Accumulated Depreciation). */
+    const allTypes=[
+      ['revenue','Revenue'],
+      ['contra_revenue','Contra Revenue (discounts/refunds)'],
+      ['cogs','COGS (cost of goods sold)'],
+      ['expense','Expense (operating/labor/other)'],
+      ['asset','Asset'],
+      ['contra_asset','Contra Asset (depreciation)'],
+      ['liability','Liability'],
+      ['equity','Equity']
+    ];
+    const typeOpts=allTypes.map(([v,l])=>`<option value="${v}" ${(d.type||'expense')===v?'selected':''}>${l}</option>`).join('');
     body=`<div class="form-row"><div class="form-group"><label>Code</label><input id="m-coa-code" placeholder="e.g. 6999" value="${esc(d.code||'')}"></div><div class="form-group"><label>Type</label><select id="m-coa-type">${typeOpts}</select></div></div>
-    <div class="form-group"><label>Account Name</label><input id="m-coa-name" placeholder="Account name" value="${esc(d.name||'')}"></div>
-    <div class="form-group"><label>Group</label><select id="m-coa-group">${grpOpts}</select></div>
+    <div class="form-group"><label>Account Name</label><input id="m-coa-name" placeholder="e.g. Drinking Water" value="${esc(d.name||'')}"></div>
+    <div class="form-group"><label>Group <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· pick an existing group or type a new one</span></label><input id="m-coa-group" list="coa-groups-list" placeholder="e.g. Utilities" value="${esc(d.group||'')}" autocomplete="off"><datalist id="coa-groups-list">${grpDatalist}</datalist></div>
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="${isEdit?`saveEditCoa('${d.id}')`:'submitAddCoa()'}">Save</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
 
   }else if(type==='addRoster'||type==='editRoster'){
@@ -4051,6 +4168,10 @@ function renderModal(){
     <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="09:00"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="18:00"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="120" step="15" value="60"></div></div>
     <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="09:00"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="8"></div><div class="form-group"><label>Note</label><input id="m-shift-note" placeholder="e.g. OT, half-day…"></div></div>
     <div class="info-box" style="margin-bottom:4px;font-size:.76rem">Tardiness is auto-detected: clock-in after Scheduled In is docked per policy (1–29m→30m · 30–59m→1h · 60m+→4h). Leaving early / a short day shows as Undertime. Set Scheduled hrs to 4 for a half-day.</div>
+    <div style="display:flex;gap:14px;justify-content:flex-end;padding:6px 4px;font-size:.78rem;color:var(--muted2);margin-bottom:6px">
+      <span>Hours worked: <b id="sp-hours" class="mono" style="color:var(--text)">—</b></span>
+      <span>Daily rate: <b id="sp-rate" class="mono" style="color:var(--text)">—</b></span>
+    </div>
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="submitAddShift()">Log Shift</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
     setTimeout(()=>{const upd=()=>{const e=roster.find(r=>r.id===document.getElementById('m-shift-emp')?.value);const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;const hrs=calcShiftHours(ti,to,br);const el=document.getElementById('sp-hours');const re=document.getElementById('sp-rate');if(el)el.textContent=hrs.toFixed(2)+'h';if(re)re.textContent=e?fmt(e.dailyRate):'-';};['m-shift-emp','m-shift-in','m-shift-out','m-shift-break'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',upd)});upd()},80);
     }
@@ -4058,7 +4179,8 @@ function renderModal(){
     const sid=data;const s=shifts.find(x=>x.id===sid);const emp=s?roster.find(r=>r.id===s.employeeId):null;
     if(!s){body=`<div class="warn-box">Shift not found.</div>`;
     }else{
-      body=`<div style="font-size:.82rem;color:var(--muted2);margin-bottom:12px">${esc(emp?.name||'Unknown')} · ${fmtDate(s.date)}</div>
+      body=`<div style="font-size:.82rem;color:var(--muted2);margin-bottom:12px">${esc(emp?.name||'Unknown')}</div>
+      <div class="form-row"><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${s.date}"></div><div class="form-group"></div><div class="form-group"></div></div>
       <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="${s.timeIn}"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="${s.timeOut}"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="240" step="15" value="${s.breakMins||0}"></div></div>
       <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="${s.scheduledIn||s.timeIn||'09:00'}"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="${s.scheduledHours||8}"></div><div class="form-group"><label>Note</label><input id="m-shift-note" value="${esc(s.note||'')}"></div></div>
       <div class="info-box" style="margin-bottom:8px">Tardiness is auto-detected: clock-in after Scheduled In is docked per policy (1–29m→30m · 30–59m→1h · 60m+→4h). Leaving early / a short day shows as Undertime.</div>
@@ -4114,6 +4236,10 @@ function renderModal(){
     <div class="form-row">
       <div class="form-group"><label>Special Holiday Multiplier</label><input id="ps-sh" type="number" step="0.01" min="1" value="${payrollSettings.specialHolidayMultiplier||1.30}"></div>
       <div class="form-group"><label>ND Start</label><input id="ps-ndstart" type="time" value="${payrollSettings.ndStart||'22:00'}"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>ND End <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· next-day morning end of night-diff window</span></label><input id="ps-ndend" type="time" value="${payrollSettings.ndEnd||'06:00'}"></div>
+      <div class="form-group"></div>
     </div>
     <div class="form-row">
       <div class="form-group"><label>1st Cutoff From Day</label><input id="ps-c1from" type="number" min="1" max="31" value="${payrollSettings.firstCutoff?.fromDay||26}"></div>
@@ -4404,6 +4530,17 @@ function submitTx(type){
   const coaId=(catSelect?.selectedOptions?.[0]?.dataset?.coaid)||coa.find(c=>c.name===category)?.id||'';
   const acct=document.getElementById('m-acct')?.value;
   const status=document.getElementById('m-status')?.value||'paid';
+  /* Audit fix: the Sale modal's category dropdown allows BOTH revenue and
+     contra_revenue COA items (discounts, refunds, comps). If the user picks a
+     contra item, posting as type='sale' would wrongly add cash AND subtract from
+     net revenue — books don't tie. Auto-remap to 'dsr_adjustment' (cash-neutral,
+     metric still subtracts via isContraRevenue) so the books stay balanced. */
+  if(type==='sale'){
+    const pickedCoa=coa.find(c=>c.id===coaId);
+    if(pickedCoa?.type==='contra_revenue'){
+      type='dsr_adjustment';
+    }
+  }
   /* Input VAT split: if the user entered a VAT portion, split the entered total
      into a (net) expense + a paired cash-debiting Input VAT credit (asset). The
      pair preserves: cash out = full amount, P&L expense = net, Input VAT asset
@@ -4437,9 +4574,11 @@ function submitTx(type){
 
 function submitAddCoa(){
   const name=(document.getElementById('m-coa-name')?.value||'').trim();
-  const code=document.getElementById('m-coa-code')?.value||'';
+  const code=(document.getElementById('m-coa-code')?.value||'').trim();
+  const group=(document.getElementById('m-coa-group')?.value||'').trim()||'Other';
+  const type=document.getElementById('m-coa-type')?.value||'expense';
   if(!name){toast('Name required','error');return}
-  addCoaItem({name,code,group:document.getElementById('m-coa-group')?.value||'Other',type:document.getElementById('m-coa-type')?.value||'expense'});
+  addCoaItem({name,code,group,type});
 }
 
 function submitOpenTab(){
@@ -5619,20 +5758,48 @@ function pgTransactions(){
   if(filters.dateFrom)f=f.filter(t=>t.date>=filters.dateFrom);
   if(filters.dateTo)f=f.filter(t=>t.date<=filters.dateTo);
   if(filters.search){const q=filters.search.toLowerCase();f=f.filter(t=>(t.note||'').toLowerCase().includes(q)||(t.category||'').toLowerCase().includes(q))}
+  /* Totals computed over the FULL filtered set (not just the visible page) so
+     summary numbers reflect what the filters say, not "what fits on screen". */
   const active=f.filter(t=>!t.voided);
   const tS=active.filter(t=>t.type==='sale').reduce((s,t)=>s+t.amount,0);
   const tE=active.filter(t=>t.type==='expense').reduce((s,t)=>s+t.amount,0);
   const net=tS-tE;
   const sel=(v,c)=>v===c?'selected':'';
-  const rows=f.length?f.map(tx=>`<tr style="${tx.voided?'opacity:.55':''}"><td style="font-size:.76rem;white-space:nowrap;color:var(--muted)">${fmtDate(tx.date)}</td><td>${badge(tx)}</td><td><div style="font-weight:500">${esc(tx.category)||(tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:'—')}</div>${tx.note?`<div style="font-size:.72rem;color:var(--muted2)">${esc(tx.note)}</div>`:''}</td><td style="font-size:.76rem;color:var(--muted2)">${tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:an(tx.account)}</td><td style="text-align:right">${amountCell(tx)}</td><td style="font-size:.72rem;color:var(--muted2)">${esc(tx.handler||'')}</td><td><div class="row-actions">
+  /* Pagination — slice the filtered list to the current page. txPerPage may be
+     0 to mean "show all" (the per-page select offers it as an escape hatch). */
+  const totalRows=f.length;
+  const showAll=!txPerPage||txPerPage<=0;
+  const totalPages=showAll?1:Math.max(1,Math.ceil(totalRows/txPerPage));
+  /* Clamp page so a filter change that shrinks the result set doesn't strand the
+     user on a now-empty page (e.g., they were on page 7 then narrowed by date). */
+  if(txPage>totalPages) txPage=totalPages;
+  if(txPage<1) txPage=1;
+  const startIdx=showAll?0:(txPage-1)*txPerPage;
+  const endIdx=showAll?totalRows:Math.min(totalRows,startIdx+txPerPage);
+  const pageRows=f.slice(startIdx,endIdx);
+  const rows=pageRows.length?pageRows.map(tx=>`<tr style="${tx.voided?'opacity:.55':''}"><td style="font-size:.76rem;white-space:nowrap;color:var(--muted)">${fmtDate(tx.date)}</td><td>${badge(tx)}</td><td><div style="font-weight:500">${esc(tx.category)||(tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:'—')}</div>${tx.note?`<div style="font-size:.72rem;color:var(--muted2)">${esc(tx.note)}</div>`:''}</td><td style="font-size:.76rem;color:var(--muted2)">${tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:an(tx.account)}</td><td style="text-align:right">${amountCell(tx)}</td><td style="font-size:.72rem;color:var(--muted2)">${esc(tx.handler||'')}</td><td><div class="row-actions">
   ${isStaff?`<span style="font-size:.68rem;color:var(--muted2)">${tx.voided?'voided':'view only'}</span>`:`${tx.type==='expense'&&tx.status==='unpaid'&&!tx.voided?`<button class="row-btn" style="color:var(--green)" onclick="markExpensePaid('${tx.id}')" title="Mark Paid">✓</button>`:''}
   ${!tx.voided?`<button class="row-btn" onclick="editTransaction('${tx.id}')" title="Edit">✎</button><button class="row-btn del" onclick="deleteTransaction('${tx.id}')" title="Delete">✕</button>`:`<span style="font-size:.68rem;color:var(--muted2)">voided</span>`}`}
-</div></td></tr>`).join(''):`<tr><td colspan="6" class="empty">No transactions match filters.</td></tr>`;
-  const summary=f.length?`<div class="summary-footer"><span style="font-size:.78rem;color:var(--muted)">Shown: <b>${f.length}</b></span><span class="green" style="font-size:.78rem">Sales: <b>${fmt(tS)}</b></span><span class="red" style="font-size:.78rem">Expenses: <b>${fmt(tE)}</b></span><span class="${net>=0?'green':'red'}" style="font-size:.78rem">Net: <b>${net>=0?'+':''}${fmt(net)}</b></span></div>`:'';
+</div></td></tr>`).join(''):`<tr><td colspan="7" class="empty">No transactions match filters.</td></tr>`;
+  /* Pagination controls — only render when there's something to paginate. */
+  const pagerBtn=(label,targetPage,disabled,title)=>`<button class="btn btn-ghost btn-xs" ${disabled?'disabled style="opacity:.35;cursor:not-allowed"':`onclick="txPage=${targetPage};renderMain()"`} title="${title||''}">${label}</button>`;
+  const perPageOpts=[25,50,100,250,0].map(n=>`<option value="${n}" ${txPerPage===n?'selected':''}>${n===0?'All':n+' / page'}</option>`).join('');
+  const pager=totalRows>0?`<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-top:1px solid var(--border);font-size:.76rem;flex-wrap:wrap">
+    <span style="color:var(--muted)">Showing <b style="color:var(--text)">${startIdx+1}</b>–<b style="color:var(--text)">${endIdx}</b> of <b style="color:var(--text)">${totalRows}</b></span>
+    ${!showAll&&totalPages>1?`<div style="display:flex;align-items:center;gap:4px;margin-left:auto">
+      ${pagerBtn('« First',1,txPage<=1,'Jump to first page')}
+      ${pagerBtn('‹ Prev',Math.max(1,txPage-1),txPage<=1,'Previous page')}
+      <span style="padding:0 8px;color:var(--muted)">Page <b style="color:var(--text)">${txPage}</b> of <b style="color:var(--text)">${totalPages}</b></span>
+      ${pagerBtn('Next ›',Math.min(totalPages,txPage+1),txPage>=totalPages,'Next page')}
+      ${pagerBtn('Last »',totalPages,txPage>=totalPages,'Jump to last page')}
+    </div>`:'<div style="flex:1"></div>'}
+    <select onchange="txPerPage=parseInt(this.value)||0;txPage=1;renderMain()" style="font-size:.74rem;padding:2px 6px;border-radius:4px;border:1px solid var(--border2);background:var(--bg);cursor:pointer">${perPageOpts}</select>
+  </div>`:'';
+  const summary=totalRows?`<div class="summary-footer"><span style="font-size:.78rem;color:var(--muted)">Total matched: <b>${totalRows}</b></span><span class="green" style="font-size:.78rem">Sales: <b>${fmt(tS)}</b></span><span class="red" style="font-size:.78rem">Expenses: <b>${fmt(tE)}</b></span><span class="${net>=0?'green':'red'}" style="font-size:.78rem">Net: <b>${net>=0?'+':''}${fmt(net)}</b></span></div>`:'';
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Transactions</div><div class="page-sub">All movements — edit, void, or delete</div></div></div>
-<div class="filter-row"><input placeholder="Search…" value="${esc(filters.search)}" oninput="filters.search=this.value;renderMain()" style="flex:1;min-width:100px;max-width:200px"><select onchange="filters.type=this.value;renderMain()"><option value="" ${sel('',filters.type)}>All Types</option><option value="sale" ${sel('sale',filters.type)}>Sales</option><option value="expense" ${sel('expense',filters.type)}>Expenses</option><option value="transfer" ${sel('transfer',filters.type)}>Transfers</option><option value="deposit" ${sel('deposit',filters.type)}>Deposits</option><option value="withdrawal" ${sel('withdrawal',filters.type)}>Withdrawals</option></select><input type="date" value="${filters.dateFrom}" onchange="filters.dateFrom=this.value;renderMain()"><input type="date" value="${filters.dateTo}" onchange="filters.dateTo=this.value;renderMain()"><button class="btn btn-ghost btn-sm" onclick="filters={type:'',search:'',dateFrom:'',dateTo:''};renderMain()">Clear</button><div style="flex:1"></div><button class="btn btn-ghost btn-sm" onclick="exportCSV()">↓ CSV</button></div>
+<div class="filter-row"><input placeholder="Search…" value="${esc(filters.search)}" oninput="filters.search=this.value;txPage=1;renderMain()" style="flex:1;min-width:100px;max-width:200px"><select onchange="filters.type=this.value;txPage=1;renderMain()"><option value="" ${sel('',filters.type)}>All Types</option><option value="sale" ${sel('sale',filters.type)}>Sales</option><option value="expense" ${sel('expense',filters.type)}>Expenses</option><option value="transfer" ${sel('transfer',filters.type)}>Transfers</option><option value="deposit" ${sel('deposit',filters.type)}>Deposits</option><option value="withdrawal" ${sel('withdrawal',filters.type)}>Withdrawals</option><option value="sc_collected" ${sel('sc_collected',filters.type)}>SC Collected</option><option value="tip_collected" ${sel('tip_collected',filters.type)}>Tip Collected</option><option value="sc_paid" ${sel('sc_paid',filters.type)}>SC Paid Out</option><option value="tip_paid" ${sel('tip_paid',filters.type)}>Tip Paid Out</option><option value="liability_payment" ${sel('liability_payment',filters.type)}>Liability Remittance</option><option value="dsr_adjustment" ${sel('dsr_adjustment',filters.type)}>DSR Adjustment (VAT/Discount)</option></select><input type="date" value="${filters.dateFrom}" onchange="filters.dateFrom=this.value;txPage=1;renderMain()"><input type="date" value="${filters.dateTo}" onchange="filters.dateTo=this.value;txPage=1;renderMain()"><button class="btn btn-ghost btn-sm" onclick="filters={type:'',search:'',dateFrom:'',dateTo:''};txPage=1;renderMain()">Clear</button><div style="flex:1"></div><button class="btn btn-ghost btn-sm" onclick="exportCSV()">↓ CSV</button></div>
 ${isStaff?`<div class="info-box" style="margin-bottom:10px;font-size:.78rem">Viewing in <b>staff (read-only)</b> mode — ad-hoc transactions, edits, voids, and deletes are manager-only.</div>`:`<div class="action-bar"><button class="btn btn-primary btn-sm" onclick="openModal('sale')">+ Sale</button><button class="btn btn-ghost btn-sm" onclick="openModal('expense')">+ Expense</button><button class="btn btn-ghost btn-sm" onclick="openModal('transfer')">↕ Transfer</button><button class="btn btn-ghost btn-sm" onclick="openModal('deposit')">↓ Deposit</button><button class="btn btn-ghost btn-sm" onclick="openModal('withdrawal')">↑ Withdraw</button><button class="btn btn-ghost btn-sm" onclick="triggerCSVImport()">↑ Import CSV</button><input type="file" id="csv-import-input" accept=".csv" style="display:none" onchange="handleCSVImport(this.files[0])"></div>`}
-<div class="card-flush"><table><thead><tr><th>Date</th><th>Type</th><th>Category / Note</th><th>Account</th><th style="text-align:right">Amount</th><th>Handler</th><th></th></tr></thead><tbody>${rows}</tbody></table>${summary}</div>`;
+<div class="card-flush"><table><thead><tr><th>Date</th><th>Type</th><th>Category / Note</th><th>Account</th><th style="text-align:right">Amount</th><th>Handler</th><th></th></tr></thead><tbody>${rows}</tbody></table>${pager}${summary}</div>`;
 }
 
 /* ═══════════════════════════════════════════════
@@ -6033,6 +6200,9 @@ function postDSRToLedger(date){
 
   // Mark DSR as posted
   dsrEntries[date]={...dsrEntries[date],posted:true,postedAt:new Date().toISOString()};
+  /* Snapshot the metric history for this date's day/week/month so trend reports
+     have persisted summaries to read instead of recomputing from raw transactions. */
+  try{ persistMetricsForDate(date); }catch(e){ console.warn('persistMetricsForDate failed',e); }
   logActivity(`DSR posted for ${fmtDate(date)}: ${fmt(tFood+tAlc+tBev)} sales, ${newTxs.length} transactions`);
   scheduleSave();
   render();
@@ -6069,6 +6239,8 @@ function unpostDSR(date){
   staffPayables=staffPayables.filter(p=>!(p.date===date&&p.description&&p.description.includes('DSR')));
   // Mark as unposted
   dsrEntries[date]={...dsrEntries[date],posted:false,postedAt:null};
+  /* Refresh metric snapshots for this date now that its txs are gone. */
+  try{ persistMetricsForDate(date); }catch(e){ console.warn('persistMetricsForDate failed',e); }
   logActivity(`DSR unposted for ${fmtDate(date)}`);
   scheduleSave();render();
   toast(`DSR unposted — ${existing.length} transactions reversed`);
@@ -7294,7 +7466,25 @@ function createPayrollAdjustment({employeeId,payrollPeriod,type,category,amount,
   scheduleSave();
 }
 
+/* Returns the finalized payroll run whose [fromDate,toDate] window contains the
+   given ISO date, or null if none. Used to block edits to inputs (shifts,
+   adjustments, holidays) that a finalized run already baked into pay. The run
+   stays correct as long as those inputs are intact — deleting them now means an
+   unfinalize/refinalize would produce different numbers (silent drift). */
+function findFinalizedRunForDate(dateStr){
+  if(!dateStr) return null;
+  return (payrollRuns||[]).find(r=>r&&r.fromDate&&r.toDate&&dateStr>=r.fromDate&&dateStr<=r.toDate)||null;
+}
 function deletePayrollAdjustment(id){
+  const adj=(payrollAdjustments||[]).find(a=>a&&a.id===id);
+  if(!adj){toast('Adjustment not found','error');return;}
+  /* Finalized-period guard — adjustment is baked into a finalized run's pay
+     amounts; deleting it now silently changes pay if you ever unfinalize and
+     re-finalize the same period. */
+  if(adj.payrollPeriod){
+    const inRun=(payrollRuns||[]).find(r=>r&&`${r.fromDate}-${r.toDate}`===adj.payrollPeriod);
+    if(inRun){toast(`This adjustment is part of a finalized payroll (${fmtDate(inRun.fromDate)}–${fmtDate(inRun.toDate)}) — unfinalize that run first if you need to remove it`,'error');return;}
+  }
   if(!confirm('Remove this adjustment?'))return;
   payrollAdjustments=payrollAdjustments.filter(a=>a.id!==id);
   scheduleSave();renderMain();toast('Removed');
@@ -7473,6 +7663,9 @@ function finalizePayroll({fromDate,toDate}){
     return {...p, status:'paid', paidAt:new Date().toISOString(), paidByPayrollRunId:payrollId};
   });
 
+  /* Period-wide labor materially changes — refresh metric snapshots for the period
+     end date so the daily/weekly/monthly history reflects the accrual. */
+  try{ persistMetricsForDate(toDate); }catch(e){ console.warn('persistMetricsForDate failed',e); }
   logActivity(`Payroll finalized: ${fmtDate(fromDate)}–${fmtDate(toDate)} · Net ${fmt(totalNet)} (Wages ${fmt(totalWageGross)} + SC ${fmt(totalSC)} + Tips ${fmt(totalTip)}) · ${rowsPreview.length} employees · ${entries.length} ledger entr${entries.length===1?'y':'ies'} · ${flippedCount} staffPayable${flippedCount===1?'':'s'} settled`);
   scheduleSave();renderMain();
   toast(`Payroll finalized — wages ${fmt(totalWageGross)} payable (pay on payday), ${fmt(totalSC+totalTip)} SC/Tips paid now ✓`,'success');
@@ -7533,6 +7726,7 @@ function savePayrollSettings(){
     regularHolidayMultiplier:parseFloat(document.getElementById('ps-rh')?.value||2),
     specialHolidayMultiplier:parseFloat(document.getElementById('ps-sh')?.value||1.30),
     ndStart:document.getElementById('ps-ndstart')?.value||'22:00',
+    ndEnd:document.getElementById('ps-ndend')?.value||'06:00',
     firstCutoff:{fromDay:parseInt(document.getElementById('ps-c1from')?.value||26),toDay:parseInt(document.getElementById('ps-c1to')?.value||10),payDay:parseInt(document.getElementById('ps-c1pay')?.value||15)},
     secondCutoff:{fromDay:parseInt(document.getElementById('ps-c2from')?.value||11),toDay:parseInt(document.getElementById('ps-c2to')?.value||25),payDay:parseInt(document.getElementById('ps-c2pay')?.value||30)},
   };
@@ -7680,6 +7874,8 @@ function submitBackfillMonth(){
     `Net cash impact on ${accounts.find(a=>a.id===acctId)?.name||'account'}: ${cashImpact>=0?'+':''}${fmt(cashImpact)}\n`+
     `(Output VAT is cash-neutral; Input VAT debits cash for the VAT portion of purchases)`))return;
   createLedgerBatch(txs);
+  /* Refresh metric snapshots for the backfilled month so the history reflects it. */
+  try{ persistMetricsForDate(date); }catch(e){ console.warn('persistMetricsForDate failed',e); }
   logActivity(`Backfilled ${monthVal}: ${txs.length} entries · net ${fmt(netProfit)}`);
   closeModal();
   toast(`Backfilled ${monthVal} — ${txs.length} entries posted ✓`,'success');
@@ -7784,7 +7980,13 @@ function addShift(s){
   scheduleSave();render();closeModal();toast('Shift logged ✓');
 }
 function deleteShift(id){
-  const s=shifts.find(x=>x.id===id);if(!s||!confirm('Delete this shift?'))return;
+  const s=shifts.find(x=>x.id===id);if(!s)return;
+  /* Finalized-period guard — shift hours fed a finalized run; deleting now
+     means a re-finalize would compute different labor. The run snapshot stays
+     correct, but the audit trail no longer ties out. */
+  const inRun=findFinalizedRunForDate(s.date);
+  if(inRun){toast(`This shift is in a finalized payroll (${fmtDate(inRun.fromDate)}–${fmtDate(inRun.toDate)}) — unfinalize that run first if you need to delete it`,'error');return;}
+  if(!confirm('Delete this shift?'))return;
   // Phase 2.7: no direct tx to reverse
   shifts=shifts.filter(x=>x.id!==id);
   scheduleSave();render();toast('Shift deleted');
@@ -7793,6 +7995,18 @@ function calcShiftHours(ti,to,br){if(!ti||!to)return 0;const[ih,im]=ti.split(':'
 function calcSCTipDistribution(date){const ds=shifts.filter(s=>s.date===date);if(!ds.length)return[];const empOf=s=>roster.find(r=>r.id===s.employeeId);const scT=staffPayables.filter(p=>p.date===date&&p.type==='sc'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);const tipT=staffPayables.filter(p=>p.date===date&&p.type==='tip'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);const pot=scT+tipT;/* SC and tips distribute over their OWN eligible-hours denominators (the two flags can differ). */const scH=ds.filter(s=>empOf(s)?.scEligible!==false).reduce((s,x)=>s+x.hoursWorked,0);const tipH=ds.filter(s=>empOf(s)?.tipsEligible!==false).reduce((s,x)=>s+x.hoursWorked,0);return ds.filter(s=>{const e=empOf(s);return e?.scEligible!==false||e?.tipsEligible!==false}).map(s=>{const e=empOf(s);const scShare=(e?.scEligible!==false&&scH>0)?(s.hoursWorked/scH)*scT:0;const tipShare=(e?.tipsEligible!==false&&tipH>0)?(s.hoursWorked/tipH)*tipT:0;const totalShare=scShare+tipShare;return{employeeId:s.employeeId,name:e?.name||'Unknown',position:e?.position||'',hoursWorked:s.hoursWorked,sharePct:pot>0?(totalShare/pot*100):0,scShare,tipShare,totalShare,dailyRate:e?.dailyRate||0}}).sort((a,b)=>b.hoursWorked-a.hoursWorked)}
 function saveEditShift(id){
   const s=shifts.find(x=>x.id===id);if(!s)return;
+  const date=document.getElementById('m-shift-date')?.value||s.date;
+  /* Finalized-period guards — block edits that would either
+     (a) move a shift OUT of a finalized period, or
+     (b) move a shift INTO a finalized period.
+     Mirrors the deleteShift guard: any change to inputs of a finalized run means
+     a re-finalize would compute different labor. */
+  const inRunOld=findFinalizedRunForDate(s.date);
+  if(inRunOld){toast(`This shift is in a finalized payroll (${fmtDate(inRunOld.fromDate)}–${fmtDate(inRunOld.toDate)}) — unfinalize that run first if you need to edit it`,'error');return;}
+  if(date!==s.date){
+    const inRunNew=findFinalizedRunForDate(date);
+    if(inRunNew){toast(`The new date falls in a finalized payroll (${fmtDate(inRunNew.fromDate)}–${fmtDate(inRunNew.toDate)}) — unfinalize that run first`,'error');return;}
+  }
   const ti=document.getElementById('m-shift-in')?.value||s.timeIn;
   const to=document.getElementById('m-shift-out')?.value||s.timeOut;
   const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;
@@ -7802,7 +8016,7 @@ function saveEditShift(id){
   const hrs=calcShiftHours(ti,to,br);
   // Phase 2.7: no direct tx manipulation — shift records only.
   // Tardiness is derived in computeShiftPay from scheduledIn vs timeIn — no stored lateMinutes.
-  shifts=shifts.map(x=>x.id===id?{...x,timeIn:ti,timeOut:to,breakMins:br,scheduledHours:sched,scheduledIn:schedIn,note,hoursWorked:hrs}:x);
+  shifts=shifts.map(x=>x.id===id?{...x,date,timeIn:ti,timeOut:to,breakMins:br,scheduledHours:sched,scheduledIn:schedIn,note,hoursWorked:hrs}:x);
   scheduleSave();render();closeModal();toast('Shift updated ✓');
 }
 function submitAddRoster(){
@@ -7833,7 +8047,15 @@ function submitAddRoster(){
 }
 function submitAddShift(){const empId=document.getElementById('m-shift-emp')?.value;if(!empId){toast('Select an employee','error');return}const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;if(!ti||!to){toast('Enter shift times','error');return}addShift({employeeId:empId,date:document.getElementById('m-shift-date')?.value||today(),timeIn:ti,timeOut:to,breakMins:parseInt(document.getElementById('m-shift-break')?.value||0)||0,scheduledHours:parseFloat(document.getElementById('m-shift-sched')?.value)||8,scheduledIn:document.getElementById('m-shift-schedin')?.value||ti,note:document.getElementById('m-shift-note')?.value||''})}
 function submitAddHoliday(){const date=document.getElementById('m-hol-date')?.value;const name=(document.getElementById('m-hol-name')?.value||'').trim();const type=document.getElementById('m-hol-type')?.value||'special';if(!date||!name){toast('Date and name required','error');return}if(holidays.some(h=>h.date===date)){toast('Holiday already exists','error');return}holidays=[...holidays,{date,name,type}].sort((a,b)=>a.date.localeCompare(b.date));scheduleSave();renderMain();closeModal();toast('Holiday added ✓')}
-function deleteHoliday(date){if(!confirm('Remove this holiday?'))return;holidays=holidays.filter(h=>h.date!==date);scheduleSave();renderMain();toast('Removed')}
+function deleteHoliday(date){
+  /* Finalized-period guard — holiday flag drove premium pay in a finalized run;
+     deleting now silently changes pay if you ever unfinalize and re-finalize. */
+  const inRun=findFinalizedRunForDate(date);
+  if(inRun){toast(`This date falls in a finalized payroll (${fmtDate(inRun.fromDate)}–${fmtDate(inRun.toDate)}) — unfinalize that run first if you need to remove this holiday`,'error');return;}
+  if(!confirm('Remove this holiday?'))return;
+  holidays=holidays.filter(h=>h.date!==date);
+  scheduleSave();renderMain();toast('Removed');
+}
 let _laborTab='shifts';
 function pgLabor(){
   const vd=window._laborDate||today();const co=getCutoffPeriod(vd);const at=_laborTab||'shifts';
@@ -8448,14 +8670,27 @@ function editPayable(id){openModal('editPayable',payables.find(p=>p.id===id))}
 function saveEditPayable(id){payables=payables.map(p=>p.id===id?{...p,name:document.getElementById('m-pay-name')?.value||p.name,type:document.getElementById('m-pay-type')?.value||p.type,supplier:document.getElementById('m-pay-supplier')?.value||p.supplier,balance:parseFloat(document.getElementById('m-pay-balance')?.value||p.balance)||p.balance,dueDate:document.getElementById('m-pay-due')?.value||p.dueDate,note:document.getElementById('m-pay-note')?.value||p.note}:p);scheduleSave();render();closeModal();toast('Updated ✓')}
 function deletePayable(id){if(!confirm('Delete this payable?'))return;payables=payables.filter(p=>p.id!==id);scheduleSave();render();toast('Deleted')}
 function payPayable(id){const p=payables.find(x=>x.id===id);if(!p)return;openModal('payPayable',p)}
-function confirmPayPayable(id){const p=payables.find(x=>x.id===id);if(!p)return;const amt=parseFloat(document.getElementById('m-payamt')?.value||p.balance)||p.balance;const acct=document.getElementById('m-payacct')?.value||accounts[0]?.id;const tx={id:uid(),date:today(),type:'expense',category:'Accounts Payable',account:acct,amount:amt,status:'paid',note:`Payable paid: ${p.name}`,handler:currentUser};createLedgerTransaction(tx,{skipRender:true,skipSave:true});const newBal=p.balance-amt;payables=payables.map(x=>x.id===id?{...x,balance:Math.max(0,newBal),status:newBal<=0?'paid':'open'}:x);logActivity(`Payable paid: ${p.name} — ${fmt(amt)}`);scheduleSave();render();closeModal();toast('Payment recorded ✓')}
+function confirmPayPayable(id){const p=payables.find(x=>x.id===id);if(!p)return;const amt=parseFloat(document.getElementById('m-payamt')?.value||p.balance)||p.balance;const acct=document.getElementById('m-payacct')?.value||accounts[0]?.id;
+  /* payableId links the payment tx back to its payable so voiding the tx can
+     restore the payable's balance (mirrors payrollRunId / advanceId). */
+  const tx={id:uid(),date:today(),type:'expense',category:'Accounts Payable',account:acct,amount:amt,status:'paid',note:`Payable paid: ${p.name}`,handler:currentUser,payableId:id};createLedgerTransaction(tx,{skipRender:true,skipSave:true});const newBal=p.balance-amt;payables=payables.map(x=>x.id===id?{...x,balance:Math.max(0,newBal),status:newBal<=0?'paid':'open'}:x);logActivity(`Payable paid: ${p.name} — ${fmt(amt)}`);scheduleSave();render();closeModal();toast('Payment recorded ✓')}
 
 /* ═══════════════════════════════════════════════
    KEYBOARD + FORECAST
 ═══════════════════════════════════════════════ */
 function handleKeyboard(e){if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA')return;if(currentModal)return;const isStaff=userRole==='staff';const map=isStaff?{}:{s:()=>openModal('sale'),e:()=>openModal('expense'),t:()=>openModal('transfer')};if(map[e.key]){e.preventDefault();map[e.key]()}if(e.key==='Escape')closeModal()}
+/* forecastTargets now persists through collectState (server + JSON backup + sync
+   recovery). The localStorage seed preserves targets for users who set them
+   before this got wired into unified state — once they save once after the
+   upgrade, the server copy takes over and the localStorage value is just a
+   fast-mirror fallback (no longer the source of truth). */
 let forecastTargets=JSON.parse(localStorage.getItem('ledger_targets')||'null')||{cogsTarget:30,laborTarget:32,primeTarget:62};
-function saveTargets(){localStorage.setItem('ledger_targets',JSON.stringify(forecastTargets))}
+function saveTargets(){
+  /* Keep the localStorage mirror so existing migration logic still works AND
+     push to the server via scheduleSave so targets now sync across devices. */
+  try{ localStorage.setItem('ledger_targets',JSON.stringify(forecastTargets)); }catch(e){}
+  scheduleSave();
+}
 function getFixedMonthlyExpenses(){const ft=transactions.filter(t=>t.type==='expense'&&t.expenseType==='fixed'&&t.status==='paid'&&!t.voided);if(!ft.length)return 0;const bm={};ft.forEach(t=>{const m=t.date.slice(0,7);bm[m]=(bm[m]||0)+t.amount});const mv=Object.values(bm);return mv.reduce((s,v)=>s+v,0)/mv.length}
 function getVariableExpenseRatio(){const vt=transactions.filter(t=>t.type==='expense'&&t.expenseType==='variable'&&t.status==='paid'&&!t.voided);const st=transactions.filter(t=>t.type==='sale'&&!t.voided);const ts=st.reduce((s,t)=>s+t.amount,0);const tv=vt.reduce((s,t)=>s+t.amount,0);return ts>0?tv/ts:0}
 function buildDailyHistory(){const map={};transactions.filter(t=>!t.voided&&t.status!=='unpaid').forEach(t=>{if(!map[t.date])map[t.date]={sales:0,cogs:0,labor:0,otherExp:0};if(t.type==='sale')map[t.date].sales+=t.amount;else if(t.type==='expense'){if(isCOGS(t.category))map[t.date].cogs+=t.amount;else if(isLabor(t.category))map[t.date].labor+=t.amount;else map[t.date].otherExp+=t.amount;}});return map}
@@ -8892,6 +9127,7 @@ function persistDailyMetrics(dateStr=today()){
   const idx=dailyMetrics.findIndex(d=>d.date===dateStr);
   if(idx>=0) dailyMetrics[idx]=snapshot;
   else dailyMetrics.push(snapshot);
+  scheduleSave(); /* push the snapshot to the server */
   return snapshot;
 }
 
@@ -8912,6 +9148,7 @@ function persistWeeklyMetrics(weekStart=isoWeekStart()){
   const idx=weeklyMetrics.findIndex(d=>d.weekStart===weekStart);
   if(idx>=0) weeklyMetrics[idx]=snapshot;
   else weeklyMetrics.push(snapshot);
+  scheduleSave();
   return snapshot;
 }
 
@@ -8932,6 +9169,50 @@ function persistMonthlyMetrics(monthKey){
   const idx=monthlyMetrics.findIndex(d=>d.month===snapshot.month);
   if(idx>=0) monthlyMetrics[idx]=snapshot;
   else monthlyMetrics.push(snapshot);
+  scheduleSave();
+  return snapshot;
+}
+/* Convenience: persist all three snapshot levels for a given date in one call.
+   Used by transaction-changing events (DSR post, finalize payroll, etc.) so the
+   metric history stays current for any period the change affected. */
+function persistMetricsForDate(dateStr){
+  if(!dateStr) return;
+  persistDailyMetrics(dateStr);
+  persistWeeklyMetrics(isoWeekStart(new Date(dateStr+'T12:00:00')));
+  persistMonthlyMetrics(dateStr.slice(0,7));
+}
+/* Forecast snapshot — captures the 30-day projection as-of today so you can later
+   compare what you forecasted vs what actually happened. Idempotent per date:
+   only writes one snapshot per calendar day unless force=true. */
+function buildForecastSnapshot(asOf=today()){
+  const fc=runForecast(30);
+  return {
+    id:'fs_'+asOf,
+    date:asOf,
+    asOfCash:fc.totalCash,
+    asOfObligations:fc.obligationsTotal||0,
+    avgDailySales:fc.avgDailySales||0,
+    weeksOfData:fc.weeksOfData||0,
+    forecastDays:(fc.days||[]).map(d=>({
+      iso:d.iso,
+      forecastedSales:d.forecastedSales,
+      forecastedCogs:d.forecastedCogs,
+      forecastedLabor:d.forecastedLabor,
+      forecastedExp:d.forecastedExp,
+      forecastedNet:d.forecastedNet,
+      runningCash:d.runningCash
+    })),
+    createdAt:new Date().toISOString()
+  };
+}
+function persistForecastSnapshot(force=false){
+  const dateStr=today();
+  if(!force && (forecastSnapshots||[]).some(s=>s&&s.date===dateStr)) return null; // already captured today
+  const snapshot=buildForecastSnapshot(dateStr);
+  const idx=forecastSnapshots.findIndex(s=>s&&s.date===dateStr);
+  if(idx>=0) forecastSnapshots[idx]=snapshot;
+  else forecastSnapshots.push(snapshot);
+  scheduleSave();
   return snapshot;
 }
 
