@@ -1088,6 +1088,106 @@ let reportPeriod='month';
 let reportTab='pl'; /* 'pl' | 'balance' | 'cashflow' */
 /* Global date filter — affects all pages */
 let globalDate={preset:'today',from:today(),to:today()};
+/* Dashboard lens — independent of the top global filter. Picks a period and a
+   comparison so KPIs/charts can frame anything (WoW / MoM / QoQ / YoY / custom).
+   gran:    'week' | 'month' | 'quarter' | 'year' | 'custom'
+   anchor:  any iso date in the current period
+   compare: 'prior' | 'yoy' | 'custom'
+   custom:  for custom mode — current and comparison ranges */
+let dashLens={gran:'week', anchor:today(), compare:'prior', custom:{from:today(), to:today(), compareFrom:'', compareTo:''}};
+let dashTrendMetric='revenue'; // 'revenue' | 'netProfit' | 'laborP' | 'primeP'
+function setDashTrend(m){ dashTrendMetric=m; render(); }
+function getLensRange(gran, anchorIso){
+  const d=new Date(anchorIso+'T12:00:00');
+  if(gran==='week'){
+    const ws=isoWeekStart(d);
+    const we=addDays(ws,6);
+    return {from:ws, to:we, label:`${fmtShort(ws)} – ${fmtShort(we)}`};
+  }
+  if(gran==='month'){
+    const y=d.getFullYear(),m=d.getMonth();
+    const last=new Date(y,m+1,0).getDate();
+    return {from:`${y}-${String(m+1).padStart(2,'0')}-01`, to:`${y}-${String(m+1).padStart(2,'0')}-${String(last).padStart(2,'0')}`, label:d.toLocaleDateString('en-US',{month:'long',year:'numeric'})};
+  }
+  if(gran==='quarter'){
+    const y=d.getFullYear(),q=Math.floor(d.getMonth()/3);
+    const startM=q*3, endM=startM+2;
+    const last=new Date(y,endM+1,0).getDate();
+    return {from:`${y}-${String(startM+1).padStart(2,'0')}-01`, to:`${y}-${String(endM+1).padStart(2,'0')}-${String(last).padStart(2,'0')}`, label:`Q${q+1} ${y}`};
+  }
+  if(gran==='year'){
+    const y=d.getFullYear();
+    return {from:`${y}-01-01`, to:`${y}-12-31`, label:`${y}`};
+  }
+  // custom — caller responsible for filling dashLens.custom
+  return {from:dashLens.custom.from||'', to:dashLens.custom.to||'', label:`${dashLens.custom.from||'(start)'} – ${dashLens.custom.to||'(end)'}`};
+}
+function shiftAnchor(gran, anchorIso, n){
+  const d=new Date(anchorIso+'T12:00:00');
+  if(gran==='week') d.setDate(d.getDate()+n*7);
+  else if(gran==='month') d.setMonth(d.getMonth()+n);
+  else if(gran==='quarter') d.setMonth(d.getMonth()+n*3);
+  else if(gran==='year') d.setFullYear(d.getFullYear()+n);
+  return localISO(d);
+}
+function getCompareRange(gran, anchorIso, mode){
+  if(mode==='custom'){
+    return {from:dashLens.custom.compareFrom||'', to:dashLens.custom.compareTo||'', label:'Custom'};
+  }
+  if(mode==='yoy'){
+    const d=new Date(anchorIso+'T12:00:00');
+    d.setFullYear(d.getFullYear()-1);
+    const r=getLensRange(gran, localISO(d));
+    return {...r, label:r.label+' (YoY)'};
+  }
+  // prior
+  return getLensRange(gran, shiftAnchor(gran, anchorIso, -1));
+}
+/* Bucket the days within a range — drives the within-period bar chart's x-axis.
+   Week → 7 daily buckets · Month → weekly buckets · Quarter/Year → monthly. */
+function getLensBuckets(gran, range){
+  if(!range.from||!range.to) return [];
+  if(gran==='week'){
+    const out=[]; let d=range.from;
+    while(d<=range.to){ out.push({label:new Date(d+'T12:00:00').toLocaleDateString('en-US',{weekday:'short'}), from:d, to:d}); d=addDays(d,1); if(out.length>=14)break; }
+    return out;
+  }
+  if(gran==='month'){
+    const out=[]; let ws=range.from, n=1;
+    while(ws<=range.to){
+      const we=addDays(ws,6)<=range.to?addDays(ws,6):range.to;
+      out.push({label:`W${n}`, from:ws, to:we}); ws=addDays(we,1); n++;
+    }
+    return out;
+  }
+  if(gran==='quarter'||gran==='year'){
+    const out=[]; const s=new Date(range.from+'T12:00:00'), e=new Date(range.to+'T12:00:00');
+    let d=new Date(s.getFullYear(), s.getMonth(), 1);
+    while(d<=e){
+      const y=d.getFullYear(),m=d.getMonth();
+      const last=new Date(y,m+1,0).getDate();
+      out.push({label:d.toLocaleDateString('en-US',{month:'short'}), from:`${y}-${String(m+1).padStart(2,'0')}-01`, to:`${y}-${String(m+1).padStart(2,'0')}-${String(last).padStart(2,'0')}`});
+      d.setMonth(d.getMonth()+1);
+    }
+    return out;
+  }
+  // custom — fall back to daily, capped
+  const out=[]; let d=range.from;
+  while(d<=range.to && out.length<35){ out.push({label:new Date(d+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}), from:d, to:d}); d=addDays(d,1); }
+  return out;
+}
+/* Build last N periods for the trend chart (newest last). */
+function getTrendPeriods(gran, anchorIso, count){
+  const out=[]; let a=anchorIso;
+  for(let i=0;i<count;i++){ out.unshift({...getLensRange(gran,a), anchor:a}); a=shiftAnchor(gran,a,-1); }
+  return out;
+}
+function setDashLens(patch){
+  Object.assign(dashLens, patch);
+  if(patch.gran) dashLens.anchor=today(); // jumping granularity resets to "current"
+  render();
+}
+function navLens(delta){ dashLens.anchor=shiftAnchor(dashLens.gran, dashLens.anchor, delta); render(); }
 function setGlobalPreset(p){
   const n=new Date(),iso=d=>localISO(d);
   globalDate.preset=p;
@@ -4947,13 +5047,34 @@ function renderWeeklyPerformanceSection(){
 
 function pgDashboard(){
 
-  /* ── Data assembly ── */
-  const thisWeekDates = getWeekDates(0);
-  const lastWeekDates = getWeekDates(-1);
-  const twTx = transactions.filter(t=>thisWeekDates.includes(t.date)&&!t.voided);
-  const lwTx = transactions.filter(t=>lastWeekDates.includes(t.date)&&!t.voided);
+  /* ── Data assembly via the dashboard lens (independent of top global filter) ── */
+  const currentRange = getLensRange(dashLens.gran, dashLens.anchor);
+  const compareRange = getCompareRange(dashLens.gran, dashLens.anchor, dashLens.compare);
+  const inRange=(t,r)=>!t.voided && r.from && r.to && t.date>=r.from && t.date<=r.to;
+  const twTx = transactions.filter(t=>inRange(t,currentRange));
+  const lwTx = transactions.filter(t=>inRange(t,compareRange));
   const tw = financialService.getMetrics(twTx);
   const lw = financialService.getMetrics(lwTx);
+  /* Dates arrays for the within-period bars + DSR pax aggregation: build flat list
+     of every date string in the range (bucketing for the chart happens via getLensBuckets). */
+  const enumerateDates = r => { const out=[]; if(!r.from||!r.to) return out; let d=r.from; while(d<=r.to){ out.push(d); d=addDays(d,1); if(out.length>366)break; } return out; };
+  const thisWeekDates = enumerateDates(currentRange);
+  const lastWeekDates = enumerateDates(compareRange);
+  /* Period nouns for labels — keeps copy honest at any granularity. */
+  const PERIOD_NOUNS = {week:{this:'This Week',  prev:'Last Week',  delta:'WoW'},
+                        month:{this:'This Month', prev:'Last Month', delta:'MoM'},
+                        quarter:{this:'This Quarter', prev:'Last Quarter', delta:'QoQ'},
+                        year:{this:'This Year', prev:'Last Year', delta:'YoY'},
+                        custom:{this:'Current', prev:'Comparison', delta:'Δ'}};
+  const _periodLabel = PERIOD_NOUNS[dashLens.gran] || PERIOD_NOUNS.custom;
+  /* If the user has navigated to a past period, drop the "This" copy and show the
+     actual period label so the headers don't lie ("This Week" for a 2024 week). */
+  const _isCurrentPeriod = today()>=currentRange.from && today()<=currentRange.to;
+  const periodThis = _isCurrentPeriod ? _periodLabel.this : currentRange.label;
+  const periodPrev = dashLens.compare==='yoy' ? 'Same period · last year'
+                   : dashLens.compare==='custom' ? 'Comparison'
+                   : (_isCurrentPeriod ? _periodLabel.prev : compareRange.label);
+  const deltaLabel = dashLens.compare==='yoy' ? 'YoY' : (dashLens.compare==='custom' ? 'Δ' : _periodLabel.delta);
 
   /* Period metrics (global date filter) */
   const tx = transactions.filter(txInRange).filter(t=>!t.voided);
@@ -4967,13 +5088,19 @@ function pgDashboard(){
   const wowLabor  = wow.laborWOW;
   const wowPrime  = wow.primeWOW;
 
-  /* Budget — monthly budget prorated to week */
+  /* Budget — prorated to the lens granularity so the comparison is apples-to-apples
+     (a weekly budget number is meaningless in a Year view). */
   const plan = getPlanningModel();
   const currentMk = getMonthKey();
   const mb = monthlyBudget[currentMk] || {};
   const daysInMonth = new Date(new Date().getFullYear(), new Date().getMonth()+1, 0).getDate();
   const budgetMonthlySales = mb.sales || weeklyTargets.sales*4.33 || 0;
-  const budgetWeeklySales  = budgetMonthlySales > 0 ? Math.round(budgetMonthlySales / (daysInMonth/7)) : 0;
+  const _budMultiplier = dashLens.gran==='week' ? (7/daysInMonth)
+                       : dashLens.gran==='month' ? 1
+                       : dashLens.gran==='quarter' ? 3
+                       : dashLens.gran==='year' ? 12
+                       : 1;
+  const budgetWeeklySales = budgetMonthlySales > 0 ? Math.round(budgetMonthlySales*_budMultiplier) : 0;
   const budgetLaborP  = mb.laborP  || weeklyTargets.laborP  || plan.laborTargetP  || 32;
   const budgetPrimeP  = mb.primeP  || weeklyTargets.primeP  || plan.primeCostTargetP || 62;
   const budgetCogsP   = mb.cogsP   || plan.cogsTargetP || 30;
@@ -5001,40 +5128,53 @@ function pgDashboard(){
   const leanBreakEven = leanOpsService.getBreakEvenStatus();
   const leanAlerts    = leanOpsService.generateLeanAlerts();
 
-  /* Daily bars — this week vs last week (NET: exclude contra_revenue) */
-  const DOW_LABELS = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
-  const twDaily={}, lwDaily={}, twFood={}, twAlc={}, twBev={};
-  const twPaxDay={}, lwPaxDay={};
-  thisWeekDates.forEach((d,i)=>{ twDaily[i]=0; twFood[i]=0; twAlc[i]=0; twBev[i]=0; twPaxDay[i]=0; });
-  lastWeekDates.forEach((d,i)=>{ lwDaily[i]=0; lwPaxDay[i]=0; });
-
-  twTx.forEach(t=>{
-    const i=thisWeekDates.indexOf(t.date); if(i<0)return;
-    const c=(coa||[]).find(x=>x.id===t.coaId||x.name===t.category);
-    if(c?.type==='revenue'){
-      twDaily[i]+=(Number(t.amount)||0);
-      if(t.coaId==='r4000') twFood[i]+=(Number(t.amount)||0);
-      else if(t.coaId==='r4020') twAlc[i]+=(Number(t.amount)||0);
-      else if(t.coaId==='r4010') twBev[i]+=(Number(t.amount)||0);
-    } else if(c?.type==='contra_revenue'){
-      twDaily[i]-=(Number(t.amount)||0); // subtract discounts/refunds for net
-    }
+  /* Bars adapt to the lens granularity: week→by day, month→by week, qtr/year→by month. */
+  const curBuckets = getLensBuckets(dashLens.gran, currentRange);
+  const cmpBuckets = getLensBuckets(dashLens.gran, compareRange);
+  const DOW_LABELS = curBuckets.map(b=>b.label);
+  const CMP_LABELS = cmpBuckets.map(b=>b.label);
+  /* Bucketed aggregates — drop into bucket i if t.date sits within bucket[i].from..to. */
+  const aggBucket = (buckets, txs, sign=1) => {
+    const out=new Array(buckets.length).fill(0);
+    txs.forEach(t=>{
+      const c=(coa||[]).find(x=>x.id===t.coaId||x.name===t.category);
+      const isRev = c?.type==='revenue';
+      const isContra = c?.type==='contra_revenue';
+      if(!isRev && !isContra) return;
+      for(let i=0;i<buckets.length;i++){
+        if(t.date>=buckets[i].from && t.date<=buckets[i].to){
+          if(isRev) out[i]+=(Number(t.amount)||0)*sign;
+          else if(isContra) out[i]-=(Number(t.amount)||0)*sign;
+          break;
+        }
+      }
+    });
+    return out;
+  };
+  const twDaily = aggBucket(curBuckets, twTx);
+  const lwDaily = aggBucket(cmpBuckets, lwTx);
+  /* Category breakdown — only for current period (last 3 cards), bucketed same way. */
+  const aggCategory = (buckets, txs, coaId) => {
+    const out=new Array(buckets.length).fill(0);
+    txs.forEach(t=>{ if(t.coaId!==coaId) return;
+      for(let i=0;i<buckets.length;i++){
+        if(t.date>=buckets[i].from && t.date<=buckets[i].to){ out[i]+=(Number(t.amount)||0); break; }
+      }
+    });
+    return out;
+  };
+  const twFood = aggCategory(curBuckets, twTx, 'r4000');
+  const twAlc  = aggCategory(curBuckets, twTx, 'r4020');
+  const twBev  = aggCategory(curBuckets, twTx, 'r4010');
+  /* DSR pax — bucket by summing days within each bucket. */
+  const paxFor = d => { const e=dsrEntries?.[d]||{}; return Number(e.nPax||0)+Number(e.lPax||0); };
+  const aggPax = buckets => buckets.map(b => {
+    let s=0, d=b.from;
+    while(d<=b.to){ s+=paxFor(d); d=addDays(d,1); if(d>b.to)break; }
+    return s;
   });
-  lwTx.forEach(t=>{
-    const i=lastWeekDates.indexOf(t.date); if(i<0)return;
-    const c=(coa||[]).find(x=>x.id===t.coaId||x.name===t.category);
-    if(c?.type==='revenue') lwDaily[i]+=(Number(t.amount)||0);
-    else if(c?.type==='contra_revenue') lwDaily[i]-=(Number(t.amount)||0);
-  });
-  /* Pax per day from DSR */
-  thisWeekDates.forEach((d,i)=>{
-    const e=dsrEntries?.[d]||{};
-    twPaxDay[i]=(Number(e.nPax||0)+Number(e.lPax||0));
-  });
-  lastWeekDates.forEach((d,i)=>{
-    const e=dsrEntries?.[d]||{};
-    lwPaxDay[i]=(Number(e.nPax||0)+Number(e.lPax||0));
-  });
+  const twPaxDay = aggPax(curBuckets);
+  const lwPaxDay = aggPax(cmpBuckets);
 
   /* ── SVG chart helpers ── */
   function svgBars(twVals, lwVals, height=110, color1='#22c55e', color2='#94a3b8'){
@@ -5101,11 +5241,14 @@ function pgDashboard(){
   const budgetAvgSpend = budgetWeeklySales>0 && twPax>0 ? budgetWeeklySales/twPax : 0;
   const coversDiff = twPax - lwPax;
 
-  /* ── period COGS for period selected ── */
-  const periodCogsP = m.cogsP||0;
-  const periodLaborP = m.laborP||0;
-  const periodPrimeP = m.primeP||0;
-  const grossProfitP = m.netRevenue>0 ? (m.grossProfit/m.netRevenue)*100 : 0;
+  /* Period summary metrics — all follow the lens (tw = current lens period) so
+     KPI cards, Donuts, and other "period" displays stay in sync with the rest
+     of the dashboard. The legacy `m` (top-global-filter metrics) is still
+     available for cross-page comparisons but no longer drives dashboard KPIs. */
+  const periodCogsP = tw.cogsP||0;
+  const periodLaborP = tw.laborP||0;
+  const periodPrimeP = tw.primeP||0;
+  const grossProfitP = tw.netRevenue>0 ? (tw.grossProfit/tw.netRevenue)*100 : 0;
 
   /* Live labor from logged shifts (this/last week) — operational estimate that
      updates before payroll is finalized. Posted labor (tw.laborP) stays the
@@ -5121,13 +5264,38 @@ function pgDashboard(){
 
   return `
 <!-- ═══ HEADER ═══════════════════════════════ -->
-<div class="page-header" style="margin-bottom:14px">
+<div class="page-header" style="margin-bottom:10px">
   <div class="page-hd-left">
     <div class="page-title">Dashboard</div>
-    <div class="page-sub">Restaurant Operating Intelligence</div>
+    <div class="page-sub">${currentRange.label} <span style="color:var(--muted2)">vs</span> ${compareRange.label}</div>
   </div>
   <div style="display:flex;gap:6px;align-items:center">
     <button class="btn btn-ghost btn-sm" onclick="exportDashboardPDF()">↓ PDF</button>
+  </div>
+</div>
+
+<!-- ═══ DASHBOARD LENS ════════════════════════ -->
+<div class="card-flush" style="margin-bottom:12px;padding:8px 12px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+  <div style="display:flex;gap:0;border:1px solid var(--border2);border-radius:6px;overflow:hidden">
+    ${[['week','Week'],['month','Month'],['quarter','Quarter'],['year','Year'],['custom','Custom']].map(([v,l])=>`<button onclick="setDashLens({gran:'${v}'})" style="padding:5px 12px;border:none;background:${dashLens.gran===v?'var(--blue)':'transparent'};color:${dashLens.gran===v?'#fff':'var(--text)'};font-size:.77rem;font-weight:${dashLens.gran===v?'600':'500'};cursor:pointer">${l}</button>`).join('')}
+  </div>
+  ${dashLens.gran!=='custom'?`<div style="display:flex;gap:4px;align-items:center">
+    <button class="btn btn-ghost btn-xs" onclick="navLens(-1)" title="Previous">←</button>
+    <span style="font-size:.78rem;font-weight:600;min-width:140px;text-align:center">${currentRange.label}</span>
+    <button class="btn btn-ghost btn-xs" onclick="navLens(1)" title="Next">→</button>
+    <button class="btn btn-ghost btn-xs" onclick="setDashLens({anchor:today()})" title="Jump to current" style="margin-left:4px">Today</button>
+  </div>`:`<div style="display:flex;gap:6px;align-items:center;font-size:.76rem">
+    <span style="color:var(--muted)">From</span><input type="date" value="${dashLens.custom.from}" onchange="dashLens.custom.from=this.value;render()" style="font-size:.76rem;padding:3px 6px">
+    <span style="color:var(--muted)">To</span><input type="date" value="${dashLens.custom.to}" onchange="dashLens.custom.to=this.value;render()" style="font-size:.76rem;padding:3px 6px">
+  </div>`}
+  <div style="display:flex;gap:6px;align-items:center;margin-left:auto;font-size:.76rem">
+    <span style="color:var(--muted)">Compare to:</span>
+    <select onchange="setDashLens({compare:this.value})" style="font-size:.76rem;padding:3px 6px;border-radius:4px;border:1px solid var(--border2);background:var(--bg)">
+      <option value="prior" ${dashLens.compare==='prior'?'selected':''}>Prior period</option>
+      <option value="yoy" ${dashLens.compare==='yoy'?'selected':''}>Same period · last year</option>
+      <option value="custom" ${dashLens.compare==='custom'?'selected':''}>Custom range</option>
+    </select>
+    ${dashLens.compare==='custom'?`<input type="date" value="${dashLens.custom.compareFrom}" onchange="dashLens.custom.compareFrom=this.value;render()" style="font-size:.76rem;padding:3px 6px"><span style="color:var(--muted)">→</span><input type="date" value="${dashLens.custom.compareTo}" onchange="dashLens.custom.compareTo=this.value;render()" style="font-size:.76rem;padding:3px 6px">`:`<span style="color:var(--muted2)">· ${compareRange.label}</span>`}
   </div>
 </div>
 
@@ -5156,28 +5324,28 @@ function pgDashboard(){
     <div class="stat-label">Net Revenue</div>
     <div class="stat-value" style="font-size:1.05rem">${fmt(tw.netRevenue)}</div>
     <div class="stat-sub" style="color:${wowSales>=0?'var(--green)':'var(--red)'}">
-      ${wowSales>=0?'▲':'▼'} ${Math.abs(wowSales).toFixed(1)}% WoW
+      ${wowSales>=0?'▲':'▼'} ${Math.abs(wowSales).toFixed(1)}% ${deltaLabel}
     </div>
   </div>
 
   <div class="card">
     <div class="stat-label">Covers / Avg Spend</div>
     <div class="stat-value" style="font-size:1.05rem">${twPax>0?twPax:'—'}</div>
-    <div class="stat-sub">${twAvgSpend>0?fmt(twAvgSpend)+' avg':'No pax data'} · LW ${lwPax||'—'}</div>
+    <div class="stat-sub">${twAvgSpend>0?fmt(twAvgSpend)+' avg':'No pax data'} · prev ${lwPax||'—'}</div>
   </div>
 
   <div class="card">
     <div class="stat-label">Prime Cost</div>
     <div class="stat-value" style="font-size:1.05rem;color:${tw.primeP<=62?'var(--green)':tw.primeP<=68?'var(--amber)':'var(--red)'}">${(tw.primeP||0).toFixed(1)}%</div>
     <div class="stat-sub" style="color:${wowPrime<=0?'var(--green)':'var(--red)'}">
-      ${wowPrime<=0?'▼':'▲'} ${Math.abs(wowPrime).toFixed(1)}pp WoW
+      ${wowPrime<=0?'▼':'▲'} ${Math.abs(wowPrime).toFixed(1)}pp ${deltaLabel}
     </div>
   </div>
 
   <div class="card">
     <div class="stat-label">Gross Profit</div>
-    <div class="stat-value" style="font-size:1.05rem;color:${grossProfitP>=60?'var(--green)':grossProfitP>=50?'var(--amber)':'var(--red)'}">${fmt(m.grossProfit)}</div>
-    <div class="stat-sub">${grossProfitP.toFixed(1)}% margin · period</div>
+    <div class="stat-value" style="font-size:1.05rem;color:${grossProfitP>=60?'var(--green)':grossProfitP>=50?'var(--amber)':'var(--red)'}">${fmt(tw.grossProfit)}</div>
+    <div class="stat-sub">${grossProfitP.toFixed(1)}% · ${currentRange.label}</div>
   </div>
 
   <div class="card">
@@ -5199,16 +5367,16 @@ function pgDashboard(){
 <!-- ═══ IMAGE 1 STYLE — WoW + Budget rows ══════ -->
 <div class="card-flush" style="margin-bottom:14px;overflow-x:auto">
   <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
-    <span class="sec-title">WoW Comparison <span style="font-size:.7rem;font-weight:500;color:var(--muted2);text-transform:none;letter-spacing:0;margin-left:4px">· fixed: this week vs last week · ignores the top filter</span></span>
-    <span style="font-size:.71rem;color:var(--muted2)">${thisWeekDates[0]} – ${thisWeekDates[6]}</span>
+    <span class="sec-title">${deltaLabel} Comparison <span style="font-size:.7rem;font-weight:500;color:var(--muted2);text-transform:none;letter-spacing:0;margin-left:4px">· follows the dashboard lens</span></span>
+    <span style="font-size:.71rem;color:var(--muted2)">${currentRange.label} vs ${compareRange.label}</span>
   </div>
   <table style="min-width:600px">
     <thead>
       <tr style="background:var(--bg3)">
         <th style="padding:6px 10px;text-align:left;font-size:.65rem">Metric</th>
-        <th style="padding:6px 10px;text-align:right;font-size:.65rem">This Week</th>
-        <th style="padding:6px 10px;text-align:right;font-size:.65rem">Last Week</th>
-        <th style="padding:6px 10px;text-align:right;font-size:.65rem">WoW Δ</th>
+        <th style="padding:6px 10px;text-align:right;font-size:.65rem">${periodThis}</th>
+        <th style="padding:6px 10px;text-align:right;font-size:.65rem">${periodPrev}</th>
+        <th style="padding:6px 10px;text-align:right;font-size:.65rem">${deltaLabel} Δ</th>
         <th style="padding:6px 10px;text-align:right;font-size:.65rem">Budget</th>
         <th style="padding:6px 10px;text-align:right;font-size:.65rem">vs Budget</th>
       </tr>
@@ -5258,9 +5426,9 @@ function pgDashboard(){
 
   <div class="card-flush">
     <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center">
-      <span class="sec-title">Sales by Day</span>
-      <span style="font-size:.69rem;color:var(--green)">■ This week</span>
-      <span style="font-size:.69rem;color:var(--muted2)">■ Last week</span>
+      <span class="sec-title">Sales by ${dashLens.gran==='week'?'Day':dashLens.gran==='month'?'Week':'Month'}</span>
+      <span style="font-size:.69rem;color:var(--green)">■ ${periodThis}</span>
+      <span style="font-size:.69rem;color:var(--muted2)">■ ${periodPrev}</span>
     </div>
     <div style="padding:10px 14px">
       ${svgBars(Object.values(twDaily),Object.values(lwDaily),120)}
@@ -5269,9 +5437,9 @@ function pgDashboard(){
 
   <div class="card-flush">
     <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center">
-      <span class="sec-title">Daily Guest Count</span>
-      <span style="font-size:.69rem;color:var(--blue)">■ This week</span>
-      <span style="font-size:.69rem;color:var(--muted2)">■ Last week</span>
+      <span class="sec-title">Guest Count by ${dashLens.gran==='week'?'Day':dashLens.gran==='month'?'Week':'Month'}</span>
+      <span style="font-size:.69rem;color:var(--blue)">■ ${periodThis}</span>
+      <span style="font-size:.69rem;color:var(--muted2)">■ ${periodPrev}</span>
     </div>
     <div style="padding:10px 14px">
       ${svgBars(Object.values(twPaxDay),Object.values(lwPaxDay),120,'#3b82f6','#94a3b8')}
@@ -5286,17 +5454,17 @@ function pgDashboard(){
 <!-- ═══ FOOD / ALCOHOL / BEV BY DAY ════════════ -->
 <div class="card-flush" style="margin-bottom:14px">
   <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center">
-    <span class="sec-title">Revenue by Category — Daily</span>
+    <span class="sec-title">Revenue by Category — ${dashLens.gran==='week'?'Daily':dashLens.gran==='month'?'Weekly':'Monthly'}</span>
     <span style="font-size:.69rem;color:#22c55e">■ Food</span>
     <span style="font-size:.69rem;color:#f59e0b">■ Alcohol</span>
     <span style="font-size:.69rem;color:#3b82f6">■ NA Bev</span>
   </div>
   <div style="padding:10px 14px">
     ${(()=>{
-      const maxV=Math.max(...Object.values(twFood),...Object.values(twAlc),...Object.values(twBev),1);
-      const H=110, W=400, n=7, groupW=W/n;
-      const bw=10, gap=2;
-      const bars=Array.from({length:7},(_,i)=>{
+      const maxV=Math.max(...twFood,...twAlc,...twBev,1);
+      const H=110, W=400, n=curBuckets.length||1, groupW=W/n;
+      const bw=Math.min(10, (groupW-6)/3), gap=2;
+      const bars=curBuckets.map((b,i)=>{
         const x=i*groupW+4;
         const hf=((twFood[i]||0)/maxV)*(H-20);
         const ha=((twAlc[i]||0)/maxV)*(H-20);
@@ -5306,7 +5474,7 @@ function pgDashboard(){
           <rect x="${x}" y="${y-hf}" width="${bw}" height="${hf}" fill="#22c55e" rx="2"/>
           <rect x="${x+bw+gap}" y="${y-ha}" width="${bw}" height="${ha}" fill="#f59e0b" rx="2"/>
           <rect x="${x+bw*2+gap*2}" y="${y-hb}" width="${bw}" height="${hb}" fill="#3b82f6" rx="2"/>
-          <text x="${x+bw*1.5+gap}" y="${H}" font-size="7" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]}</text>
+          <text x="${x+bw*1.5+gap}" y="${H}" font-size="7" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]||''}</text>
         `;
       }).join('');
       return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:110px">${bars}</svg>`;
@@ -5314,13 +5482,62 @@ function pgDashboard(){
   </div>
 </div>
 
+<!-- ═══ TREND — last N periods ════════════════ -->
+${(()=>{
+  /* Build a rolling N-period strip ending at the current anchor — sizes itself per
+     granularity so the chart stays readable without scrolling. Each period gets
+     its full metrics computed (calcMetrics on its txs); user can toggle which
+     metric drives the bar heights. */
+  const counts={week:8, month:6, quarter:4, year:3, custom:1};
+  const count=counts[dashLens.gran]||6;
+  if(dashLens.gran==='custom') return '';
+  const periods=getTrendPeriods(dashLens.gran, dashLens.anchor, count);
+  const periodMetrics=periods.map(p=>{
+    const txs=transactions.filter(t=>!t.voided && t.date>=p.from && t.date<=p.to);
+    return {...p, m:financialService.getMetrics(txs)};
+  });
+  const isPct = dashTrendMetric==='laborP' || dashTrendMetric==='primeP';
+  const pickVal = m => {
+    if(dashTrendMetric==='revenue') return m.netRevenue||0;
+    if(dashTrendMetric==='netProfit') return m.netProfit||0;
+    if(dashTrendMetric==='laborP') return m.laborP||0;
+    if(dashTrendMetric==='primeP') return m.primeP||0;
+    return 0;
+  };
+  const vals=periodMetrics.map(p=>pickVal(p.m));
+  const maxV=Math.max(...vals.map(Math.abs),1);
+  const H=130, W=600;
+  const bw=Math.min(50, (W-40)/count - 8);
+  const barX=i=>20 + i*((W-40)/count) + ((W-40)/count - bw)/2;
+  const tabs=[['revenue','Net Revenue','#22c55e'],['netProfit','Net Profit','#3b82f6'],['laborP','Labor %','#f59e0b'],['primeP','Prime %','#ef4444']];
+  const activeColor=(tabs.find(t=>t[0]===dashTrendMetric)||tabs[0])[2];
+  return `<div class="card-flush" style="margin-bottom:14px">
+    <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <span class="sec-title">Trend — last ${count} ${dashLens.gran}${count>1?'s':''}</span>
+      <div style="display:flex;gap:0;margin-left:auto;border:1px solid var(--border2);border-radius:5px;overflow:hidden">
+        ${tabs.map(([v,l,c])=>`<button onclick="setDashTrend('${v}')" style="padding:3px 9px;border:none;background:${dashTrendMetric===v?c:'transparent'};color:${dashTrendMetric===v?'#fff':'var(--text)'};font-size:.7rem;font-weight:${dashTrendMetric===v?'600':'500'};cursor:pointer">${l}</button>`).join('')}
+      </div>
+    </div>
+    <div style="padding:14px">
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px">
+        ${periodMetrics.map((p,i)=>{
+          const v=pickVal(p.m), h=(Math.abs(v)/maxV)*(H-38), y=H-22-h, x=barX(i);
+          return `<rect x="${x}" y="${y}" width="${bw}" height="${h}" fill="${activeColor}" rx="3" opacity="${i===periodMetrics.length-1?'1':'0.7'}"/>
+            <text x="${x+bw/2}" y="${y-3}" font-size="9" fill="var(--muted)" text-anchor="middle" font-weight="600">${isPct?v.toFixed(1)+'%':fmt(v).replace('PHP','')}</text>
+            <text x="${x+bw/2}" y="${H-6}" font-size="8" fill="var(--muted2)" text-anchor="middle">${p.label}</text>`;
+        }).join('')}
+      </svg>
+    </div>
+  </div>`;
+})()}
+
 <!-- ═══ DONUTS + CASH POSITION ════════════════ -->
 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">
 
   <div class="card" style="display:flex;flex-direction:column;align-items:center;gap:6px">
     <div class="sec-title" style="align-self:flex-start">Gross Profit</div>
     ${svgDonut(grossProfitP, grossProfitP>=60?'#22c55e':grossProfitP>=50?'#f59e0b':'#ef4444', 'GP%', 90)}
-    <div style="font-size:.75rem;color:var(--muted2);text-align:center">${fmt(m.grossProfit)} · period</div>
+    <div style="font-size:.75rem;color:var(--muted2);text-align:center">${fmt(tw.grossProfit)} · ${currentRange.label}</div>
   </div>
 
   <div class="card" style="display:flex;flex-direction:column;align-items:center;gap:6px">
