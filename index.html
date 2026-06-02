@@ -441,10 +441,27 @@ function markCacheSynced(){
     if(raw){const c=JSON.parse(raw);c.synced=true;localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify(c));}
   }catch(e){}
 }
+/* Defer the local-cache write to the next macrotask so the synchronous
+   JSON.stringify(collectState()) doesn't block the click handler. With growing
+   state (snapshots, audit log, transactions), the serialize+localStorage write
+   was running ~50-200ms in line with every scheduleSave — felt as UI lag after
+   adding a shift, saving an edit, etc. Multiple rapid scheduleSaves now coalesce
+   into a single deferred cache write (only the FIRST one queues; subsequent
+   calls within the same tick see _cacheTimer is set and skip). flushSaveBeacon
+   forces a sync write if the deferred one is still pending at unload time, so
+   tab-close-mid-edit is still safe. */
+let _cacheTimer=null;
+function _scheduleCacheWrite(){
+  if(_cacheTimer!==null) return;
+  _cacheTimer=setTimeout(()=>{
+    _cacheTimer=null;
+    try{ writeLocalCache(); }catch(e){ console.warn('deferred writeLocalCache failed:',e); }
+  },0);
+}
 function scheduleSave(){
   setSyncStatus('saving');
   pendingSave=true;
-  writeLocalCache();            // synchronous — survives an immediate reload/close
+  _scheduleCacheWrite();          // deferred — non-blocking
   clearTimeout(syncTimer);
   syncTimer=setTimeout(pushSave,1400);
 }
@@ -476,6 +493,13 @@ async function pushSave(){
    payload is too large for a beacon it silently no-ops and the local cache
    recovery on next load takes over. */
 function flushSaveBeacon(){
+  /* If a deferred cache write was queued, run it now SYNCHRONOUSLY before unload
+     — otherwise the next-tick setTimeout never fires (page is dead) and the
+     unsynced-cache recovery on next load would miss the last change. */
+  if(_cacheTimer!==null){
+    clearTimeout(_cacheTimer); _cacheTimer=null;
+    try{ writeLocalCache(); }catch(e){}
+  }
   if(!pendingSave||!scriptUrl)return;
   try{
     const body=JSON.stringify({action:'save',pinHash,...collectState()});
@@ -610,6 +634,13 @@ async function loadApp(){
     weeklyMetrics=Array.isArray(data.weeklyMetrics)?data.weeklyMetrics:[];
     monthlyMetrics=Array.isArray(data.monthlyMetrics)?data.monthlyMetrics:[];
     forecastSnapshots=Array.isArray(data.forecastSnapshots)?data.forecastSnapshots:[];
+    /* One-shot cap-on-load — trims arrays that grew large before the per-insert
+       caps existed. Without this, an existing user keeps the bloated arrays
+       until they happen to hit the persist function for each level. */
+    if(dailyMetrics.length>DAILY_METRICS_CAP)         dailyMetrics=_capByDateField(dailyMetrics,DAILY_METRICS_CAP,'date');
+    if(weeklyMetrics.length>WEEKLY_METRICS_CAP)       weeklyMetrics=_capByDateField(weeklyMetrics,WEEKLY_METRICS_CAP,'weekStart');
+    if(monthlyMetrics.length>MONTHLY_METRICS_CAP)     monthlyMetrics=_capByDateField(monthlyMetrics,MONTHLY_METRICS_CAP,'month');
+    if(forecastSnapshots.length>FORECAST_SNAPSHOT_CAP) forecastSnapshots=_capByDateField(forecastSnapshots,FORECAST_SNAPSHOT_CAP,'date');
     /* Forecast targets: server value wins if present. Otherwise the in-memory
        value (seeded from legacy localStorage 'ledger_targets' at script init)
        sticks — preserves targets for users who set them before this was synced. */
@@ -9488,11 +9519,28 @@ function buildDailyMetricsSnapshot(dateStr){
   };
 }
 
+/* Caps on metric history arrays — these grow unbounded otherwise and every
+   save uploads the full state. Each forecastSnapshot in particular carries 30
+   nested forecast days, so a year of daily use = ~365 × 30 = 10,950 nested
+   entries (~1 MB of JSON shipped on every save). Horizons chosen for typical
+   restaurant analytics needs: 400 days of daily, 3 years of weekly, 5 years of
+   monthly, 6 months of forecast snapshots (= enough history for forecast-vs-
+   actual variance reports). Older entries dropped first. */
+const DAILY_METRICS_CAP    = 400;
+const WEEKLY_METRICS_CAP   = 156;
+const MONTHLY_METRICS_CAP  = 60;
+const FORECAST_SNAPSHOT_CAP = 180;
+function _capByDateField(arr, cap, dateField){
+  if(!Array.isArray(arr) || arr.length<=cap) return arr;
+  /* Sort by date ascending, keep tail (most recent `cap` entries). */
+  return arr.slice().sort((a,b)=>(a?.[dateField]||'').localeCompare(b?.[dateField]||'')).slice(-cap);
+}
 function persistDailyMetrics(dateStr=today()){
   const snapshot=buildDailyMetricsSnapshot(dateStr);
   const idx=dailyMetrics.findIndex(d=>d.date===dateStr);
   if(idx>=0) dailyMetrics[idx]=snapshot;
   else dailyMetrics.push(snapshot);
+  if(dailyMetrics.length>DAILY_METRICS_CAP) dailyMetrics=_capByDateField(dailyMetrics,DAILY_METRICS_CAP,'date');
   scheduleSave(); /* push the snapshot to the server */
   return snapshot;
 }
@@ -9514,6 +9562,7 @@ function persistWeeklyMetrics(weekStart=isoWeekStart()){
   const idx=weeklyMetrics.findIndex(d=>d.weekStart===weekStart);
   if(idx>=0) weeklyMetrics[idx]=snapshot;
   else weeklyMetrics.push(snapshot);
+  if(weeklyMetrics.length>WEEKLY_METRICS_CAP) weeklyMetrics=_capByDateField(weeklyMetrics,WEEKLY_METRICS_CAP,'weekStart');
   scheduleSave();
   return snapshot;
 }
@@ -9535,6 +9584,7 @@ function persistMonthlyMetrics(monthKey){
   const idx=monthlyMetrics.findIndex(d=>d.month===snapshot.month);
   if(idx>=0) monthlyMetrics[idx]=snapshot;
   else monthlyMetrics.push(snapshot);
+  if(monthlyMetrics.length>MONTHLY_METRICS_CAP) monthlyMetrics=_capByDateField(monthlyMetrics,MONTHLY_METRICS_CAP,'month');
   scheduleSave();
   return snapshot;
 }
@@ -9578,6 +9628,7 @@ function persistForecastSnapshot(force=false){
   const idx=forecastSnapshots.findIndex(s=>s&&s.date===dateStr);
   if(idx>=0) forecastSnapshots[idx]=snapshot;
   else forecastSnapshots.push(snapshot);
+  if(forecastSnapshots.length>FORECAST_SNAPSHOT_CAP) forecastSnapshots=_capByDateField(forecastSnapshots,FORECAST_SNAPSHOT_CAP,'date');
   scheduleSave();
   return snapshot;
 }
