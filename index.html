@@ -631,6 +631,7 @@ return [
 {id:'a1040',code:'1040',name:'Bank Account',group:'Current Assets',type:'asset',isDefault:true},
 {id:'a1050',code:'1050',name:'Accounts Receivable',group:'Current Assets',type:'asset',isDefault:true},
 {id:'a1060',code:'1060',name:'Employee Receivables',group:'Current Assets',type:'asset',isDefault:true},
+{id:'a1080',code:'1080',name:'Input VAT',group:'Current Assets',type:'asset',isDefault:true},
 
 /* INVENTORY */
 {id:'a1100',code:'1100',name:'Food Inventory',group:'Inventory',type:'asset',isDefault:true},
@@ -1252,12 +1253,16 @@ function pgCashPosition(){
       <table>
         <tbody>
           <tr>
-            <td>Pending Payroll</td>
-            <td class="mono" style="text-align:right;color:var(--red)">${fmt(obligs.payroll)}</td>
+            <td>Pending Payroll <span style="font-size:.7rem;color:var(--muted2)">· accrued wages</span></td>
+            <td class="mono" style="text-align:right;color:var(--red)">${fmt(obligs.payroll||0)}</td>
           </tr>
+          ${(obligs.accrued||0)>0?`<tr>
+            <td>Accrued Expenses <span style="font-size:.7rem;color:var(--muted2)">· supplier credit + Input VAT</span></td>
+            <td class="mono" style="text-align:right;color:var(--red)">${fmt(obligs.accrued||0)}</td>
+          </tr>`:''}
           <tr>
-            <td>Open Payables</td>
-            <td class="mono" style="text-align:right;color:var(--red)">${fmt(obligs.payablesDue)}</td>
+            <td>Open Payables <span style="font-size:.7rem;color:var(--muted2)">· manual AP</span></td>
+            <td class="mono" style="text-align:right;color:var(--red)">${fmt(obligs.payablesDue||0)}</td>
           </tr>
           <tr style="background:var(--bg3);font-weight:700">
             <td>Total Obligations</td>
@@ -1717,13 +1722,24 @@ const treasuryService={
   },
 
   _getObligations(){
-    const payroll = (payrollRuns||[])
-      .filter(r=>r.status!=='paid')
-      .reduce((s,r)=>s+(r.netPay||0),0);
+    /* Hotfix: previous implementation read r.netPay (which doesn't exist on the
+       payrollRuns shape — they store totalPayroll/totalNet) AND filtered by r.status
+       which is never set. Both broken → payroll obligations always 0. Now mirrors
+       pendingPayroll: sum of unpaid wage expense txs tagged with payrollRunId.
+       Also includes other accrued expenses (unpaid non-payroll expense/withdrawal
+       txs) so the obligations view is complete: wages + supplier credit + Input VAT
+       half of unpaid bills + manual payables. */
+    const txs = (transactions||[]).filter(t=>t&&!t.voided);
+    const payroll = txs
+      .filter(t=>t.payrollRunId&&t.type==='expense'&&t.status==='unpaid')
+      .reduce((s,t)=>s+(Number(t.amount)||0),0);
+    const accrued = txs
+      .filter(t=>!t.payrollRunId&&(t.type==='expense'||t.type==='withdrawal')&&t.status==='unpaid')
+      .reduce((s,t)=>s+(Number(t.amount)||0),0);
     const payablesDue = (payables||[])
       .filter(p=>p.status!=='paid')
-      .reduce((s,p)=>s+(p.balance||0),0);
-    return { payroll, payablesDue, total:payroll+payablesDue };
+      .reduce((s,p)=>s+(Number(p.balance)||0),0);
+    return { payroll, accrued, payablesDue, total:payroll+accrued+payablesDue };
   },
 
   /* ── Average daily burn (30-day rolling) ── */
@@ -1810,17 +1826,25 @@ const treasuryService={
     const employeeReceivables=round2((cashAdvances||[])
       .filter(a=>a&&a.status!=='settled')
       .reduce((s,a)=>s+(Number(a.balance)||0),0));
-    const assets=cashAssets+employeeReceivables;
+    /* Input VAT = VAT paid on purchases, claimable against Output VAT when remitting.
+       A current asset. Sums ALL non-voided txs tagged to a1080 regardless of type:
+       'withdrawal' (live expense modal + backfill — real cash paid for VAT) and
+       'dsr_adjustment' (any legacy/manual cash-neutral entry). Status-agnostic so
+       accrued (unpaid-invoice) VAT credit is recognized when invoiced, not paid. */
+    const inputVAT=round2((transactions||[])
+      .filter(t=>t&&!t.voided&&(t.coaId==='a1080'||t.category==='Input VAT'))
+      .reduce((s,t)=>s+(Number(t.amount)||0),0));
+    const assets=cashAssets+employeeReceivables+inputVAT;
     const totalPayables=(payables||[])
       .filter(p=>p.status!=='paid')
       .reduce((s,p)=>s+(Number(p.balance)||0),0);
-    /* Accrued expenses payable = unpaid expense transactions (payroll wages accrued
-       at cutoff + any on-credit purchases). This is the balance-sheet counterpart to
-       accrual-basis P&L: every expense recognized but not yet paid sits here. Replaces
-       the old run-based payrollLiability, which counted every run forever (r.status was
-       never set) and double-counted SC/Tips (already in their own liability lines). */
+    /* Accrued expenses payable = unpaid cash-debiting transactions you owe (payroll
+       wages accrued at cutoff + any on-credit purchases + the Input VAT half of an
+       on-credit VAT-able expense). This is the balance-sheet counterpart to accrual
+       P&L: everything recognized but not yet paid. Includes unpaid withdrawals (only
+       practical case: the Input VAT half linked to an unpaid expense pair). */
     const accruedExpenses=(transactions||[])
-      .filter(t=>t&&!t.voided&&t.type==='expense'&&t.status==='unpaid')
+      .filter(t=>t&&!t.voided&&(t.type==='expense'||t.type==='withdrawal')&&t.status==='unpaid')
       .reduce((s,t)=>s+(Number(t.amount)||0),0);
     /* Outstanding liability = collected (DSR) minus paid out (payroll finalize)
        minus any manual remittance (type 'liability_payment' via the Settle modal).
@@ -1848,6 +1872,8 @@ const treasuryService={
           .filter(a=>a.excludeFromLiquidity)
           .reduce((s,a)=>s+(Number(a.balance)||0),0),
         employeeReceivables,
+        inputVAT,
+        netVATPayable:Math.max(0, vatLiability-inputVAT),
         accountsPayable:totalPayables,
         accruedExpenses,
         serviceChargeLiability:scLiability,
@@ -2203,12 +2229,16 @@ function _calcMetricsImpl(txList){
   const profitP = netRevenue > 0 ? (netProfit / netRevenue) * 100 : 0;
 
   /* CASH-BASIS variants — used ONLY by the Cash Flow statement (everything above is
-     accrual). Paid-only costs; net operating cash ≈ net revenue − paid costs. */
+     accrual). Paid-only costs; net operating cash ≈ net revenue − paid costs.
+     inputVATCash captures the VAT half of paid VAT-able expenses (a1080 withdrawals)
+     — real cash leaving for the VAT portion of purchases. Without it, Net Operating
+     Cash would understate outflow by the period's Input VAT. */
   const cashTx = active.filter(t => t.status !== 'unpaid');
   const cogsCash  = cashTx.filter(isCogsTx).reduce((s,t)=>s+t.amount,0);
   const laborCash = cashTx.filter(isLaborTx).reduce((s,t)=>s+t.amount,0);
   const opexCash  = cashTx.filter(isOperatingExpenseTx).reduce((s,t)=>s+t.amount,0);
-  const netOperatingCash = netRevenue - cogsCash - laborCash - opexCash;
+  const inputVATCash = cashTx.filter(t=>t.type==='withdrawal'&&(t.coaId==='a1080'||t.category==='Input VAT')).reduce((s,t)=>s+t.amount,0);
+  const netOperatingCash = netRevenue - cogsCash - laborCash - opexCash - inputVATCash;
 
   return {
 
@@ -2272,18 +2302,25 @@ function _calcMetricsImpl(txList){
     cogsCash,
     laborCash,
     opexCash,
+    inputVATCash,
     netOperatingCash
   };
 }
 
 function pctBadge(val,type){
-  // type: cogs (good <30), labor (good <35), prime (good <65), net (good >15)
-  let cls='pct-neutral';
-  if(type==='cogs'){cls=val<=30?'pct-good':val<=35?'pct-warn':'pct-bad'}
-  else if(type==='labor'){cls=val<=32?'pct-good':val<=38?'pct-warn':'pct-bad'}
-  else if(type==='prime'){cls=val<=60?'pct-good':val<=68?'pct-warn':'pct-bad'}
-  else if(type==='net'){cls=val>=15?'pct-good':val>=5?'pct-warn':'pct-bad'}
-  return`<span class="stat-pct ${cls}">${val>0?val.toFixed(1):'—'}%</span>`;
+  /* Reads thresholds from kpiTargets so user-customized targets actually drive
+     the badge colors. Warn-zone width: +5 pts for cost lines (cogs/labor/prime),
+     where lower is better; −10 pts for net (where higher is better). Falls back
+     to standard PH-restaurant defaults if a target is missing. */
+  const t=name=>Number(kpiTargets?.[name]?.target);
+  let cls='pct-neutral', good, warn;
+  if(type==='cogs'){       good=isFinite(t('cogsP'))     ?t('cogsP')     :30;  warn=good+5;  cls=val<=good?'pct-good':val<=warn?'pct-warn':'pct-bad'; }
+  else if(type==='labor'){ good=isFinite(t('laborP'))    ?t('laborP')    :32;  warn=good+5;  cls=val<=good?'pct-good':val<=warn?'pct-warn':'pct-bad'; }
+  else if(type==='prime'){ good=isFinite(t('primeCostP'))?t('primeCostP'):62;  warn=good+5;  cls=val<=good?'pct-good':val<=warn?'pct-warn':'pct-bad'; }
+  else if(type==='net'){   good=isFinite(t('netProfitP'))?t('netProfitP'):15;  warn=Math.max(0,good-10); cls=val>=good?'pct-good':val>=warn?'pct-warn':'pct-bad'; }
+  /* Show value when non-zero (positive OR negative — a negative net margin should
+     still display as "-12.3%", not "—"). */
+  return`<span class="stat-pct ${cls}">${val!==0&&!isNaN(val)?val.toFixed(1):'—'}%</span>`;
 }
 
 
@@ -2321,23 +2358,11 @@ function addTreasuryEvent(){
   toast('Treasury adjustment saved ✓');
 }
 
-function getUpcomingObligations(){
-
-  const payroll=(payrollRuns||[])
-    .filter(r=>r.status!=='paid')
-    .reduce((s,r)=>s+(r.netPay||0),0);
-
-  const payablesDue=(payables||[])
-    .filter(p=>!p.paid)
-    .reduce((s,p)=>s+(p.amount||0),0);
-
-  return {
-    payroll,
-    payables:payablesDue,
-    total:payroll+payablesDue
-  };
-}
-
+/* Removed: getUpcomingObligations — dead code (defined but never called) with
+   three latent bugs (r.netPay didn't exist on runs; !p.paid wasn't how payables
+   track status; p.amount was wrong field — should be p.balance). The live
+   obligation aggregator is treasuryService._getObligations(), which has been
+   fixed and is the single source of truth. */
 
 function getTreasuryReconciliation(dateRangeTx=null){
   /* Hotfix H1: route through treasuryService._flows so reconciliation and the
@@ -2885,6 +2910,7 @@ function handleImport(file){
 /* Bulk CSV import */
 function triggerCSVImport(){document.getElementById('csv-import-input').click()}
 function handleCSVImport(file){
+  if(userRole==='staff'){toast('CSV import is manager-only','error');return;}
   if(!file)return;
   const r=new FileReader();
   r.onload=e=>{
@@ -2942,6 +2968,16 @@ async function clearAllData(){
     payrollAdjustments=[];
     payrollRuns=[];
     payrollPools={};
+    /* Phase: align client reset with server reset (apps-script.js) so the debounced
+       save right after reset doesn't push stale local state back over the clean server.
+       Previously missing: cashAdvances (phantom receivables would persist),
+       dailySnapshots, forecastSnapshots. NOTE: kpiTargets and payrollSettings are
+       intentionally NOT reset — they're consumed via nested direct access
+       (e.g. kpiTargets.cogsP.target) so {} would crash render; the let-default
+       structure is the real source of truth and stays. */
+    cashAdvances=[];
+    dailySnapshots=[];
+    forecastSnapshots=[];
     dailyMetrics=[];
     weeklyMetrics=[];
     monthlyMetrics=[];
@@ -3373,6 +3409,7 @@ function normalizeTx(tx){
        accrued/unpaid item was actually settled. */
     payrollRunId:  tx.payrollRunId||null,
     advanceId:     tx.advanceId||null,
+    linkedTxId:    tx.linkedTxId||null,
     paidAt:        tx.paidAt||null,
     /* Hotfix M6: removed duplicate createdAt/createdBy/voided/voidedAt definitions
        that were overwriting the earlier ones with weaker fallbacks. */
@@ -3478,9 +3515,17 @@ function editTransaction(id){
 }
 
 function saveEditTx(id){
+  if(userRole==='staff'){toast('Editing transactions is manager-only','error');return;}
   const tx=transactions.find(t=>t.id===id);
   if(!tx)return;
   if(isPeriodLocked(tx.date)) { toast('Accounting period locked','error'); return; }
+  /* Pair-integrity guard: editing a tx that belongs to an Input VAT pair (either
+     side) could desync amounts between the expense and its VAT half. Force a
+     clean void + recreate path instead. Mirrors the void guard. */
+  if(tx.linkedTxId){toast('This is the Input VAT half of an expense — void the expense and recreate to change amounts','error');return;}
+  if((transactions||[]).some(t=>t&&t.linkedTxId===id&&!t.voided)){
+    toast('This expense has a linked Input VAT entry — to change amounts, void it and recreate the expense','error');return;
+  }
   const amt=parseFloat(document.getElementById('m-amt')?.value||0);
   if(!amt||amt<=0){toast('Enter a valid amount','error');return}
   const date=document.getElementById('m-date')?.value||today();
@@ -3504,6 +3549,7 @@ function deleteTransaction(id){
 }
 
 function voidTransaction(id,reason='Manual void'){
+  if(userRole==='staff'){toast('Voiding is manager-only — ask your manager to correct it','error');return;}
   const tx=transactions.find(t=>t.id===id);
   if(!tx)return;
   /* Integrity guard: system-generated entries are owned by a payroll run or a cash
@@ -3512,12 +3558,18 @@ function voidTransaction(id,reason='Manual void'){
      the user to the proper undo, which reverses the ledger AND the linked state. */
   if(tx.payrollRunId){toast('This entry belongs to a finalized payroll — reverse it via Payroll History → Unfinalize (keeps history in sync)','error');return;}
   if(tx.advanceId){toast('This entry belongs to a cash advance — delete the advance instead so the balance stays correct','error');return;}
+  /* Linked-half guard: this tx is the VAT half of an expense pair. Voiding it alone
+     would leave the expense without its Input VAT — desync. Route to the parent. */
+  if(tx.linkedTxId){toast('This entry is the Input VAT half of an expense — void the expense itself, and this will void with it','error');return;}
   if(!confirm('Void this transaction? It will remain in the log marked as voided.'))return;
   if(isPeriodLocked(tx.date)){toast('Accounting period locked','error');return;}
-  /* Mark void then rebuild via the gateway.
+  /* Mark void then rebuild via the gateway. Also void any linked children (e.g.
+     the Input VAT withdrawal paired with this expense) so cash + Input VAT asset
+     unwind together.
      Hotfix H5/H6: gateway rebuilds; skipAudit:true so only the per-tx 'void'
      audit row fires (carries the voided tx snapshot). */
-  ledgerReplaceTransactions(transactions.map(t=>t.id===id?{...t,voided:true,voidedAt:new Date().toISOString(),voidedBy:currentUser,voidReason:reason,modifiedAt:new Date().toISOString(),modifiedBy:currentUser}:t),'void_transaction',{skipAudit:true});
+  const stamp=new Date().toISOString();
+  ledgerReplaceTransactions(transactions.map(t=>(t.id===id||t.linkedTxId===id)?{...t,voided:true,voidedAt:stamp,voidedBy:currentUser,voidReason:reason,modifiedAt:stamp,modifiedBy:currentUser}:t),'void_transaction',{skipAudit:true});
   appendAudit('void',tx);
   logActivity(`Voided ${tx.type}: ${fmt(tx.amount)}`);
   scheduleSave();render();toast('Transaction voided');
@@ -3643,9 +3695,18 @@ function areaChart(data){
 /* ═══════════════════════════════════════════════
    BADGE / AMOUNT
 ═══════════════════════════════════════════════ */
-const BS={sale:`background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd)`,dsr_adjustment:`background:var(--bg3);color:var(--muted);border:1px solid var(--border)`,expense:`background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd)`,transfer:`background:var(--amber-bg);color:var(--amber);border:1px solid var(--amber-bd)`,deposit:`background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue-bd)`,withdrawal:`background:var(--purple-bg);color:var(--purple);border:1px solid var(--purple-bd)`};
-const TL={sale:'Sale',expense:'Expense',transfer:'Transfer',deposit:'Deposit',withdrawal:'Withdrawal',sc_collected:'SC',tip_collected:'Tips',sc_paid:'SC Out',tip_paid:'Tips Out',liability_payment:'Remittance',dsr_adjustment:'Adjustment'};
-const badge=type=>`<span class="badge" style="${BS[type]||''}">${TL[type]||type}</span>`;
+const BS={sale:`background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd)`,dsr_adjustment:`background:var(--bg3);color:var(--muted);border:1px solid var(--border)`,expense:`background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd)`,transfer:`background:var(--amber-bg);color:var(--amber);border:1px solid var(--amber-bd)`,deposit:`background:var(--blue-bg);color:var(--blue);border:1px solid var(--blue-bd)`,withdrawal:`background:var(--purple-bg);color:var(--purple);border:1px solid var(--purple-bd)`,input_vat:`background:var(--bg3);color:var(--muted);border:1px solid var(--border)`,output_vat:`background:var(--bg3);color:var(--muted);border:1px solid var(--border)`};
+const TL={sale:'Sale',expense:'Expense',transfer:'Transfer',deposit:'Deposit',withdrawal:'Withdrawal',sc_collected:'SC',tip_collected:'Tips',sc_paid:'SC Out',tip_paid:'Tips Out',liability_payment:'Remittance',dsr_adjustment:'Adjustment',input_vat:'Input VAT',output_vat:'Output VAT'};
+/* badge(tx) — accountant-friendly relabel: if a tx is the Input VAT half of an
+   expense pair (withdrawal tagged to a1080) or an Output VAT adjustment (l2100),
+   show the friendly accounting label instead of the internal cash-flow type. */
+function txDisplayType(t){
+  if(!t) return '';
+  if(t.coaId==='a1080'||t.category==='Input VAT') return 'input_vat';
+  if(t.coaId==='l2100'&&t.type==='dsr_adjustment') return 'output_vat';
+  return t.type;
+}
+const badge=arg=>{const type=typeof arg==='object'?txDisplayType(arg):arg;return `<span class="badge" style="${BS[type]||''}">${TL[type]||type}</span>`};
 function amountCell(tx){
   const v=`${fmt(tx.amount)}${tx.voided?'<span style="font-size:.68rem;color:var(--muted2);margin-left:4px">[voided]</span>':''}`;
   const s=tx.voided?'text-decoration:line-through;opacity:.5;':'';
@@ -4059,11 +4120,19 @@ function renderModal(){
       Enter monthly aggregate totals for each P&L line. The system posts <b>one transaction per non-zero amount</b>, dated to the <b>last day</b> of the selected month. Revenue → sales (cash in), COGS / Labor / OpEx → paid expenses (cash out), Contra-revenue → cash-neutral discounts.
       <br><br><b>Before posting:</b> if you previously deposited an "opening balance" that represents these months' carry-forward (e.g. your May 1 deposits), void them after backfilling so cash isn't double-counted.
     </div>
-    <div style="display:grid;grid-template-columns:180px 1fr;gap:14px;margin-bottom:6px;align-items:end">
+    <div style="display:grid;grid-template-columns:150px 1fr 140px 140px;gap:12px;margin-bottom:6px;align-items:end">
       <div class="form-group" style="margin:0"><label>Month</label><input id="bf-month" type="month" value="${defaultMonth}"></div>
       <div class="form-group" style="margin:0">
         <label>Cash account <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· where the period's net cash lands / leaves</span></label>
         <select id="bf-acct">${acctOpts}</select>
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Output VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· liability</span></label>
+        <input id="bf-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· credit</span></label>
+        <input id="bf-input-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)">
       </div>
     </div>
     <div style="max-height:58vh;overflow-y:auto;padding-right:8px;border-top:1px solid var(--border);margin-top:6px;padding-top:2px">
@@ -4190,7 +4259,11 @@ function renderModal(){
       <div class="form-row">
         <div class="form-group"><label>Payment Status</label><select id="m-status"><option value="paid" ${(data?.status||'paid')==='paid'?'selected':''}>Paid (cash out now)</option><option value="unpaid" ${data?.status==='unpaid'?'selected':''}>On Credit (pay later)</option></select></div>
         <div class="form-group"><label>Due Date</label><input id="m-duedate" type="date" value="${data?.dueDate||''}"></div>
-      </div>`:'';
+      </div>
+      ${isEdit?'':`<div class="form-row">
+        <div class="form-group"><label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· VAT portion of total · optional</span></label><input id="m-input-vat" type="number" step="0.01" min="0" placeholder="0.00"></div>
+        <div class="form-group" style="font-size:.7rem;color:var(--muted2);padding-top:18px;line-height:1.4">If the Amount above is VAT-inclusive, enter the VAT portion here. The expense recorded in P&L will be net of VAT; the VAT becomes a claimable Input VAT credit.</div>
+      </div>`}`:'';
     body=`<div class="form-row"><div class="form-group"><label>Date</label><input id="m-date" type="date" value="${data?.date||today()}"></div><div class="form-group"><label>Amount (₱)</label><input id="m-amt" type="number" step="0.01" min="0.01" placeholder="0.00" value="${data?.amount||''}"></div></div>${catField}${acctField}${accrualFields}<div class="form-row"><div class="form-group"><label>Note</label><input id="m-note" placeholder="Description…" value="${esc(data?.note||'')}"></div><div class="form-group"><label>Handler</label><input id="m-handler" placeholder="Your name" value="${esc(data?.handler||currentUser)}"></div></div><div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="${saveCall}">${isEdit?'Update':'Save'}</button>${isEdit?`<button class="btn btn-danger" onclick="voidTransaction('${data.id}');closeModal()">Void</button>`:''}<button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
   }
 
@@ -4210,6 +4283,7 @@ function renderModal(){
 }
 
 function submitTx(type){
+  if(userRole==='staff'){toast('Posting ad-hoc transactions is manager-only — use DSR for sales','error');return;}
   const amt=parseFloat(document.getElementById('m-amt')?.value||0);
   if(!amt||amt<=0){toast('Enter a valid amount','error');return}
   const note=document.getElementById('m-note')?.value||'';
@@ -4228,15 +4302,37 @@ function submitTx(type){
   /* Phase 1C: resolve coaId from selected option data attribute, fall back to name lookup */
   const catSelect=document.getElementById('m-cat');
   const coaId=(catSelect?.selectedOptions?.[0]?.dataset?.coaid)||coa.find(c=>c.name===category)?.id||'';
-  createLedgerTransaction({
-    type, account:document.getElementById('m-acct')?.value,
+  const acct=document.getElementById('m-acct')?.value;
+  const status=document.getElementById('m-status')?.value||'paid';
+  /* Input VAT split: if the user entered a VAT portion, split the entered total
+     into a (net) expense + a paired cash-debiting Input VAT credit (asset). The
+     pair preserves: cash out = full amount, P&L expense = net, Input VAT asset
+     = vat. Status mirrors the expense AND the pair is linked via linkedTxId so
+     "Pay Now" on an unpaid expense flips its VAT half too. */
+  const rawVat=type==='expense'?parseFloat(document.getElementById('m-input-vat')?.value||0)||0:0;
+  const inputVat=round2(Math.max(0,Math.min(rawVat,amt))); // clamp 0..amt
+  const expenseAmt=round2(amt-inputVat);
+  const expenseTx=createLedgerTransaction({
+    type, account:acct,
     category, coaId,
-    amount:amt, note, date, handler,
+    amount:expenseAmt, note, date, handler,
     supplier:document.getElementById('m-supplier')?.value||'',
     expenseType:document.getElementById('m-exptype')?.value||'',
-    status:document.getElementById('m-status')?.value||'paid',
+    status,
     dueDate:document.getElementById('m-duedate')?.value||'',
-  });
+  },{skipRender:inputVat>0});
+  if(inputVat>0){
+    /* Withdrawal (cash-debiting) tagged to a1080 — cash leaves with the expense,
+       Input VAT asset accrues. Linked to the expense via linkedTxId so payment
+       state stays in sync. */
+    createLedgerTransaction({
+      type:'withdrawal', coaId:'a1080', category:'Input VAT',
+      account:acct, amount:inputVat,
+      note:`Input VAT — ${note||category||'expense'}`,
+      date, handler, status,
+      linkedTxId:expenseTx.id
+    });
+  }
 }
 
 function submitAddCoa(){
@@ -5285,6 +5381,10 @@ ${leanAlerts.length ? `
    PAGE: TRANSACTIONS
 ═══════════════════════════════════════════════ */
 function pgTransactions(){
+  /* Staff role is read-only on this page — they can see all transactions but
+     can't edit/void/delete or post ad-hoc txs. Only the manager corrects past
+     entries. Page-level access is still allowed (set in STAFF_PAGES). */
+  const isStaff=userRole==='staff';
   let f=[...transactions].filter(txInRange).sort((a,b)=>b.date.localeCompare(a.date));
   if(filters.type)f=f.filter(t=>t.type===filters.type);
   if(filters.dateFrom)f=f.filter(t=>t.date>=filters.dateFrom);
@@ -5295,14 +5395,14 @@ function pgTransactions(){
   const tE=active.filter(t=>t.type==='expense').reduce((s,t)=>s+t.amount,0);
   const net=tS-tE;
   const sel=(v,c)=>v===c?'selected':'';
-  const rows=f.length?f.map(tx=>`<tr style="${tx.voided?'opacity:.55':''}"><td style="font-size:.76rem;white-space:nowrap;color:var(--muted)">${fmtDate(tx.date)}</td><td>${badge(tx.type)}</td><td><div style="font-weight:500">${esc(tx.category)||(tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:'—')}</div>${tx.note?`<div style="font-size:.72rem;color:var(--muted2)">${esc(tx.note)}</div>`:''}</td><td style="font-size:.76rem;color:var(--muted2)">${tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:an(tx.account)}</td><td style="text-align:right">${amountCell(tx)}</td><td style="font-size:.72rem;color:var(--muted2)">${esc(tx.handler||'')}</td><td><div class="row-actions">
-  ${tx.type==='expense'&&tx.status==='unpaid'&&!tx.voided?`<button class="row-btn" style="color:var(--green)" onclick="markExpensePaid('${tx.id}')" title="Mark Paid">✓</button>`:''}
-  ${!tx.voided?`<button class="row-btn" onclick="editTransaction('${tx.id}')" title="Edit">✎</button><button class="row-btn del" onclick="deleteTransaction('${tx.id}')" title="Delete">✕</button>`:`<span style="font-size:.68rem;color:var(--muted2)">voided</span>`}
+  const rows=f.length?f.map(tx=>`<tr style="${tx.voided?'opacity:.55':''}"><td style="font-size:.76rem;white-space:nowrap;color:var(--muted)">${fmtDate(tx.date)}</td><td>${badge(tx)}</td><td><div style="font-weight:500">${esc(tx.category)||(tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:'—')}</div>${tx.note?`<div style="font-size:.72rem;color:var(--muted2)">${esc(tx.note)}</div>`:''}</td><td style="font-size:.76rem;color:var(--muted2)">${tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:an(tx.account)}</td><td style="text-align:right">${amountCell(tx)}</td><td style="font-size:.72rem;color:var(--muted2)">${esc(tx.handler||'')}</td><td><div class="row-actions">
+  ${isStaff?`<span style="font-size:.68rem;color:var(--muted2)">${tx.voided?'voided':'view only'}</span>`:`${tx.type==='expense'&&tx.status==='unpaid'&&!tx.voided?`<button class="row-btn" style="color:var(--green)" onclick="markExpensePaid('${tx.id}')" title="Mark Paid">✓</button>`:''}
+  ${!tx.voided?`<button class="row-btn" onclick="editTransaction('${tx.id}')" title="Edit">✎</button><button class="row-btn del" onclick="deleteTransaction('${tx.id}')" title="Delete">✕</button>`:`<span style="font-size:.68rem;color:var(--muted2)">voided</span>`}`}
 </div></td></tr>`).join(''):`<tr><td colspan="6" class="empty">No transactions match filters.</td></tr>`;
   const summary=f.length?`<div class="summary-footer"><span style="font-size:.78rem;color:var(--muted)">Shown: <b>${f.length}</b></span><span class="green" style="font-size:.78rem">Sales: <b>${fmt(tS)}</b></span><span class="red" style="font-size:.78rem">Expenses: <b>${fmt(tE)}</b></span><span class="${net>=0?'green':'red'}" style="font-size:.78rem">Net: <b>${net>=0?'+':''}${fmt(net)}</b></span></div>`:'';
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Transactions</div><div class="page-sub">All movements — edit, void, or delete</div></div></div>
 <div class="filter-row"><input placeholder="Search…" value="${esc(filters.search)}" oninput="filters.search=this.value;renderMain()" style="flex:1;min-width:100px;max-width:200px"><select onchange="filters.type=this.value;renderMain()"><option value="" ${sel('',filters.type)}>All Types</option><option value="sale" ${sel('sale',filters.type)}>Sales</option><option value="expense" ${sel('expense',filters.type)}>Expenses</option><option value="transfer" ${sel('transfer',filters.type)}>Transfers</option><option value="deposit" ${sel('deposit',filters.type)}>Deposits</option><option value="withdrawal" ${sel('withdrawal',filters.type)}>Withdrawals</option></select><input type="date" value="${filters.dateFrom}" onchange="filters.dateFrom=this.value;renderMain()"><input type="date" value="${filters.dateTo}" onchange="filters.dateTo=this.value;renderMain()"><button class="btn btn-ghost btn-sm" onclick="filters={type:'',search:'',dateFrom:'',dateTo:''};renderMain()">Clear</button><div style="flex:1"></div><button class="btn btn-ghost btn-sm" onclick="exportCSV()">↓ CSV</button></div>
-<div class="action-bar"><button class="btn btn-primary btn-sm" onclick="openModal('sale')">+ Sale</button><button class="btn btn-ghost btn-sm" onclick="openModal('expense')">+ Expense</button><button class="btn btn-ghost btn-sm" onclick="openModal('transfer')">↕ Transfer</button><button class="btn btn-ghost btn-sm" onclick="openModal('deposit')">↓ Deposit</button><button class="btn btn-ghost btn-sm" onclick="openModal('withdrawal')">↑ Withdraw</button><button class="btn btn-ghost btn-sm" onclick="triggerCSVImport()">↑ Import CSV</button><input type="file" id="csv-import-input" accept=".csv" style="display:none" onchange="handleCSVImport(this.files[0])"></div>
+${isStaff?`<div class="info-box" style="margin-bottom:10px;font-size:.78rem">Viewing in <b>staff (read-only)</b> mode — ad-hoc transactions, edits, voids, and deletes are manager-only.</div>`:`<div class="action-bar"><button class="btn btn-primary btn-sm" onclick="openModal('sale')">+ Sale</button><button class="btn btn-ghost btn-sm" onclick="openModal('expense')">+ Expense</button><button class="btn btn-ghost btn-sm" onclick="openModal('transfer')">↕ Transfer</button><button class="btn btn-ghost btn-sm" onclick="openModal('deposit')">↓ Deposit</button><button class="btn btn-ghost btn-sm" onclick="openModal('withdrawal')">↑ Withdraw</button><button class="btn btn-ghost btn-sm" onclick="triggerCSVImport()">↑ Import CSV</button><input type="file" id="csv-import-input" accept=".csv" style="display:none" onchange="handleCSVImport(this.files[0])"></div>`}
 <div class="card-flush"><table><thead><tr><th>Date</th><th>Type</th><th>Category / Note</th><th>Account</th><th style="text-align:right">Amount</th><th>Handler</th><th></th></tr></thead><tbody>${rows}</tbody></table>${summary}</div>`;
 }
 
@@ -5512,6 +5612,7 @@ function rebuildAccountBalances(){
 
 /* ── MARK EXPENSE PAID ── */
 function markExpensePaid(id){
+  if(userRole==='staff'){toast('Paying expenses is manager-only','error');return;}
   const tx=transactions.find(t=>t.id===id);
   if(!tx||tx.status==='paid')return;
   /* Paying flips unpaid→paid which moves cash — block if the tx date sits in a
@@ -5519,8 +5620,11 @@ function markExpensePaid(id){
   if(isPeriodLocked(tx.date)){toast('Accounting period locked for '+fmtDate(tx.date),'error');return;}
   /* Hotfix H5: removed redundant rebuildAccountBalances() — gateway rebuilds.
      The status flip from 'unpaid' to 'paid' is what causes the cash debit
-     in rebuildAccountBalances() (case 'expense' early-return on unpaid). */
-  ledgerReplaceTransactions(transactions.map(t=>t.id===id?{...t,status:'paid',paidAt:new Date().toISOString()}:t),'mark_paid');
+     in rebuildAccountBalances() (case 'expense' early-return on unpaid).
+     Also flip any linked tx (e.g. Input VAT withdrawal paired with this expense)
+     so cash for the VAT half moves at the same time. */
+  const stamp=new Date().toISOString();
+  ledgerReplaceTransactions(transactions.map(t=>(t.id===id||t.linkedTxId===id)?{...t,status:'paid',paidAt:stamp}:t),'mark_paid');
   logActivity(`Expense paid: ${tx.category} — ${fmt(tx.amount)}`);
   scheduleSave();render();toast('Marked as paid ✓');
 }
@@ -5707,6 +5811,7 @@ function postDSRToLedger(date){
 }
 
 function unpostDSR(date){
+  if(userRole==='staff'){toast('Unposting a DSR is manager-only — ask your manager to correct it','error');return;}
   const existing=getDSRPosted(date);
   const isMarkedPosted=!!(dsrEntries[date]?.posted);
   /* Recovery path: date is flagged posted but has no live DSR transactions —
@@ -6586,6 +6691,7 @@ function pgReports(){
             <td style="font-size:.7rem;color:var(--muted2)">${a.excludeFromLiquidity?'clearing':a.type}</td></tr>
           `).join('')}
           ${bs.breakdown.employeeReceivables>0?`<tr><td style="font-size:.8rem">Employee Receivables <span style="font-size:.7rem;color:var(--muted2)">· cash advances</span></td><td class="mono" style="text-align:right;font-size:.8rem">${fmt(bs.breakdown.employeeReceivables)}</td><td style="font-size:.7rem;color:var(--muted2)">asset</td></tr>`:''}
+          ${bs.breakdown.inputVAT>0?`<tr><td style="font-size:.8rem">Input VAT <span style="font-size:.7rem;color:var(--muted2)">· claimable against output</span></td><td class="mono" style="text-align:right;font-size:.8rem">${fmt(bs.breakdown.inputVAT)}</td><td style="font-size:.7rem;color:var(--muted2)">asset</td></tr>`:''}
           <tr style="background:var(--bg3);font-weight:700"><td style="padding:7px 12px">Total Assets</td><td class="mono" style="text-align:right;font-weight:700">${fmt(bs.totalAssets)}</td><td></td></tr>
         </tbody></table>
       </div>
@@ -6596,7 +6702,8 @@ function pgReports(){
           <tr><td style="font-size:.8rem">Accrued Expenses (unpaid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.accruedExpenses)}</td><td></td></tr>
           <tr><td style="font-size:.8rem">Service Charge Payable</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.serviceChargeLiability)}</td><td></td></tr>
           <tr><td style="font-size:.8rem">Tips Payable</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.tipsLiability||0)}</td><td></td></tr>
-          <tr><td style="font-size:.8rem">VAT Payable</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.vatLiability||0)}</td><td></td></tr>
+          <tr><td style="font-size:.8rem">VAT Payable <span style="font-size:.7rem;color:var(--muted2)">· Output</span></td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(bs.breakdown.vatLiability||0)}</td><td></td></tr>
+          ${bs.breakdown.inputVAT>0?`<tr><td style="font-size:.78rem;color:var(--muted2);padding-left:24px">└ Net VAT to BIR (Output − Input)</td><td class="mono" style="text-align:right;font-size:.78rem;color:var(--muted2)">${fmt(bs.breakdown.netVATPayable||0)}</td><td style="font-size:.7rem;color:var(--muted2)">net</td></tr>`:''}
           <tr style="background:var(--bg3)"><td style="font-size:.8rem;font-weight:600">Total Liabilities</td><td class="mono" style="text-align:right;font-size:.8rem;font-weight:700;color:var(--red)">${fmt(bs.totalLiabilities)}</td><td></td></tr>
           <tr style="background:var(--bg3);font-weight:700;border-top:2px solid var(--border)"><td style="padding:7px 12px">Net Equity</td><td class="mono" style="text-align:right;font-weight:700;color:${bs.netEquity>=0?'var(--green)':'var(--red)'}">${fmt(bs.netEquity)}</td><td></td></tr>
         </tbody></table>
@@ -6613,6 +6720,7 @@ function pgReports(){
         <tr><td style="font-size:.8rem;padding-left:24px">Less: COGS (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.cogsCash)}</td></tr>
         <tr><td style="font-size:.8rem;padding-left:24px">Less: Labor (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.laborCash)}</td></tr>
         <tr><td style="font-size:.8rem;padding-left:24px">Less: OpEx (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.opexCash||0)}</td></tr>
+        ${m.inputVATCash>0?`<tr><td style="font-size:.8rem;padding-left:24px">Less: Input VAT (paid)</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">${fmt(m.inputVATCash)}</td></tr>`:''}
         <tr style="font-weight:700;background:var(--bg3)"><td>Net Operating Cash Flow</td><td class="mono" style="text-align:right;color:${m.netOperatingCash>=0?'var(--green)':'var(--red)'}">${fmt(m.netOperatingCash)}</td></tr>
         <tr style="background:var(--bg3)"><td colspan="2" style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;padding:8px 12px">Reconciliation</td></tr>
         <tr><td style="font-size:.8rem;padding-left:24px">Expected Cash</td><td class="mono" style="text-align:right;font-size:.8rem">${fmt(recon.expectedCash)}</td></tr>
@@ -7300,13 +7408,48 @@ function submitBackfillMonth(){
       status:'paid', handler:currentUser
     });
   });
+  /* Output VAT: if entered, post a dsr_adjustment to l2100 (VAT Payable) so the
+     metrics layer strips it from net revenue. Matches how DSR posts VAT — cash-
+     neutral, just a liability accrual mirrored from the gross sales. */
+  const vatAmt=round2(parseFloat(document.getElementById('bf-vat')?.value)||0);
+  if(vatAmt>0){
+    txs.push({
+      date, type:'dsr_adjustment', coaId:'l2100', category:'VAT Payable',
+      account:acctId, amount:vatAmt,
+      note:`Backfill — ${monthVal} output VAT`,
+      status:'paid', handler:currentUser
+    });
+  }
+  /* Input VAT: cash actually left to cover the VAT portion of VAT-able purchases
+     (you paid suppliers GROSS, the VAT becomes a claimable asset). Posted as a
+     withdrawal so cash debits and the asset accrues — symmetric to how the live
+     expense modal splits Input VAT. */
+  const inputVatAmt=round2(parseFloat(document.getElementById('bf-input-vat')?.value)||0);
+  if(inputVatAmt>0){
+    txs.push({
+      date, type:'withdrawal', coaId:'a1080', category:'Input VAT',
+      account:acctId, amount:inputVatAmt,
+      note:`Backfill — ${monthVal} input VAT`,
+      status:'paid', handler:currentUser
+    });
+  }
   if(!txs.length){toast('Enter at least one amount','error');return}
-  const netProfit=round2(totalRevenue-totalExpense);
+  const netRevenue=round2(totalRevenue-vatAmt);
+  const netProfit=round2(netRevenue-totalExpense);
+  const netVAT=round2(vatAmt-inputVatAmt);
+  /* Cash impact: revenue is gross VAT-incl cash in; expenses are net cash out (the
+     wizard takes net for P&L lines); Input VAT is the additional cash that left for
+     the VAT portion of purchases. Output VAT is cash-neutral (already inside revenue). */
+  const cashImpact=round2(totalRevenue-totalExpense-inputVatAmt);
   if(!confirm(`Post ${txs.length} aggregate transaction${txs.length===1?'':'s'} for ${monthVal} (dated ${fmtDate(date)})?\n\n`+
-    `• Revenue total: ${fmt(totalRevenue)}\n`+
-    `• Expense total: ${fmt(totalExpense)}\n`+
+    `• Gross Revenue: ${fmt(totalRevenue)}\n`+
+    (vatAmt>0?`• Output VAT:    −${fmt(vatAmt)} (stripped, liability)\n`:'')+
+    `• Net Revenue:   ${fmt(netRevenue)}\n`+
+    `• Expense total: ${fmt(totalExpense)} (net of input VAT)\n`+
     `• Net profit:    ${fmt(netProfit)}\n\n`+
-    `Net cash impact on ${accounts.find(a=>a.id===acctId)?.name||'account'}: ${netProfit>=0?'+':''}${fmt(netProfit)}`))return;
+    (inputVatAmt>0?`• Input VAT credit: ${fmt(inputVatAmt)} (claimable asset)\n• Net VAT to BIR:   ${fmt(Math.max(0,netVAT))}\n\n`:'')+
+    `Net cash impact on ${accounts.find(a=>a.id===acctId)?.name||'account'}: ${cashImpact>=0?'+':''}${fmt(cashImpact)}\n`+
+    `(Output VAT is cash-neutral; Input VAT debits cash for the VAT portion of purchases)`))return;
   createLedgerBatch(txs);
   logActivity(`Backfilled ${monthVal}: ${txs.length} entries · net ${fmt(netProfit)}`);
   closeModal();
@@ -7366,7 +7509,15 @@ function submitSettleLiability(){
 }
 
 function addRosterMember(m){roster=[...roster,{id:uid(),status:'active',...m}];scheduleSave();render();closeModal();toast('Employee added ✓')}
-function deleteRosterMember(id){if(shifts.some(s=>s.employeeId===id)){toast('Employee has shifts — cannot delete','error');return}if(!confirm('Remove this employee?'))return;roster=roster.filter(r=>r.id!==id);scheduleSave();render();toast('Removed')}
+function deleteRosterMember(id){
+  if(shifts.some(s=>s.employeeId===id)){toast('Employee has shifts — cannot delete','error');return}
+  /* Block delete if outstanding cash advance — phantom receivable would persist on
+     the Balance Sheet (Employee Receivables) with no roster card to surface it. */
+  const owed=employeeAdvanceBalance(id);
+  if(owed>0){toast(`Employee still owes ${fmt(owed)} in cash advances — settle or delete the advance first`,'error');return}
+  if(!confirm('Remove this employee?'))return;
+  roster=roster.filter(r=>r.id!==id);scheduleSave();render();toast('Removed');
+}
 function editRosterMember(id){openModal('editRoster',roster.find(r=>r.id===id))}
 function saveEditRoster(id){
   const name=(document.getElementById('m-emp-name')?.value||'').trim();
@@ -8073,7 +8224,7 @@ function confirmPayPayable(id){const p=payables.find(x=>x.id===id);if(!p)return;
 /* ═══════════════════════════════════════════════
    KEYBOARD + FORECAST
 ═══════════════════════════════════════════════ */
-function handleKeyboard(e){if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA')return;if(currentModal)return;const map={s:()=>openModal('sale'),e:()=>openModal('expense'),t:()=>openModal('transfer')};if(map[e.key]){e.preventDefault();map[e.key]()}if(e.key==='Escape')closeModal()}
+function handleKeyboard(e){if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT'||e.target.tagName==='TEXTAREA')return;if(currentModal)return;const isStaff=userRole==='staff';const map=isStaff?{}:{s:()=>openModal('sale'),e:()=>openModal('expense'),t:()=>openModal('transfer')};if(map[e.key]){e.preventDefault();map[e.key]()}if(e.key==='Escape')closeModal()}
 let forecastTargets=JSON.parse(localStorage.getItem('ledger_targets')||'null')||{cogsTarget:30,laborTarget:32,primeTarget:62};
 function saveTargets(){localStorage.setItem('ledger_targets',JSON.stringify(forecastTargets))}
 function getFixedMonthlyExpenses(){const ft=transactions.filter(t=>t.type==='expense'&&t.expenseType==='fixed'&&t.status==='paid'&&!t.voided);if(!ft.length)return 0;const bm={};ft.forEach(t=>{const m=t.date.slice(0,7);bm[m]=(bm[m]||0)+t.amount});const mv=Object.values(bm);return mv.reduce((s,v)=>s+v,0)/mv.length}
@@ -8083,7 +8234,16 @@ function buildWeeklyTotals(dm){const w={};Object.entries(dm).forEach(([iso,d])=>
 function weightedMovingAvg(wt,field){const n=wt.length;if(!n)return 0;const weights=wt.map((_,i)=>Math.max(1,3-(n-1-i)));const sumW=weights.reduce((a,b)=>a+b,0);return wt.reduce((s,w,i)=>s+w[field]*weights[i],0)/sumW}
 function buildDOWIndex(dm){const ds=[0,0,0,0,0,0,0],dc=[0,0,0,0,0,0,0];Object.entries(dm).forEach(([iso,d])=>{const dow=new Date(iso+'T12:00:00').getDay();ds[dow]+=d.sales;dc[dow]++});const da=ds.map((s,i)=>dc[i]>0?s/dc[i]:null);const oa=da.filter(Boolean).reduce((a,b)=>a+b,0)/(da.filter(Boolean).length||1);return da.map(v=>v!=null?v/oa:1.0)}
 function buildStdDev(dm){const vals=Object.values(dm).map(d=>d.sales).filter(v=>v>0);if(vals.length<2)return 0;const mean=vals.reduce((a,b)=>a+b,0)/vals.length;return Math.sqrt(vals.reduce((s,v)=>s+(v-mean)**2,0)/vals.length)}
-function runForecast(days=30){const dm=buildDailyHistory(),wd=buildWeeklyTotals(dm);const tc=treasuryService.getOperationalLiquidity();if(!wd.length)return{days:[],hasEnoughData:false,weeksOfData:0,dowIndex:[1,1,1,1,1,1,1],totalCash:tc};const wmaS=weightedMovingAvg(wd,'sales'),wmaO=weightedMovingAvg(wd,'otherExp');const di=buildDOWIndex(dm),sd=buildStdDev(dm),ads=wmaS/7;const result=[];let rc=tc;for(let i=1;i<=days;i++){const d=new Date();d.setDate(d.getDate()+i);const iso=localISO(d),dow=d.getDay();const fs=ads*di[dow],fc=fs*(forecastTargets.cogsTarget/100),fl=fs*(forecastTargets.laborTarget/100),fo=wmaO/7;const fe=fc+fl+fo,fn=fs-fe;rc+=fn;result.push({iso,dow,label:d.toLocaleDateString('en-US',{month:'short',day:'numeric'}),dayLabel:d.toLocaleDateString('en-US',{weekday:'short'}),forecastedSales:fs,forecastedCogs:fc,forecastedLabor:fl,forecastedOther:fo,forecastedExp:fe,forecastedNet:fn,bestSales:fs+sd*di[dow],worstSales:Math.max(0,fs-sd*di[dow]),forecastedPrime:fs>0?(fc+fl)/fs*100:0,runningCash:rc,isWeekend:dow===0||dow===6})}return{days:result,hasEnoughData:wd.length>=2,weeksOfData:wd.length,wmaWeeklySales:wmaS,avgDailySales:ads,dowIndex:di,stdDev:sd,totalCash:tc}}
+function runForecast(days=30){const dm=buildDailyHistory(),wd=buildWeeklyTotals(dm);const tc=treasuryService.getOperationalLiquidity();
+  /* Subtract pending obligations from the starting cash so the projection reflects
+     "cash you can actually count on" — unpaid wages, supplier credit, manual
+     payables. Without this, the running-cash curve is optimistic and can hide an
+     impending payday cliff. Total cash is still exposed separately. */
+  const obligations=treasuryService._getObligations();
+  const obligationsTotal=Number(obligations?.total)||0;
+  const adjustedStart=tc-obligationsTotal;
+  if(!wd.length)return{days:[],hasEnoughData:false,weeksOfData:0,dowIndex:[1,1,1,1,1,1,1],totalCash:tc,obligationsTotal,adjustedStart};
+  const wmaS=weightedMovingAvg(wd,'sales'),wmaO=weightedMovingAvg(wd,'otherExp');const di=buildDOWIndex(dm),sd=buildStdDev(dm),ads=wmaS/7;const result=[];let rc=adjustedStart;for(let i=1;i<=days;i++){const d=new Date();d.setDate(d.getDate()+i);const iso=localISO(d),dow=d.getDay();const fs=ads*di[dow],fc=fs*(forecastTargets.cogsTarget/100),fl=fs*(forecastTargets.laborTarget/100),fo=wmaO/7;const fe=fc+fl+fo,fn=fs-fe;rc+=fn;result.push({iso,dow,label:d.toLocaleDateString('en-US',{month:'short',day:'numeric'}),dayLabel:d.toLocaleDateString('en-US',{weekday:'short'}),forecastedSales:fs,forecastedCogs:fc,forecastedLabor:fl,forecastedOther:fo,forecastedExp:fe,forecastedNet:fn,bestSales:fs+sd*di[dow],worstSales:Math.max(0,fs-sd*di[dow]),forecastedPrime:fs>0?(fc+fl)/fs*100:0,runningCash:rc,isWeekend:dow===0||dow===6})}return{days:result,hasEnoughData:wd.length>=2,weeksOfData:wd.length,wmaWeeklySales:wmaS,avgDailySales:ads,dowIndex:di,stdDev:sd,totalCash:tc,obligationsTotal,adjustedStart}}
 function pgForecast(){
   const fc=runForecast(30);const targets=forecastTargets;
   const cut30=new Date();cut30.setDate(cut30.getDate()-30);
