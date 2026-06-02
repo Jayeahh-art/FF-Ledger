@@ -5288,14 +5288,14 @@ function pgDashboard(){
     <span style="color:var(--muted)">From</span><input type="date" value="${dashLens.custom.from}" onchange="dashLens.custom.from=this.value;render()" style="font-size:.76rem;padding:3px 6px">
     <span style="color:var(--muted)">To</span><input type="date" value="${dashLens.custom.to}" onchange="dashLens.custom.to=this.value;render()" style="font-size:.76rem;padding:3px 6px">
   </div>`}
-  <div style="display:flex;gap:6px;align-items:center;margin-left:auto;font-size:.76rem">
-    <span style="color:var(--muted)">Compare to:</span>
-    <select onchange="setDashLens({compare:this.value})" style="font-size:.76rem;padding:3px 6px;border-radius:4px;border:1px solid var(--border2);background:var(--bg)">
-      <option value="prior" ${dashLens.compare==='prior'?'selected':''}>Prior period</option>
-      <option value="yoy" ${dashLens.compare==='yoy'?'selected':''}>Same period · last year</option>
-      <option value="custom" ${dashLens.compare==='custom'?'selected':''}>Custom range</option>
+  <div style="display:flex;gap:6px;align-items:center;margin-left:auto;font-size:.76rem;white-space:nowrap">
+    <label style="color:var(--muted);font-weight:500">vs</label>
+    <select onchange="setDashLens({compare:this.value})" style="font-size:.76rem;padding:3px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg);cursor:pointer">
+      <option value="prior" ${dashLens.compare==='prior'?'selected':''}>Prior period · ${compareRange.label}</option>
+      <option value="yoy" ${dashLens.compare==='yoy'?'selected':''}>Last year · ${compareRange.label}</option>
+      <option value="custom" ${dashLens.compare==='custom'?'selected':''}>Custom range…</option>
     </select>
-    ${dashLens.compare==='custom'?`<input type="date" value="${dashLens.custom.compareFrom}" onchange="dashLens.custom.compareFrom=this.value;render()" style="font-size:.76rem;padding:3px 6px"><span style="color:var(--muted)">→</span><input type="date" value="${dashLens.custom.compareTo}" onchange="dashLens.custom.compareTo=this.value;render()" style="font-size:.76rem;padding:3px 6px">`:`<span style="color:var(--muted2)">· ${compareRange.label}</span>`}
+    ${dashLens.compare==='custom'?`<input type="date" value="${dashLens.custom.compareFrom}" onchange="dashLens.custom.compareFrom=this.value;render()" style="font-size:.76rem;padding:3px 6px;border:1px solid var(--border2);border-radius:5px;background:var(--bg)"><span style="color:var(--muted)">→</span><input type="date" value="${dashLens.custom.compareTo}" onchange="dashLens.custom.compareTo=this.value;render()" style="font-size:.76rem;padding:3px 6px;border:1px solid var(--border2);border-radius:5px;background:var(--bg)">`:''}
   </div>
 </div>
 
@@ -5488,7 +5488,12 @@ ${(()=>{
      granularity so the chart stays readable without scrolling. Each period gets
      its full metrics computed (calcMetrics on its txs); user can toggle which
      metric drives the bar heights. */
-  const counts={week:8, month:6, quarter:4, year:3, custom:1};
+  /* Defaults sized for restaurant-operator review cadences:
+       Week  → 12 weeks (≈ rolling quarter — industry standard)
+       Month → 12 months (rolling year)
+       Quarter → 6 quarters (1.5 years)
+       Year → 3 years */
+  const counts={week:12, month:12, quarter:6, year:3, custom:1};
   const count=counts[dashLens.gran]||6;
   if(dashLens.gran==='custom') return '';
   const periods=getTrendPeriods(dashLens.gran, dashLens.anchor, count);
@@ -5496,10 +5501,11 @@ ${(()=>{
     const txs=transactions.filter(t=>!t.voided && t.date>=p.from && t.date<=p.to);
     return {...p, m:financialService.getMetrics(txs)};
   });
-  const isPct = dashTrendMetric==='laborP' || dashTrendMetric==='primeP';
+  const isPct = dashTrendMetric==='laborP' || dashTrendMetric==='primeP' || dashTrendMetric==='cogsP';
   const pickVal = m => {
     if(dashTrendMetric==='revenue') return m.netRevenue||0;
     if(dashTrendMetric==='netProfit') return m.netProfit||0;
+    if(dashTrendMetric==='cogsP') return m.cogsP||0;
     if(dashTrendMetric==='laborP') return m.laborP||0;
     if(dashTrendMetric==='primeP') return m.primeP||0;
     return 0;
@@ -5507,9 +5513,15 @@ ${(()=>{
   const vals=periodMetrics.map(p=>pickVal(p.m));
   const maxV=Math.max(...vals.map(Math.abs),1);
   const H=130, W=600;
-  const bw=Math.min(50, (W-40)/count - 8);
+  const bw=Math.min(50, (W-40)/count - 6);
   const barX=i=>20 + i*((W-40)/count) + ((W-40)/count - bw)/2;
-  const tabs=[['revenue','Net Revenue','#22c55e'],['netProfit','Net Profit','#3b82f6'],['laborP','Labor %','#f59e0b'],['primeP','Prime %','#ef4444']];
+  const tabs=[
+    ['revenue','Net Revenue','#22c55e'],
+    ['netProfit','Net Profit','#3b82f6'],
+    ['cogsP','COGS %','#a855f7'],
+    ['laborP','Labor %','#f59e0b'],
+    ['primeP','Prime %','#ef4444']
+  ];
   const activeColor=(tabs.find(t=>t[0]===dashTrendMetric)||tabs[0])[2];
   return `<div class="card-flush" style="margin-bottom:14px">
     <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap">
