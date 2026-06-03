@@ -4782,10 +4782,10 @@ function renderModal(){
       </div>
       ${isEdit?'':`<div class="form-row">
         <div class="form-group"><label>VAT Mode <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· sticks across receipts</span></label>
-          <select id="m-vat-mode" onchange="onVatModeChange()">
-            <option value="manual" ${_vatMode==='manual'?'selected':''}>Manual — type VAT from receipt</option>
-            <option value="auto"   ${_vatMode==='auto'  ?'selected':''}>Auto — back out 12% from gross</option>
-            <option value="none"   ${_vatMode==='none'  ?'selected':''}>None — VAT-exempt vendor</option>
+          <select id="m-vat-mode" onchange="onVatModeChange()" style="font-size:.82rem">
+            <option value="manual" ${_vatMode==='manual'?'selected':''}>Manual entry</option>
+            <option value="auto"   ${_vatMode==='auto'  ?'selected':''}>Auto · 12% inclusive</option>
+            <option value="none"   ${_vatMode==='none'  ?'selected':''}>Exempt · no VAT</option>
           </select>
         </div>
         <div class="form-group"><label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· claimable from BIR</span></label><input id="m-input-vat" type="number" step="0.01" min="0" placeholder="0.00" oninput="checkVatSanity()"></div>
