@@ -4641,7 +4641,7 @@ function renderModal(){
       <br><br><b>Tip — backfilling per cutoff:</b> set the Post Date to the actual <b>payday</b> for that cutoff (e.g., 15th for the 1st cutoff, end-of-month for the 2nd) so cash-flow timing reflects when wages actually went out.
       <br><br><b>Before posting:</b> if you previously deposited an "opening balance" that represents these months' carry-forward (e.g. your May 1 deposits), void them after backfilling so cash isn't double-counted.
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1.4fr;gap:12px;margin-bottom:10px;align-items:end">
+    <div style="display:grid;grid-template-columns:1.1fr 1.5fr 1fr 1fr;gap:12px;margin-bottom:8px;align-items:end">
       <div class="form-group" style="margin:0">
         <label>Post Date</label>
         <input id="bf-date" type="date" value="${defaultPostDate}" title="When the backfill transactions will be dated. The month being backfilled is taken from this date.">
@@ -4650,15 +4650,13 @@ function renderModal(){
         <label>Cash Account</label>
         <select id="bf-acct" title="Where this period's net cash lands or leaves">${acctOpts}</select>
       </div>
-    </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:6px;align-items:end">
       <div class="form-group" style="margin:0">
-        <label>Output VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">liability</span></label>
-        <input id="bf-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)" title="VAT you owe BIR — stripped from revenue, posted as l2100 liability">
+        <label>Output VAT</label>
+        <input id="bf-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)" title="VAT you owe BIR (liability) — stripped from revenue, posted as l2100">
       </div>
       <div class="form-group" style="margin:0">
-        <label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">claimable</span></label>
-        <input id="bf-input-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)" title="VAT you paid suppliers — claimable as a1080 asset against Output VAT">
+        <label>Input VAT</label>
+        <input id="bf-input-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)" title="VAT you paid suppliers (claimable) — posted as a1080 asset against Output VAT">
       </div>
     </div>
     <div style="max-height:58vh;overflow-y:auto;padding-right:8px;border-top:1px solid var(--border);margin-top:6px;padding-top:2px">
