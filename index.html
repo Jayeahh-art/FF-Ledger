@@ -441,6 +441,81 @@ function markCacheSynced(){
     if(raw){const c=JSON.parse(raw);c.synced=true;localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify(c));}
   }catch(e){}
 }
+/* ── EXPENSE MODAL VAT-MODE HELPERS ──
+   For bulk receipt entry where vendors hand you a gross total without breaking
+   out the VAT line: pick "Auto" mode once and every subsequent expense modal
+   back-computes the VAT from the gross (gross × 12/112) as you type the amount.
+   "Manual" preserves the original behavior. "None" hides the VAT field for
+   VAT-exempt vendor receipts. The choice persists in localStorage so it stays
+   in effect across sessions / browser restarts. */
+function recalcAutoVat(){
+  const modeSel=document.getElementById('m-vat-mode');
+  const amtEl=document.getElementById('m-amt');
+  const vatEl=document.getElementById('m-input-vat');
+  if(!modeSel||!amtEl||!vatEl){ checkVatSanity(); return; }
+  const mode=modeSel.value;
+  if(mode!=='auto'){ checkVatSanity(); return; }
+  const amt=parseFloat(amtEl.value)||0;
+  if(amt<=0){ vatEl.value=''; checkVatSanity(); return; }
+  /* VAT-inclusive back-out: VAT = gross × 12/112. Standard PH formula for
+     pulling the embedded VAT out of a gross total. */
+  const vat=Math.round((amt*12/112)*100)/100;
+  vatEl.value=vat.toFixed(2);
+  checkVatSanity();
+}
+/* Live sanity check on the Input VAT field — flag values that exceed the math
+   ceiling (gross × 12/112). Catches typos like "1200" instead of "120" before
+   they hit BIR via the schedule of input VAT. Allows a 5-centavo tolerance so
+   receipts where the supplier rounded VAT up by a peso-cent don't false-alarm. */
+function checkVatSanity(){
+  const modeSel=document.getElementById('m-vat-mode');
+  const amtEl=document.getElementById('m-amt');
+  const vatEl=document.getElementById('m-input-vat');
+  const hint=document.getElementById('m-vat-hint');
+  if(!hint) return;
+  const mode=modeSel?modeSel.value:'manual';
+  const amt=amtEl?parseFloat(amtEl.value)||0:0;
+  const vat=vatEl?parseFloat(vatEl.value)||0:0;
+  /* Only show the warning in Manual mode (Auto never exceeds the cap; None
+     disables the field). Auto-mode users see the normal mode hint. */
+  if(mode==='manual' && amt>0 && vat>0){
+    const cap=Math.round((amt*12/112)*100)/100;
+    if(vat>cap+0.05){
+      hint.innerHTML=`<span style="color:var(--red);font-weight:600">⚠ VAT ${fmt(vat)} exceeds the maximum for this gross (max ${fmt(cap)} = ${fmt(amt)} × 12/112). Common typo: extra digit, or amount typed net-of-VAT.</span>`;
+      return;
+    }
+  }
+  /* No warning — fall back to the standard mode-specific hint. */
+  if(mode==='auto') hint.textContent='Auto: VAT = Amount × 12/112. Edit the field manually if the receipt has mixed VAT + VAT-exempt items (override stays until you change Amount).';
+  else if(mode==='none') hint.textContent='No Input VAT will be recorded — use this when the vendor is non-VAT-registered or every item on the receipt is VAT-exempt.';
+  else hint.textContent='Type the VAT line from the receipt. Leave blank if the receipt has no VAT.';
+}
+function onVatModeChange(){
+  const sel=document.getElementById('m-vat-mode');
+  if(!sel) return;
+  const mode=sel.value;
+  try{ localStorage.setItem('ledger_vat_mode',mode); }catch(e){}
+  const vatEl=document.getElementById('m-input-vat');
+  if(vatEl){
+    if(mode==='none'){
+      vatEl.value='';
+      vatEl.disabled=true;
+      vatEl.placeholder='—';
+    } else if(mode==='auto'){
+      vatEl.disabled=false;
+      vatEl.placeholder='auto';
+      recalcAutoVat();   // recalcAutoVat() now calls checkVatSanity() internally
+      return;
+    } else {
+      vatEl.disabled=false;
+      vatEl.placeholder='0.00';
+    }
+  }
+  /* checkVatSanity sets the hint text appropriately for the chosen mode AND
+     surfaces the over-cap warning if Manual mode has a typo. */
+  checkVatSanity();
+}
+
 /* Defer the local-cache write to the next macrotask so the synchronous
    JSON.stringify(collectState()) doesn't block the click handler. With growing
    state (snapshots, audit log, transactions), the serialize+localStorage write
@@ -4691,6 +4766,11 @@ function renderModal(){
     }
     const saveCall=isEdit?`saveEditTx('${data.id}')`:' submitTx(\''+txType+'\')';
     const isExpense=txType==='expense';
+    /* VAT mode preference is sticky across sessions — once a user picks "Auto",
+       every subsequent expense modal opens in Auto mode (the typical case for
+       restaurants where most receipts are VAT-inclusive gross totals without
+       the VAT line broken out). Defaults to 'manual' for backwards compat. */
+    const _vatMode=(()=>{ try{return localStorage.getItem('ledger_vat_mode')||'manual';}catch(e){return 'manual';} })();
     const accrualFields=isExpense?`
       <div class="form-row">
         <div class="form-group"><label>Supplier / Vendor</label><input id="m-supplier" placeholder="e.g. Sysco, Meralco" value="${esc(data?.supplier||'')}"></div>
@@ -4701,10 +4781,20 @@ function renderModal(){
         <div class="form-group"><label>Due Date</label><input id="m-duedate" type="date" value="${data?.dueDate||''}"></div>
       </div>
       ${isEdit?'':`<div class="form-row">
-        <div class="form-group"><label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· VAT portion of total · optional</span></label><input id="m-input-vat" type="number" step="0.01" min="0" placeholder="0.00"></div>
-        <div class="form-group" style="font-size:.7rem;color:var(--muted2);padding-top:18px;line-height:1.4">If the Amount above is VAT-inclusive, enter the VAT portion here. The expense recorded in P&L will be net of VAT; the VAT becomes a claimable Input VAT credit.</div>
-      </div>`}`:'';
-    body=`<div class="form-row"><div class="form-group"><label>Date</label><input id="m-date" type="date" value="${data?.date||today()}"></div><div class="form-group"><label>Amount (₱)</label><input id="m-amt" type="number" step="0.01" min="0.01" placeholder="0.00" value="${data?.amount||''}"></div></div>${catField}${acctField}${accrualFields}<div class="form-row"><div class="form-group"><label>Note</label><input id="m-note" placeholder="Description…" value="${esc(data?.note||'')}"></div><div class="form-group"><label>Handler</label><input id="m-handler" placeholder="Your name" value="${esc(data?.handler||currentUser)}"></div></div><div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="${saveCall}">${isEdit?'Update':'Save'}</button>${isEdit?`<button class="btn btn-danger" onclick="voidTransaction('${data.id}');closeModal()">Void</button>`:''}<button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
+        <div class="form-group"><label>VAT Mode <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· sticks across receipts</span></label>
+          <select id="m-vat-mode" onchange="onVatModeChange()">
+            <option value="manual" ${_vatMode==='manual'?'selected':''}>Manual — type VAT from receipt</option>
+            <option value="auto"   ${_vatMode==='auto'  ?'selected':''}>Auto — back out 12% from gross</option>
+            <option value="none"   ${_vatMode==='none'  ?'selected':''}>None — VAT-exempt vendor</option>
+          </select>
+        </div>
+        <div class="form-group"><label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· claimable from BIR</span></label><input id="m-input-vat" type="number" step="0.01" min="0" placeholder="0.00" oninput="checkVatSanity()"></div>
+      </div>
+      <div id="m-vat-hint" style="font-size:.7rem;color:var(--muted2);margin:-2px 0 8px;line-height:1.45"></div>`}`:'';
+    body=`<div class="form-row"><div class="form-group"><label>Date</label><input id="m-date" type="date" value="${data?.date||today()}"></div><div class="form-group"><label>Amount (₱)</label><input id="m-amt" type="number" step="0.01" min="0.01" placeholder="0.00" value="${data?.amount||''}" oninput="recalcAutoVat()"></div></div>${catField}${acctField}${accrualFields}<div class="form-row"><div class="form-group"><label>Note</label><input id="m-note" placeholder="Description…" value="${esc(data?.note||'')}"></div><div class="form-group"><label>Handler</label><input id="m-handler" placeholder="Your name" value="${esc(data?.handler||currentUser)}"></div></div><div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="${saveCall}">${isEdit?'Update':'Save'}</button>${isEdit?`<button class="btn btn-danger" onclick="voidTransaction('${data.id}');closeModal()">Void</button>`:''}<button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
+    /* Apply initial VAT-mode state after modal mounts — sets the hint text, enables/
+       disables the Input VAT field, and runs the first auto-compute if needed. */
+    if(isExpense && !isEdit) setTimeout(onVatModeChange, 30);
   }
 
   const ov=document.getElementById('modal-wrap');
@@ -4762,6 +4852,26 @@ function submitTx(type){
      "Pay Now" on an unpaid expense flips its VAT half too. */
   const rawVat=type==='expense'?parseFloat(document.getElementById('m-input-vat')?.value||0)||0:0;
   const inputVat=round2(Math.max(0,Math.min(rawVat,amt))); // clamp 0..amt
+  /* Sanity guard: maximum legitimate Input VAT on a VAT-inclusive gross is
+     amt × 12/112 (≈ 10.714% of gross). If user typed a number above that ceiling
+     it's almost always a typo (extra digit, mis-read receipt, or amount entered
+     net-of-VAT instead of gross). 5-centavo tolerance for supplier rounding.
+     Force a confirm so the user can either back out and fix, or override if
+     they really know what they're doing. */
+  if(type==='expense' && inputVat>0){
+    const vatCap=round2(amt*12/112);
+    if(inputVat>vatCap+0.05){
+      if(!confirm(`⚠ Input VAT sanity check:\n\n`+
+        `Amount (gross):  ${fmt(amt)}\n`+
+        `Input VAT typed: ${fmt(inputVat)}\n`+
+        `Max possible:    ${fmt(vatCap)}   (= ${fmt(amt)} × 12/112)\n\n`+
+        `The VAT you entered exceeds 12% embedded in the gross amount. Common causes:\n`+
+        `  • Extra digit typo (e.g. "1200" instead of "120")\n`+
+        `  • You typed the NET amount instead of the gross\n`+
+        `  • Misread receipt\n\n`+
+        `Post anyway?`)) return;
+    }
+  }
   const expenseAmt=round2(amt-inputVat);
   const expenseTx=createLedgerTransaction({
     type, account:acct,
