@@ -4588,14 +4588,19 @@ function renderModal(){
     </div>`;
 
   }else if(type==='backfillMonth'){
-    /* One-shot monthly backfill — for populating P&L for months before daily DSR
-       tracking started. Posts one aggregate transaction per non-zero COA line,
-       dated to the last day of the selected month. */
+    /* One-shot aggregate backfill — posts one transaction per non-zero P&L line,
+       all dated to the user-chosen Post Date. Used for populating historical
+       periods before daily DSR tracking began, or for cutoff-specific batches
+       (e.g., 1st-cutoff wages posted on the 15th). */
     const acctList=accounts.filter(a=>a&&a.type!=='clearing');
     const acctOpts=acctList.map(a=>`<option value="${a.id}" ${a.id==='bank'?'selected':''}>${esc(a.name)}</option>`).join('');
-    /* Pre-fill month to the previous calendar month — the typical "next month to backfill". */
-    const _now=new Date(); const _prev=new Date(_now.getFullYear(),_now.getMonth()-1,1);
-    const defaultMonth=`${_prev.getFullYear()}-${String(_prev.getMonth()+1).padStart(2,'0')}`;
+    /* Default Post Date = last day of the previous month. Typical first use is
+       "backfill last month" so this saves one click for the common case. User
+       can pick any date from there — e.g., the 15th for a 1st-cutoff payday
+       backfill, or any day inside the current month for a same-month aggregate. */
+    const _now=new Date();
+    const _prevMonthEnd=new Date(_now.getFullYear(), _now.getMonth(), 0); // day 0 of current month = last day of prev
+    const defaultPostDate=localISO(_prevMonthEnd);
     /* Group P&L COA accounts by their group field; show one input per account.
        Skip balance-sheet types (asset/liability/equity) — backfill is P&L only. */
     const pnlCoa=(coa||[]).filter(c=>c&&['revenue','cogs','expense','contra_revenue'].includes(c.type));
@@ -4632,34 +4637,30 @@ function renderModal(){
       return sectionWrap(esc(gName), items.map(rowHtml).join(''));
     }).join('');
     body=`<div class="info-box" style="margin-bottom:10px;font-size:.76rem;line-height:1.45">
-      Enter aggregate totals for each P&L line. The system posts <b>one transaction per non-zero amount</b>, all dated to the <b>Post Date</b> you choose (defaults to the last day of the selected month — change it to e.g. the payday for a cutoff-specific backfill).
-      <br><br><b>Tip — backfilling per cutoff:</b> to post the 1st-cutoff wages on the actual payday, set <b>Post Date = 15th</b> (or whichever payday); for the 2nd-cutoff, run backfill again with the same month but <b>Post Date = end-of-month</b>.
+      Enter aggregate totals for each P&L line. The system posts <b>one transaction per non-zero amount</b>, all dated to the <b>Post Date</b> you choose. The month being backfilled is taken from the date.
+      <br><br><b>Tip — backfilling per cutoff:</b> set the Post Date to the actual <b>payday</b> for that cutoff (e.g., 15th for the 1st cutoff, end-of-month for the 2nd) so cash-flow timing reflects when wages actually went out.
       <br><br><b>Before posting:</b> if you previously deposited an "opening balance" that represents these months' carry-forward (e.g. your May 1 deposits), void them after backfilling so cash isn't double-counted.
     </div>
-    ${(()=>{
-      /* Default post date = last day of the prefilled month. Updates when the
-         user changes the Month picker (onchange handler below). User can override
-         freely after that — e.g., pick the 15th for a payday-aligned cutoff backfill. */
-      const [_y,_m]=defaultMonth.split('-').map(Number);
-      const _last=new Date(_y,_m,0).getDate();
-      const defaultPostDate=`${defaultMonth}-${String(_last).padStart(2,'0')}`;
-      return `<div style="display:grid;grid-template-columns:140px 150px 1fr 130px 130px;gap:12px;margin-bottom:6px;align-items:end">
-        <div class="form-group" style="margin:0"><label>Month</label><input id="bf-month" type="month" value="${defaultMonth}" onchange="(()=>{const m=this.value;if(!m)return;const [y,mo]=m.split('-').map(Number);const last=new Date(y,mo,0).getDate();const dEl=document.getElementById('bf-date');if(dEl)dEl.value=m+'-'+String(last).padStart(2,'0');})()"></div>
-        <div class="form-group" style="margin:0"><label>Post Date <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· when txs are dated</span></label><input id="bf-date" type="date" value="${defaultPostDate}"></div>
-        <div class="form-group" style="margin:0">
-          <label>Cash account <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· where the period's net cash lands / leaves</span></label>
-          <select id="bf-acct">${acctOpts}</select>
-        </div>
-        <div class="form-group" style="margin:0">
-          <label>Output VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· liability</span></label>
-          <input id="bf-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)">
-        </div>
-        <div class="form-group" style="margin:0">
-          <label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· credit</span></label>
-          <input id="bf-input-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)">
-        </div>
-      </div>`;
-    })()}
+    <div style="display:grid;grid-template-columns:1fr 1.4fr;gap:12px;margin-bottom:10px;align-items:end">
+      <div class="form-group" style="margin:0">
+        <label>Post Date</label>
+        <input id="bf-date" type="date" value="${defaultPostDate}" title="When the backfill transactions will be dated. The month being backfilled is taken from this date.">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Cash Account</label>
+        <select id="bf-acct" title="Where this period's net cash lands or leaves">${acctOpts}</select>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:6px;align-items:end">
+      <div class="form-group" style="margin:0">
+        <label>Output VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">liability</span></label>
+        <input id="bf-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)" title="VAT you owe BIR — stripped from revenue, posted as l2100 liability">
+      </div>
+      <div class="form-group" style="margin:0">
+        <label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">claimable</span></label>
+        <input id="bf-input-vat" type="number" step="0.01" min="0" placeholder="0.00" style="text-align:right;font-family:var(--fm)" title="VAT you paid suppliers — claimable as a1080 asset against Output VAT">
+      </div>
+    </div>
     <div style="max-height:58vh;overflow-y:auto;padding-right:8px;border-top:1px solid var(--border);margin-top:6px;padding-top:2px">
       ${sectionsHtml}${extraHtml}
     </div>
@@ -8198,33 +8199,21 @@ function submitGiveAdvance(){
     note:document.getElementById('m-adv-note')?.value
   });
 }
-/* ─── HISTORICAL MONTH BACKFILL ───
+/* ─── HISTORICAL AGGREGATE BACKFILL ───
    Posts one aggregate transaction per non-zero COA line, all dated to the
-   user-chosen Post Date (defaults to last day of selected month). Used to
-   populate P&L for periods before daily DSR tracking, or to backfill a single
-   payroll cutoff at its own posting date (e.g., the 15th for 1st-cutoff wages).
+   user-chosen Post Date. Used to populate P&L for periods before daily DSR
+   tracking, or to batch-post a payroll cutoff at its own date (e.g., the
+   15th for 1st-cutoff wages). The period being backfilled is derived from
+   the date — no separate "Month" input.
    Revenue → 'sale' txs; COGS/Labor/OpEx → 'expense' txs (status paid). */
 function submitBackfillMonth(){
-  const monthVal=document.getElementById('bf-month')?.value;
-  if(!monthVal){toast('Pick a month','error');return}
+  const date=document.getElementById('bf-date')?.value;
+  if(!date){toast('Pick a Post Date','error');return}
   const acctId=document.getElementById('bf-acct')?.value;
-  if(!acctId){toast('Pick an account','error');return}
-  const [y,m]=monthVal.split('-').map(Number);
-  /* Post date: user-configurable. Default (set by the modal) is last-day-of-month;
-     user can override to e.g. payday for a cutoff-specific backfill. Fall back to
-     last day if the field is somehow blank. */
-  let date=document.getElementById('bf-date')?.value;
-  if(!date){
-    const lastDay=new Date(y,m,0);
-    date=`${y}-${String(m).padStart(2,'0')}-${String(lastDay.getDate()).padStart(2,'0')}`;
-  }
-  /* Friendly warning if the post date isn't within the selected month — user
-     might have changed Month but forgotten to update Date. Not blocked (some
-     scenarios legitimately span months — e.g., the May 1st-cutoff payday is
-     May 15 but the cutoff covered Apr 26-May 10). Just confirm so it's deliberate. */
-  if(!date.startsWith(monthVal)){
-    if(!confirm(`Heads-up: Post Date (${fmtDate(date)}) is outside the selected Month (${monthVal}). The transactions will be dated to ${fmtDate(date)} regardless. Proceed?`)) return;
-  }
+  if(!acctId){toast('Pick a cash account','error');return}
+  /* monthKey derived from the date — used for tx-note labelling so the user
+     can later identify which backfill batch a tx came from. */
+  const monthKey=date.slice(0,7);
   if(isPeriodLocked(date)){toast(`Period locked for ${fmtDate(date)} — unlock first`,'error');return}
   const txs=[];
   let totalRevenue=0, totalExpense=0;
@@ -8247,7 +8236,7 @@ function submitBackfillMonth(){
     txs.push({
       date, type:txType, coaId:c.id, category:c.name,
       account:acctId, amount:amt,
-      note:`Backfill — ${monthVal} aggregate`,
+      note:`Backfill — ${monthKey} aggregate`,
       status:'paid', handler:currentUser
     });
   });
@@ -8259,7 +8248,7 @@ function submitBackfillMonth(){
     txs.push({
       date, type:'dsr_adjustment', coaId:'l2100', category:'VAT Payable',
       account:acctId, amount:vatAmt,
-      note:`Backfill — ${monthVal} output VAT`,
+      note:`Backfill — ${monthKey} output VAT`,
       status:'paid', handler:currentUser
     });
   }
@@ -8272,7 +8261,7 @@ function submitBackfillMonth(){
     txs.push({
       date, type:'withdrawal', coaId:'a1080', category:'Input VAT',
       account:acctId, amount:inputVatAmt,
-      note:`Backfill — ${monthVal} input VAT`,
+      note:`Backfill — ${monthKey} input VAT`,
       status:'paid', handler:currentUser
     });
   }
@@ -8284,7 +8273,7 @@ function submitBackfillMonth(){
      wizard takes net for P&L lines); Input VAT is the additional cash that left for
      the VAT portion of purchases. Output VAT is cash-neutral (already inside revenue). */
   const cashImpact=round2(totalRevenue-totalExpense-inputVatAmt);
-  if(!confirm(`Post ${txs.length} aggregate transaction${txs.length===1?'':'s'} for ${monthVal} (dated ${fmtDate(date)})?\n\n`+
+  if(!confirm(`Post ${txs.length} aggregate transaction${txs.length===1?'':'s'} for ${monthKey} (dated ${fmtDate(date)})?\n\n`+
     `• Gross Revenue: ${fmt(totalRevenue)}\n`+
     (vatAmt>0?`• Output VAT:    −${fmt(vatAmt)} (stripped, liability)\n`:'')+
     `• Net Revenue:   ${fmt(netRevenue)}\n`+
@@ -8296,9 +8285,9 @@ function submitBackfillMonth(){
   createLedgerBatch(txs);
   /* Refresh metric snapshots for the backfilled month so the history reflects it. */
   try{ persistMetricsForDate(date); }catch(e){ console.warn('persistMetricsForDate failed',e); }
-  logActivity(`Backfilled ${monthVal}: ${txs.length} entries · net ${fmt(netProfit)}`);
+  logActivity(`Backfilled ${monthKey}: ${txs.length} entries · net ${fmt(netProfit)}`);
   closeModal();
-  toast(`Backfilled ${monthVal} — ${txs.length} entries posted ✓`,'success');
+  toast(`Backfilled ${monthKey} — ${txs.length} entries posted ✓`,'success');
 }
 function deleteCashAdvance(id){
   const adv=(cashAdvances||[]).find(a=>a&&a.id===id);
