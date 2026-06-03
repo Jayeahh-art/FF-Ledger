@@ -8485,7 +8485,11 @@ function pgLabor(){
   const vd=window._laborDate||today();const co=getCutoffPeriod(vd);const at=_laborTab||'shifts';
   const tabs2=[['shifts','Shifts & Hours'],['payroll','Payroll'],['history','Payroll History'],['holidays','Holidays'],['roster','Roster']];
   const tabBar=`<div class="tab-bar" style="margin-bottom:14px">${tabs2.map(([v,l])=>`<div class="tab ${at===v?'active':''}" onclick="_laborTab='${v}';renderMain()">${l}</div>`).join('')}</div>`;
-  const hdr=`<div class="page-header"><div class="page-hd-left"><div class="page-title">Labor</div><div class="page-sub">Cut-off: <b>${co.label}</b> · Pay day: <b>${fmtDate(co.payDay)}</b></div></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="openModal('addShift')">+ Log Shift</button><button class="btn btn-ghost btn-sm" onclick="openModal('addRoster')">+ Add Employee</button><button class="btn btn-ghost btn-sm" onclick="openModal('payrollSettings')">⚙ Payroll Settings</button></div></div>`;
+  const hdr=`<div class="page-header"><div class="page-hd-left"><div class="page-title">Labor</div><div class="page-sub">Cut-off: <b>${co.label}</b> · Pay day: <b>${fmtDate(co.payDay)}</b></div></div><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+    <span style="font-size:.72rem;color:var(--muted2);font-weight:500">Jump to:</span>
+    <input type="date" value="${vd}" onchange="window._laborDate=this.value;renderMain()" title="Jump to a different date — the cut-off below auto-updates to the period containing this date" style="font-size:.78rem;padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg)">
+    ${vd!==today()?`<button class="btn btn-ghost btn-xs" onclick="window._laborDate=null;renderMain()" title="Jump back to today">↺ Today</button>`:''}
+    <button class="btn btn-primary btn-sm" onclick="openModal('addShift')">+ Log Shift</button><button class="btn btn-ghost btn-sm" onclick="openModal('addRoster')">+ Add Employee</button><button class="btn btn-ghost btn-sm" onclick="openModal('payrollSettings')">⚙ Payroll Settings</button></div></div>`;
   if(at==='shifts')return hdr+tabBar+renderShiftsTab(vd,co);
   if(at==='payroll')return hdr+tabBar+renderPayrollTab(co);
   if(at==='history')return hdr+tabBar+renderPayrollHistoryTab();
