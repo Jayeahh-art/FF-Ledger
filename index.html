@@ -5991,9 +5991,23 @@ ${(()=>{
   };
   const vals=periodMetrics.map(p=>pickVal(p.m));
   const maxV=Math.max(...vals.map(Math.abs),1);
-  const H=130, W=600;
-  const bw=Math.min(50, (W-40)/count - 6);
+  /* Wider viewBox (1000 vs old 600) so weekly labels have horizontal room and
+     font-size scales up proportionally with the card width. Taller too (160 vs
+     130) to give the value labels above bars some breathing room. */
+  const H=160, W=1000;
+  const bw=Math.min(60, (W-40)/count - 8);
   const barX=i=>20 + i*((W-40)/count) + ((W-40)/count - bw)/2;
+  /* Use START-OF-PERIOD short label for weeks (e.g., "Mar 16" instead of the
+     full "Mar 16 – Mar 22"). The cadence is implied by the lens — users don't
+     need both dates to read a weekly bar. Monthly/quarter/year keep the existing
+     label which is already concise ("May", "Q2 2025", "2025"). */
+  const trendLabel=p=>{
+    if(dashLens.gran==='week'){
+      try{ return new Date(p.from+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}); }
+      catch(e){ return p.label||''; }
+    }
+    return p.label||'';
+  };
   const tabs=[
     ['revenue','Net Revenue','#22c55e'],
     ['netProfit','Net Profit','#3b82f6'],
@@ -6010,12 +6024,12 @@ ${(()=>{
       </div>
     </div>
     <div style="padding:14px">
-      <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px">
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="xMidYMid meet">
         ${periodMetrics.map((p,i)=>{
-          const v=pickVal(p.m), h=(Math.abs(v)/maxV)*(H-38), y=H-22-h, x=barX(i);
+          const v=pickVal(p.m), h=(Math.abs(v)/maxV)*(H-46), y=H-28-h, x=barX(i);
           return `<rect x="${x}" y="${y}" width="${bw}" height="${h}" fill="${activeColor}" rx="3" opacity="${i===periodMetrics.length-1?'1':'0.7'}"/>
-            <text x="${x+bw/2}" y="${y-3}" font-size="9" fill="var(--muted)" text-anchor="middle" font-weight="600">${isPct?v.toFixed(1)+'%':fmt(v).replace('PHP','')}</text>
-            <text x="${x+bw/2}" y="${H-6}" font-size="8" fill="var(--muted2)" text-anchor="middle">${p.label}</text>`;
+            <text x="${x+bw/2}" y="${y-4}" font-size="12" fill="var(--muted)" text-anchor="middle" font-weight="600">${isPct?v.toFixed(1)+'%':fmt(v).replace('PHP','')}</text>
+            <text x="${x+bw/2}" y="${H-8}" font-size="11" fill="var(--muted2)" text-anchor="middle">${trendLabel(p)}</text>`;
         }).join('')}
       </svg>
     </div>
