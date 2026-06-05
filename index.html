@@ -1240,6 +1240,11 @@ let filters={type:'',search:'',dateFrom:'',dateTo:''};
 let txPage=1, txPerPage=50;
 /* Activity Log pagination — same pattern as transactions. UI state, not persisted. */
 let actPage=1, actPerPage=50;
+/* Payables pagination — two independent paginators: one for the "Loans & Debts"
+   table (manual payables array) and one for the "Unpaid Expenses" table (accrual
+   from unpaid expense txs). UI state, not persisted. */
+let payPage=1, payPerPage=25;
+let accrPage=1, accrPerPage=25;
 let reportPeriod='month';
 let reportTab='pl'; /* 'pl' | 'balance' | 'cashflow' */
 /* Global date filter — affects all pages */
@@ -2756,78 +2761,143 @@ const leanOpsService={
     return financialService.getMetrics(tx);
   },
 
-  getBreakEvenStatus(){
-    const tx=(transactions||[]).filter(txInRange);
-    const metrics=financialService.getMetrics(tx);
+  /* Break-even calc. Improved over the prior 85%-flat-heuristic version:
+       1. Treats Management Salaries (coaId x6200) as FIXED labor (salaried, not
+          tied to volume) and FOH/BOH wages as VARIABLE. The old code lumped all
+          labor as variable → inflated variableRatio → overstated break-even.
+       2. Edge-case fix: when variable cost ≥ revenue (losing money on every sale),
+          break-even is mathematically unreachable. Old code returned 0 (falsely
+          implying you were above break-even). Now returns Infinity + flags it.
+       3. Accepts an optional `tx` arg so the dashboard can pass its lens-filtered
+          txs instead of always using the global filter. */
+  getBreakEvenStatus(txParam){
+    const tx = txParam || (transactions||[]).filter(txInRange);
+    const metrics = financialService.getMetrics(tx);
+    const active = tx.filter(t => t && !t.voided);
 
-    const fixedExpenses=(metrics.operatingExpenses||0)*0.85;
-    const variableRatio=((metrics.cogs||0)+(metrics.labor||0))/Math.max(metrics.netRevenue||1,1);
+    /* Split labor: management = fixed, FOH/BOH = variable. */
+    const mgtLabor = active
+      .filter(t => t.coaId==='x6200' || t.category==='Management Salaries')
+      .reduce((s,t)=>s+(Number(t.amount)||0),0);
+    const variableLabor = Math.max(0, (metrics.labor||0) - mgtLabor);
 
-    const breakEvenSales=variableRatio>=1
-      ? 0
-      : fixedExpenses/(1-variableRatio);
+    /* Opex split: still use the 85/15 heuristic for opex line items since the
+       user hasn't tagged most txs as fixed/variable explicitly. MGT labor is
+       added on top as fixed (real classification, not heuristic). */
+    const opex = metrics.operatingExpenses || 0;
+    const fixedOpex = opex * 0.85;
+    const variableOpex = opex * 0.15;
 
-    const safetyMargin=(metrics.netRevenue||0)-breakEvenSales;
+    const fixedExpenses = mgtLabor + fixedOpex;
+    const variableCost = (metrics.cogs||0) + variableLabor + variableOpex;
+    const variableRatio = (metrics.netRevenue||0) > 0
+      ? variableCost / metrics.netRevenue
+      : 0;
 
-    return{
+    let breakEvenSales, aboveBreakEven, safetyMargin;
+    if (variableRatio >= 1) {
+      /* Variable cost ≥ revenue means every sale loses money. Break-even is
+         literally unreachable; no volume of sales gets you out. */
+      breakEvenSales = Infinity;
+      aboveBreakEven = false;
+      safetyMargin = -fixedExpenses; /* entire fixed cost is unrecoverable */
+    } else {
+      breakEvenSales = fixedExpenses / (1 - variableRatio);
+      aboveBreakEven = (metrics.netRevenue||0) >= breakEvenSales;
+      safetyMargin = (metrics.netRevenue||0) - breakEvenSales;
+    }
+
+    return {
       fixedExpenses,
       variableRatio,
       breakEvenSales,
       safetyMargin,
-      aboveBreakEven:safetyMargin>=0
+      aboveBreakEven,
+      mgtLabor,        /* surfaced for transparency / debugging */
+      variableLabor,
+      unreachable: !isFinite(breakEvenSales)
     };
   },
 
-  generateLeanAlerts(){
+  /* generateLeanAlerts — now lens-aware and target-aware.
+       - Accepts optional overrides {metrics, breakEvenStatus, laborP, primeP,
+         pendingObligations} so the dashboard can pass its lens metrics + shift-
+         based labor/prime. Without overrides, falls back to globalDate + posted
+         (backwards-compatible for ensureDailySnapshot).
+       - Thresholds read from kpiTargets (defaults: labor 32%, prime 62%) instead
+         of hardcoded 35/65. Honors user discipline.
+       - Cash stress checks against treasuryService._getObligations().total
+         (pending wages + accrued + payables due), not just pending wages. */
+  generateLeanAlerts(opts){
+    opts = opts || {};
+    const tx = (transactions||[]).filter(txInRange);
+    const m = opts.metrics || financialService.getMetrics(tx);
+    const be = opts.breakEvenStatus || this.getBreakEvenStatus();
 
-    const tx=(transactions||[]).filter(txInRange);
-    const metrics=financialService.getMetrics(tx);
-    const be=this.getBreakEvenStatus();
+    /* Labor / Prime to evaluate: prefer shift-based if caller passed them,
+       else use posted from metrics. Shift-based eliminates payday spike false
+       alarms (same fix the dashboard trend chart applies). */
+    const laborToCheck = (typeof opts.laborP === 'number') ? opts.laborP : (m.laborP||0);
+    const primeToCheck = (typeof opts.primeP === 'number') ? opts.primeP : (m.primeP||0);
 
-    const alerts=[];
+    /* Thresholds from user-configured targets. If user tightens to 28% for
+       discipline, alerts fire at 28%, not at the old hardcoded 35%. */
+    const laborTarget = (kpiTargets && kpiTargets.laborP && kpiTargets.laborP.target) || 32;
+    const primeTarget = (kpiTargets && kpiTargets.primeCostP && kpiTargets.primeCostP.target) || 62;
 
-    if(metrics.laborP>35){
+    const alerts = [];
+
+    if (laborToCheck > laborTarget) {
       alerts.push({
-        level:'warn',
-        title:'Labor Pressure',
-        body:`Labor at ${metrics.laborP.toFixed(1)}% exceeds target.`
+        level: 'warn',
+        title: 'Labor Pressure',
+        body: `Labor at ${laborToCheck.toFixed(1)}% exceeds target of ${Number(laborTarget).toFixed(1)}%.`
       });
     }
 
-    if(metrics.primeP>65){
+    if (primeToCheck > primeTarget) {
       alerts.push({
-        level:'warn',
-        title:'Prime Cost Pressure',
-        body:`Prime cost at ${metrics.primeP.toFixed(1)}% exceeds safe range.`
+        level: 'warn',
+        title: 'Prime Cost Pressure',
+        body: `Prime cost at ${primeToCheck.toFixed(1)}% exceeds target of ${Number(primeTarget).toFixed(1)}%.`
       });
     }
 
-    if(!be.aboveBreakEven){
+    if (!be.aboveBreakEven) {
+      const detail = be.unreachable
+        ? 'Variable cost exceeds revenue — every sale loses money.'
+        : `Sales are below break-even by ${fmt(Math.abs(be.safetyMargin))}.`;
       alerts.push({
-        level:'bad',
-        title:'Below Break-Even',
-        body:`Sales are below break-even by ${fmt(Math.abs(be.safetyMargin))}.`
+        level: 'bad',
+        title: 'Below Break-Even',
+        body: detail
       });
     }
 
+    /* Cash stress — compares operational liquidity against the FULL obligation
+       set, not just pending payroll. Pre-fix: missed payables-due, accrued
+       supplier credit, and the Input VAT half of unpaid expense pairs. Now
+       routes through the same _getObligations the Cash Position page uses. */
     const availableCash = treasuryService.getOperationalLiquidity();
-
-    /* Pending payroll = wages accrued at cutoff but not yet paid out (unpaid wage
-       expense txs tagged to a payroll run). SC/Tips settle at finalize so they're
-       already out of cash and not pending. */
-    const pendingPayroll=(transactions||[])
-      .filter(t=>t&&t.payrollRunId&&t.type==='expense'&&t.status==='unpaid'&&!t.voided)
-      .reduce((s,t)=>s+(parseFloat(t.amount)||0),0);
-
-    if(pendingPayroll>0 && availableCash<pendingPayroll){
+    let obligationsTotal;
+    if (typeof opts.pendingObligations === 'number') {
+      obligationsTotal = opts.pendingObligations;
+    } else {
+      try {
+        obligationsTotal = (treasuryService._getObligations() || {}).total || 0;
+      } catch (e) {
+        obligationsTotal = 0;
+      }
+    }
+    if (obligationsTotal > 0 && availableCash < obligationsTotal) {
       alerts.push({
-        level:'bad',
-        title:'Payroll Stress',
-        body:'Available cash may not cover pending payroll obligations.'
+        level: 'bad',
+        title: 'Cash Stress',
+        body: `Available cash (${fmt(availableCash)}) won't cover pending obligations (${fmt(obligationsTotal)}).`
       });
     }
 
-    return alerts.slice(0,4);
+    return alerts.slice(0, 4);
   },
 
   /* ── Phase 3C: Labor Efficiency ── */
@@ -3824,10 +3894,29 @@ function appendAudit(action,tx){
 }
 function updateOpeningCash(amount,countedBy='',verifiedBy=''){
   const previous=Number(openingCashState.amount||0);
-  openingCashState={amount:Number(amount||0),lastUpdated:new Date().toISOString(),countedBy,verifiedBy};
-  localStorage.setItem('opening_liquidity',openingCashState.amount);
-  const variance=openingCashState.amount-previous;
-  cashVarianceHistory.unshift({id:uid(),timestamp:new Date().toISOString(),previous,current:openingCashState.amount,variance,countedBy,verifiedBy});
+  const next=Number(amount||0);
+  const delta=next-previous;
+  /* openingCashState is the anchor for treasury-wide reconciliation:
+       expectedCash = openingCashState + ALL inflows ever - ALL outflows ever
+     So editing it RETROACTIVELY shifts the reconciliation variance for every
+     historical period. If the change is non-trivial AND there's existing
+     transaction history, confirm so the user knows what they're about to do. */
+  const hasHistory=Array.isArray(transactions) && transactions.some(t=>t&&!t.voided);
+  if(hasHistory && Math.abs(delta)>=0.01 && previous!==0){
+    if(typeof confirm==='function' && !confirm(
+      `⚠ Changing opening cash from ${fmt(previous)} to ${fmt(next)} (Δ ${delta>=0?'+':''}${fmt(delta)}).\n\n`+
+      `This is the anchor for treasury reconciliation across ALL history. Every prior month's\n`+
+      `"expected cash" and "variance" figures will shift by ${fmt(delta)}.\n\n`+
+      `Only change this if you really mean to correct the all-time starting balance.\n`+
+      `For monthly opening balances, use the Cash Position page's "Apply as opening" instead.\n\n`+
+      `Proceed?`
+    )){
+      return; /* user cancelled — leave state untouched */
+    }
+  }
+  openingCashState={amount:next,lastUpdated:new Date().toISOString(),countedBy,verifiedBy};
+  try{ localStorage.setItem('opening_liquidity',openingCashState.amount); }catch(e){}
+  cashVarianceHistory.unshift({id:uid(),timestamp:new Date().toISOString(),previous,current:openingCashState.amount,variance:delta,countedBy,verifiedBy});
 }
 function exportDashboardPDF(){
   const budgetRevenue = Number(
@@ -5597,9 +5686,9 @@ function pgDashboard(){
   const runway       = treasuryService.getRunway();
   const availableCash= treasuryService.getAvailableCash();
 
-  /* Break-even */
-  const leanBreakEven = leanOpsService.getBreakEvenStatus();
-  const leanAlerts    = leanOpsService.generateLeanAlerts();
+  /* (leanBreakEven + leanAlerts moved DOWN — they now depend on twShiftLaborP /
+     twShiftPrimeP which are computed later in the function. Old position here
+     would hit a temporal dead zone ReferenceError on render.) */
 
   /* Bars adapt to the lens granularity: week→by day, month→by week, qtr/year→by month. */
   const curBuckets = getLensBuckets(dashLens.gran, currentRange);
@@ -5725,17 +5814,46 @@ function pgDashboard(){
      of the dashboard. The legacy `m` (top-global-filter metrics) is still
      available for cross-page comparisons but no longer drives dashboard KPIs. */
   const periodCogsP = tw.cogsP||0;
-  const periodLaborP = tw.laborP||0;
-  const periodPrimeP = tw.primeP||0;
   const grossProfitP = tw.netRevenue>0 ? (tw.grossProfit/tw.netRevenue)*100 : 0;
+  /* periodLaborP / periodPrimeP defined AFTER twShiftLabor below — they now use
+     the shift-based values so KPI cards + donuts match the trend chart. */
 
-  /* Live labor from logged shifts (this/last week) — operational estimate that
-     updates before payroll is finalized. Posted labor (tw.laborP) stays the
-     accounting figure; this is shown as a separate row in Cost Controls. */
+  /* Shift-based labor for the operational dashboard view (KPI cards, donuts,
+     trend chart, Prime Cost, EBITDA). Spreads each shift's pay across the days
+     work actually happened — no payday spikes from posted lump wages. Posted
+     labor (tw.laborP) is still shown in the WoW table as a "(posted)" row for
+     reference, and Reports → P&L continues to use posted for accounting. */
   const twShiftLabor = thisWeekDates.reduce((s,d)=>s+dayLaborCostFromShifts(d),0);
   const lwShiftLabor = lastWeekDates.reduce((s,d)=>s+dayLaborCostFromShifts(d),0);
   const twShiftLaborP = tw.netRevenue>0 ? (twShiftLabor/tw.netRevenue*100) : 0;
   const lwShiftLaborP = lw.netRevenue>0 ? (lwShiftLabor/lw.netRevenue*100) : 0;
+  /* Prime Cost = COGS + Labor. Swap labor for shift-based; keep posted COGS
+     (DSR posts COGS daily already, no spike). */
+  const twShiftPrimeP = tw.netRevenue>0 ? ((twShiftLabor + (tw.cogs||0))/tw.netRevenue*100) : 0;
+  const lwShiftPrimeP = lw.netRevenue>0 ? ((lwShiftLabor + (lw.cogs||0))/lw.netRevenue*100) : 0;
+  /* EBITDA = grossProfit - labor - opex. Swap labor: take posted ebitda, add
+     posted labor back, subtract shift labor. Same trick as the trend chart's
+     netProfitLive — no need to re-derive every component. */
+  const twShiftEbitda = (tw.ebitda||0) + (tw.labor||0) - twShiftLabor;
+  const lwShiftEbitda = (lw.ebitda||0) + (lw.labor||0) - lwShiftLabor;
+  /* periodLaborP / periodPrimeP: now the shift-based versions so KPI cards +
+     donuts show the operational view (matching the trend chart). The posted
+     versions are still surfaced in the WoW table for accounting reference. */
+  const periodLaborP = twShiftLaborP;
+  const periodPrimeP = twShiftPrimeP;
+
+  /* Break-even and alerts — both now use the dashboard's LENS period (tw / twTx)
+     instead of the global date filter, so the alerts evaluate the same data the
+     KPI cards are showing. Passing shift-based labor/prime so payday spikes
+     don't trigger false "Labor Pressure" alerts. Placed here (after the
+     twShift* declarations) because earlier placement hit the TDZ. */
+  const leanBreakEven = leanOpsService.getBreakEvenStatus(twTx);
+  const leanAlerts    = leanOpsService.generateLeanAlerts({
+    metrics: tw,
+    breakEvenStatus: leanBreakEven,
+    laborP: twShiftLaborP,
+    primeP: twShiftPrimeP
+  });
 
   /* ops status bar */
   const close = getDailyCloseStatus();
@@ -5815,7 +5933,7 @@ function pgDashboard(){
 
   <div class="card">
     <div class="stat-label">Prime Cost</div>
-    <div class="stat-value" style="font-size:1.05rem;color:${tw.primeP<=62?'var(--green)':tw.primeP<=68?'var(--amber)':'var(--red)'}">${(tw.primeP||0).toFixed(1)}%</div>
+    <div class="stat-value" style="font-size:1.05rem;color:${periodPrimeP<=62?'var(--green)':periodPrimeP<=68?'var(--amber)':'var(--red)'}">${periodPrimeP.toFixed(1)}%</div>
     <div class="stat-sub" style="color:${wowPrime<=0?'var(--green)':'var(--red)'}">
       ${wowPrime<=0?'▼':'▲'} ${Math.abs(wowPrime).toFixed(1)}pp ${deltaLabel}
     </div>
@@ -5835,9 +5953,11 @@ function pgDashboard(){
 
   <div class="card" style="${leanBreakEven.aboveBreakEven?'border-left:3px solid var(--green)':'border-left:3px solid var(--red)'}">
     <div class="stat-label">Break-Even</div>
-    <div class="stat-value" style="font-size:1.05rem">${fmt(leanBreakEven.breakEvenSales||0)}</div>
+    <div class="stat-value" style="font-size:1.05rem">${leanBreakEven.unreachable?'<span style="color:var(--red);font-size:.85rem">Unreachable</span>':fmt(leanBreakEven.breakEvenSales||0)}</div>
     <div class="stat-sub" style="color:${leanBreakEven.safetyMargin>=0?'var(--green)':'var(--red)'}">
-      ${leanBreakEven.safetyMargin>=0?'▲ '+fmt(leanBreakEven.safetyMargin)+' cushion':'▼ '+fmt(Math.abs(leanBreakEven.safetyMargin))+' short'}
+      ${leanBreakEven.unreachable?'Every sale loses money (variable cost > revenue)'
+        :leanBreakEven.safetyMargin>=0?'▲ '+fmt(leanBreakEven.safetyMargin)+' cushion'
+        :'▼ '+fmt(Math.abs(leanBreakEven.safetyMargin))+' short'}
     </div>
   </div>
 
@@ -5892,10 +6012,10 @@ function pgDashboard(){
         <td colspan="6" style="padding:4px 10px;font-size:.63rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)">Cost Controls</td>
       </tr>
       ${wowRow('Food Cost (COGS%)', tw.cogsP, lw.cogsP, budgetCogsP, false, true)}
-      ${wowRow('Labor Cost % (posted)', tw.laborP, lw.laborP, budgetLaborP, false, true)}
-      ${(twShiftLabor>0||lwShiftLabor>0)?wowRow('Labor Cost % (live · shifts)', twShiftLaborP, lwShiftLaborP, budgetLaborP, false, true):''}
-      ${wowRow('Prime Cost %', tw.primeP, lw.primeP, budgetPrimeP, false, true)}
-      ${wowRow('EBITDA', tw.ebitda, lw.ebitda, 0, true, false)}
+      ${wowRow('Labor Cost % (operational · live shifts)', twShiftLaborP, lwShiftLaborP, budgetLaborP, false, true)}
+      ${wowRow('Labor Cost % (posted · accounting)', tw.laborP, lw.laborP, budgetLaborP, false, true)}
+      ${wowRow('Prime Cost %', twShiftPrimeP, lwShiftPrimeP, budgetPrimeP, false, true)}
+      ${wowRow('EBITDA', twShiftEbitda, lwShiftEbitda, 0, true, false)}
     </tbody>
   </table>
 </div>
@@ -5989,23 +6109,35 @@ ${(()=>{
        operational trend chart switches to live shifts. */
     let shiftLabor=0;
     let d=p.from, _safety=0;
-    while(d<=p.to && _safety<400){
+    /* _safety cap was 400 (covered weekly/monthly/quarterly periods up to ~13mo).
+       Bumped to 2500 so multi-year periods don't get silently chopped — a yearly
+       trend showing 3 years iterates ~1100 days per period. Cap stays as a
+       runaway-loop guard, just sized generously. */
+    while(d<=p.to && _safety<2500){
       shiftLabor += dayLaborCostFromShifts(d) || 0;
       d=addDays(d,1);
       _safety++;
     }
     const shiftLaborP = m.netRevenue>0 ? (shiftLabor/m.netRevenue)*100 : 0;
     const primeLiveP  = m.netRevenue>0 ? ((shiftLabor + (m.cogs||0)) / m.netRevenue) * 100 : 0;
-    return {...p, m, shiftLabor, shiftLaborP, primeLiveP};
+    /* Net Profit using shift-based labor — swap posted labor for shift labor
+       in the net-profit formula. m.netProfit already subtracts m.labor (posted),
+       so adding m.labor back and subtracting shiftLabor gives the live version
+       without re-deriving all other components. Same reasoning as labor %:
+       payday lumps distort the weekly read; shifts spread the cost honestly. */
+    const netProfitLive = (m.netProfit||0) + (m.labor||0) - shiftLabor;
+    return {...p, m, shiftLabor, shiftLaborP, primeLiveP, netProfitLive};
   });
   const isPct = dashTrendMetric==='laborP' || dashTrendMetric==='primeP' || dashTrendMetric==='cogsP';
   const pickVal = p => {
     if(dashTrendMetric==='revenue') return p.m.netRevenue||0;
-    if(dashTrendMetric==='netProfit') return p.m.netProfit||0;
     if(dashTrendMetric==='cogsP') return p.m.cogsP||0;
-    /* Labor and Prime: use shift-based numbers (smooth) instead of posted (spiky on payday). */
+    /* Labor, Prime, Net Profit: use shift-based labor (smooth) instead of posted
+       (spiky on payday). Same reasoning everywhere — operational dashboard wants
+       reality, Reports → P&L keeps posted for accounting compliance. */
     if(dashTrendMetric==='laborP') return p.shiftLaborP||0;
     if(dashTrendMetric==='primeP') return p.primeLiveP||0;
+    if(dashTrendMetric==='netProfit') return p.netProfitLive||0;
     return 0;
   };
   const vals=periodMetrics.map(p=>pickVal(p));
@@ -6035,9 +6167,12 @@ ${(()=>{
     ['primeP','Prime %','#ef4444']
   ];
   const activeColor=(tabs.find(t=>t[0]===dashTrendMetric)||tabs[0])[2];
+  /* Show the footnote only when the active metric uses shift-based labor —
+     pure-posted metrics (Revenue, COGS %) don't need the disclaimer. */
+  const _showShiftNote = (dashTrendMetric==='laborP' || dashTrendMetric==='primeP' || dashTrendMetric==='netProfit');
   return `<div class="card-flush" style="margin-bottom:14px">
     <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap">
-      <span class="sec-title">Trend — last ${count} ${dashLens.gran}${count>1?'s':''}</span>
+      <span class="sec-title">Trend — last ${count} ${dashLens.gran}${count>1?'s':''}${_showShiftNote?` <span style="font-size:.66rem;font-weight:500;color:var(--muted2);text-transform:none;letter-spacing:0;margin-left:6px">· labor from logged shifts (smooth) — may differ from Reports → P&L which uses posted wages</span>`:''}</span>
       <div style="display:flex;gap:0;margin-left:auto;border:1px solid var(--border2);border-radius:5px;overflow:hidden">
         ${tabs.map(([v,l,c])=>`<button onclick="setDashTrend('${v}')" style="padding:3px 9px;border:none;background:${dashTrendMetric===v?c:'transparent'};color:${dashTrendMetric===v?'#fff':'var(--text)'};font-size:.7rem;font-weight:${dashTrendMetric===v?'600':'500'};cursor:pointer">${l}</button>`).join('')}
       </div>
@@ -9105,12 +9240,52 @@ function pgPayables(){
   const totalManual=payables.filter(p=>p.status!=='paid').reduce((s,p)=>s+p.balance,0);
   const totalOwed=totalAccrual+totalManual;
   const openPayables=payables.filter(p=>p.status!=='paid');
-  const payableRows=openPayables.length?openPayables.map(p=>{const overdue=p.dueDate&&p.dueDate<today();return`<tr style="${overdue?'background:var(--red-bg)':''}"><td style="font-size:.82rem;font-weight:500">${esc(p.name)}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(p.type||'')}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(p.supplier||'')}</td><td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(p.balance)}</td><td style="font-size:.76rem;color:${overdue?'var(--red)':'var(--muted2)'}">${p.dueDate?fmtDate(p.dueDate)+(overdue?' ⚠':''):'—'}</td><td><div class="row-actions"><button class="btn btn-primary btn-xs" onclick="payPayable('${p.id}')">Pay</button><button class="btn btn-ghost btn-xs" onclick="editPayable('${p.id}')">Edit</button><button class="row-btn del" onclick="deletePayable('${p.id}')">✕</button></div></td></tr>`}).join(''):`<tr><td colspan="6" class="empty">No open payables</td></tr>`;
-  const accrualRows=accrualPayables.length?accrualPayables.map(t=>`<tr><td style="font-size:.82rem">${esc(t.category)}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(t.supplier||'—')}</td><td style="font-size:.76rem;color:var(--muted2)">${fmtDate(t.date)}</td><td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(t.amount)}</td><td style="font-size:.76rem;color:${t.dueDate&&t.dueDate<today()?'var(--red)':'var(--muted2)'}">${t.dueDate?fmtDate(t.dueDate):fmtDate(t.date)}</td><td><button class="btn btn-primary btn-xs" onclick="markExpensePaid('${t.id}')">Pay Now</button></td></tr>`).join(''):`<tr><td colspan="6" class="empty">No unpaid expenses</td></tr>`;
+
+  /* Pagination helper — same shape as the Transactions / Activity Log pagers.
+     Returns the visible slice + a pager-control HTML string. */
+  const _paginate = (list, page, perPage, pageVarName) => {
+    const total = list.length;
+    const showAll = !perPage || perPage <= 0;
+    const totalPages = showAll ? 1 : Math.max(1, Math.ceil(total/perPage));
+    let p = page;
+    if (p > totalPages) p = totalPages;
+    if (p < 1) p = 1;
+    const start = showAll ? 0 : (p-1) * perPage;
+    const end = showAll ? total : Math.min(total, start + perPage);
+    const slice = list.slice(start, end);
+    const perPageVarName = pageVarName.replace('Page','PerPage');
+    const pagerBtn = (label, target, disabled, title) =>
+      `<button class="btn btn-ghost btn-xs" ${disabled?'disabled style="opacity:.35;cursor:not-allowed"':`onclick="${pageVarName}=${target};renderMain()"`} title="${title||''}">${label}</button>`;
+    const perPageOpts = [10,25,50,100,0].map(n =>
+      `<option value="${n}" ${perPage===n?'selected':''}>${n===0?'All':n+' / page'}</option>`).join('');
+    const pager = total>0 ? `<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-top:1px solid var(--border);font-size:.74rem;flex-wrap:wrap">
+      <span style="color:var(--muted)">Showing <b style="color:var(--text)">${start+1}</b>–<b style="color:var(--text)">${end}</b> of <b style="color:var(--text)">${total}</b></span>
+      ${!showAll && totalPages>1 ? `<div style="display:flex;align-items:center;gap:4px;margin-left:auto">
+        ${pagerBtn('« First',1,p<=1,'Jump to first')}
+        ${pagerBtn('‹ Prev',Math.max(1,p-1),p<=1,'Previous page')}
+        <span style="padding:0 8px;color:var(--muted)">Page <b style="color:var(--text)">${p}</b> of <b style="color:var(--text)">${totalPages}</b></span>
+        ${pagerBtn('Next ›',Math.min(totalPages,p+1),p>=totalPages,'Next page')}
+        ${pagerBtn('Last »',totalPages,p>=totalPages,'Jump to last')}
+      </div>`:'<div style="flex:1"></div>'}
+      <select onchange="${perPageVarName}=parseInt(this.value)||0;${pageVarName}=1;renderMain()" style="font-size:.72rem;padding:2px 6px;border-radius:4px;border:1px solid var(--border2);background:var(--bg);cursor:pointer">${perPageOpts}</select>
+    </div>` : '';
+    return { slice, pager };
+  };
+
+  const payPaged   = _paginate(openPayables,    payPage,  payPerPage,  'payPage');
+  const accrPaged  = _paginate(accrualPayables, accrPage, accrPerPage, 'accrPage');
+
+  const payableRows = payPaged.slice.length
+    ? payPaged.slice.map(p=>{const overdue=p.dueDate&&p.dueDate<today();return`<tr style="${overdue?'background:var(--red-bg)':''}"><td style="font-size:.82rem;font-weight:500">${esc(p.name)}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(p.type||'')}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(p.supplier||'')}</td><td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(p.balance)}</td><td style="font-size:.76rem;color:${overdue?'var(--red)':'var(--muted2)'}">${p.dueDate?fmtDate(p.dueDate)+(overdue?' ⚠':''):'—'}</td><td><div class="row-actions"><button class="btn btn-primary btn-xs" onclick="payPayable('${p.id}')">Pay</button><button class="btn btn-ghost btn-xs" onclick="editPayable('${p.id}')">Edit</button><button class="row-btn del" onclick="deletePayable('${p.id}')">✕</button></div></td></tr>`}).join('')
+    : `<tr><td colspan="6" class="empty">No open payables</td></tr>`;
+  const accrualRows = accrPaged.slice.length
+    ? accrPaged.slice.map(t=>`<tr><td style="font-size:.82rem">${esc(t.category)}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(t.supplier||'—')}</td><td style="font-size:.76rem;color:var(--muted2)">${fmtDate(t.date)}</td><td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(t.amount)}</td><td style="font-size:.76rem;color:${t.dueDate&&t.dueDate<today()?'var(--red)':'var(--muted2)'}">${t.dueDate?fmtDate(t.dueDate):fmtDate(t.date)}</td><td><button class="btn btn-primary btn-xs" onclick="markExpensePaid('${t.id}')">Pay Now</button></td></tr>`).join('')
+    : `<tr><td colspan="6" class="empty">No unpaid expenses</td></tr>`;
+
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Payables</div><div class="page-sub">Loans · Supplier credit · Accrued expenses</div></div><button class="btn btn-primary btn-sm" onclick="openModal('addPayable')">+ Add Payable</button></div>
 <div class="g3" style="margin-bottom:14px"><div class="card" style="border-left:3px solid var(--red)"><div class="stat-label">Total Outstanding</div><div class="stat-value red">${fmt(totalOwed)}</div><div class="stat-sub">${openPayables.length} loans/debts + ${accrualPayables.length} unpaid expenses</div></div><div class="card"><div class="stat-label">Loans & Debts</div><div class="stat-value red">${fmt(totalManual)}</div><div class="stat-sub">${openPayables.length} open</div></div><div class="card"><div class="stat-label">Unpaid Expenses</div><div class="stat-value red">${fmt(totalAccrual)}</div><div class="stat-sub">${accrualPayables.length} on credit</div></div></div>
-<div class="card-flush" style="margin-bottom:12px"><div style="padding:9px 13px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span class="sec-title">Loans & Debts</span><button class="btn btn-ghost btn-xs" onclick="openModal('addPayable')">+ Add</button></div><table><thead><tr><th>Name</th><th>Type</th><th>Creditor</th><th style="text-align:right">Balance</th><th>Due</th><th></th></tr></thead><tbody>${payableRows}</tbody></table></div>
-<div class="card-flush"><div style="padding:9px 13px;border-bottom:1px solid var(--border)"><span class="sec-title">Unpaid Expenses (On Credit)</span><span style="font-size:.74rem;color:var(--muted2);margin-left:8px">Click Pay Now when settled</span></div><table><thead><tr><th>Category</th><th>Supplier</th><th>Date</th><th style="text-align:right">Amount</th><th>Due</th><th></th></tr></thead><tbody>${accrualRows}</tbody></table></div>`;
+<div class="card-flush" style="margin-bottom:12px"><div style="padding:9px 13px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span class="sec-title">Loans & Debts</span><button class="btn btn-ghost btn-xs" onclick="openModal('addPayable')">+ Add</button></div><table><thead><tr><th>Name</th><th>Type</th><th>Creditor</th><th style="text-align:right">Balance</th><th>Due</th><th></th></tr></thead><tbody>${payableRows}</tbody></table>${payPaged.pager}</div>
+<div class="card-flush"><div style="padding:9px 13px;border-bottom:1px solid var(--border)"><span class="sec-title">Unpaid Expenses (On Credit)</span><span style="font-size:.74rem;color:var(--muted2);margin-left:8px">Click Pay Now when settled</span></div><table><thead><tr><th>Category</th><th>Supplier</th><th>Date</th><th style="text-align:right">Amount</th><th>Due</th><th></th></tr></thead><tbody>${accrualRows}</tbody></table>${accrPaged.pager}</div>`;
 }
 function addPayable(p, depositToAccount){
   payables=[...payables,{id:uid(),...p,status:'open'}];
