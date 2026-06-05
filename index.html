@@ -122,6 +122,21 @@ tr:hover .row-actions{opacity:1}
 label{font-size:.67rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
 input,select,textarea{background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:7px 10px;color:var(--text);font-family:var(--fb);font-size:.84rem;outline:none;transition:border .1s,box-shadow .1s;width:100%}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(41,37,36,.07)}
+/* Override Chrome/Edge autofill yellow background — without this, autofilled
+   number/text fields look broken against our cream/dark theme. The huge inset
+   box-shadow trick repaints the background to var(--bg); the long transition
+   delay prevents the browser from re-applying its own yellow on every render. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active,
+textarea:-webkit-autofill,
+select:-webkit-autofill{
+  -webkit-box-shadow:0 0 0 1000px var(--bg) inset !important;
+  -webkit-text-fill-color:var(--text) !important;
+  caret-color:var(--text);
+  transition:background-color 600000s ease-in-out 0s, color 600000s ease-in-out 0s;
+}
 select option{background:#fff}
 input[type=color]{padding:2px 4px;height:36px;cursor:pointer}
 textarea{resize:vertical;min-height:64px}
@@ -2879,10 +2894,20 @@ const leanOpsService={
     const laborToCheck = (typeof opts.laborP === 'number') ? opts.laborP : (m.laborP||0);
     const primeToCheck = (typeof opts.primeP === 'number') ? opts.primeP : (m.primeP||0);
 
-    /* Thresholds from user-configured targets. If user tightens to 28% for
-       discipline, alerts fire at 28%, not at the old hardcoded 35%. */
-    const laborTarget = (kpiTargets && kpiTargets.laborP && kpiTargets.laborP.target) || 32;
-    const primeTarget = (kpiTargets && kpiTargets.primeCostP && kpiTargets.primeCostP.target) || 62;
+    /* Thresholds from the same source the Forecast and Weekly Check use:
+       _getEffectiveTargets reads monthlyBudget → weeklyTargets → forecastTargets
+       → defaults. So if you change Labor% / COGS% on Weekly Check, alerts fire
+       against the NEW number on the next render. Falls back to kpiTargets only
+       if _getEffectiveTargets isn't available (older render path). */
+    let laborTarget, primeTarget;
+    try {
+      const _eff = _getEffectiveTargets();
+      laborTarget = _eff.labor;
+      primeTarget = _eff.prime; // auto-derived COGS + Labor — same definition as Weekly Check
+    } catch (e) {
+      laborTarget = (kpiTargets && kpiTargets.laborP && kpiTargets.laborP.target) || 32;
+      primeTarget = (kpiTargets && kpiTargets.primeCostP && kpiTargets.primeCostP.target) || 62;
+    }
 
     const alerts = [];
 
@@ -2936,7 +2961,73 @@ const leanOpsService={
       });
     }
 
-    return alerts.slice(0, 4);
+    /* ── DSR Not Posted (operational discipline) ──
+       The whole accounting model assumes today's DSR is being closed daily. If
+       it isn't posted by the time the user opens the dashboard, sales numbers
+       lag and reconciliation drifts. Fires after 6pm local so morning loads
+       don't nag — by dinner service the morning DSR should be in. */
+    try{
+      const td = today();
+      const nowH = new Date().getHours();
+      const dsr = (typeof dsrEntries === 'object' && dsrEntries) ? (dsrEntries[td] || null) : null;
+      const posted = !!(dsr && dsr.posted);
+      if (!posted && nowH >= 18) {
+        alerts.push({
+          level: 'warn',
+          title: 'DSR Not Posted',
+          body: `Today's DSR (${td}) isn't posted yet. Close the day on the DSR page so sales, VAT, and reconciliation stay accurate.`
+        });
+      }
+    }catch(e){}
+
+    /* ── Forecasted Cash Negative (proactive 14-day warning) ──
+       Runs the existing 14-day forecast and checks whether projected running
+       cash dips below zero on any day. Catches "everything looks fine today
+       but rent + payroll hit on the same Friday next week" scenarios. */
+    try{
+      if (typeof runForecast === 'function') {
+        const f = runForecast(14);
+        const series = (f && Array.isArray(f.days)) ? f.days : [];
+        let negDay=null, negVal=0;
+        for (const d of series) {
+          const v = (d && typeof d.runningCash === 'number') ? d.runningCash : null;
+          if (v == null) continue;
+          if (v < 0 && v < negVal) { negVal = v; negDay = d.iso || d.label || null; }
+        }
+        if (negDay) {
+          alerts.push({
+            level: 'bad',
+            title: 'Forecasted Cash Negative',
+            body: `Projected cash dips to ${fmt(negVal)} on ${negDay}. Pull a payable forward or chase a deposit before then.`
+          });
+        }
+      }
+    }catch(e){}
+
+    /* ── Overdue Payables (financial hygiene) ──
+       Any unpaid expense tx or manual payable with dueDate < today. Different
+       from the "Upcoming Obligations" card which only shows next 14 days —
+       this catches stuff that already slipped past due. */
+    try{
+      const td = today();
+      const _LONG = new Set(['Loan','Owner Loan']);
+      const overdueTx = (transactions||[])
+        .filter(t=>t && !t.voided && t.type==='expense' && t.status==='unpaid' && t.dueDate && t.dueDate < td);
+      const overduePay = (payables||[])
+        .filter(p=>p && p.status!=='paid' && p.dueDate && p.dueDate < td && !_LONG.has(p.type||''));
+      const totalOverdue = overdueTx.reduce((s,t)=>s+(Number(t.amount)||0),0)
+                         + overduePay.reduce((s,p)=>s+(Number(p.balance)||0),0);
+      const count = overdueTx.length + overduePay.length;
+      if (count > 0) {
+        alerts.push({
+          level: 'bad',
+          title: 'Overdue Payables',
+          body: `${count} obligation${count===1?'':'s'} past due — ${fmt(totalOverdue)} total. Settle or renegotiate before vendor trust erodes.`
+        });
+      }
+    }catch(e){}
+
+    return alerts.slice(0, 6);
   },
 
   /* ── Phase 3C: Labor Efficiency ── */
@@ -4285,12 +4376,17 @@ function resetCOA(){
    CHARTS
 ═══════════════════════════════════════════════ */
 function barChart(data,h=110){
+  /* Bar width derives from bucket count instead of a fixed 11px. With 7-day
+     weeks the old 11px bars looked anemic vs the surrounding whitespace;
+     scaling lets the pair fill its slot. Clamped 14–28px so monthly views
+     (~30 buckets) don't squeeze and short series don't balloon. */
   const max=Math.max(...data.flatMap(d=>[d.sales||0,d.expenses||0]),1);
   const bh=h-20;
+  const bw=Math.max(14, Math.min(28, Math.round(180/Math.max(data.length,1))));
   return`<div class="chart-bars" style="height:${h}px">${data.map(d=>{
     const sh=Math.max(((d.sales||0)/max)*bh,(d.sales||0)>0?2:0);
     const eh=Math.max(((d.expenses||0)/max)*bh,(d.expenses||0)>0?2:0);
-    return`<div class="bar-group"><div class="bar-pair"><div class="bar" style="height:${sh}px;width:11px;background:var(--green)" title="Sales: ${fmt(d.sales||0)}"></div><div class="bar" style="height:${eh}px;width:11px;background:var(--red)" title="Exp: ${fmt(d.expenses||0)}"></div></div><div class="bar-label">${esc(d.label)}</div></div>`;
+    return`<div class="bar-group"><div class="bar-pair"><div class="bar" style="height:${sh}px;width:${bw}px;background:var(--green)" title="Sales: ${fmt(d.sales||0)}"></div><div class="bar" style="height:${eh}px;width:${bw}px;background:var(--red)" title="Exp: ${fmt(d.expenses||0)}"></div></div><div class="bar-label">${esc(d.label)}</div></div>`;
   }).join('')}</div><div class="chart-legend"><span><span class="legend-dot" style="background:var(--green)"></span>Sales</span><span><span class="legend-dot" style="background:var(--red)"></span>Expenses</span></div>`;
 }
 
@@ -5740,7 +5836,25 @@ function pgDashboard(){
   const oblgPayroll = Number(obligs.payroll)||0;
   const oblgAccrued = Number(obligs.accrued)||0;
   const oblgPayablesShown = dashShowLongTerm ? Number(obligs.payablesDue)||0 : operationalPayables;
-  const obligationsShownTotal = oblgPayroll + oblgAccrued + oblgPayablesShown;
+  /* Accrued Wages — shifts logged but not yet rolled into a finalized payroll run.
+     This is real owed labor that doesn't show up in Pending Payroll (which only
+     counts wage txs already created by a finalize action). Without this line the
+     dashboard underestimates obligations during the open pay period — e.g. you've
+     worked 6 days into a weekly cycle, that labor is owed but invisible. */
+  const oblgAccruedWages = (()=>{
+    try{
+      const seen={};
+      let total=0;
+      (shifts||[]).forEach(s=>{
+        if(!s||!s.date||seen[s.date])return;
+        seen[s.date]=true;
+        if(findFinalizedRunForDate(s.date))return; // already paid (or baked into a finalized run)
+        total += dayLaborCostFromShifts(s.date)||0;
+      });
+      return total;
+    }catch(e){return 0;}
+  })();
+  const obligationsShownTotal = oblgPayroll + oblgAccruedWages + oblgAccrued + oblgPayablesShown;
   const availableCash = totalCash - obligationsShownTotal;
 
   /* (leanBreakEven + leanAlerts moved DOWN — they now depend on twShiftLaborP /
@@ -6293,7 +6407,8 @@ ${(()=>{
     <table>
       <tbody>
         <tr><td style="font-size:.78rem">Total Cash</td><td class="mono" style="text-align:right">${fmt(totalCash)}</td></tr>
-        ${oblgPayroll>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Pending Payroll</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgPayroll)}</td></tr>`:''}
+        <tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Pending Payroll</td><td class="mono" style="text-align:right;color:${oblgPayroll>0?'var(--red)':'var(--muted2)'};font-size:.76rem">${fmt(oblgPayroll)}</td></tr>
+        <tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px" title="Wages from logged shifts not yet rolled into a finalized payroll run">− Accrued Wages <span style="font-size:.65rem;color:var(--muted2)">(unfinalized shifts)</span></td><td class="mono" style="text-align:right;color:${oblgAccruedWages>0?'var(--red)':'var(--muted2)'};font-size:.76rem">${fmt(oblgAccruedWages)}</td></tr>
         ${oblgAccrued>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Accrued Expenses (unpaid bills)</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgAccrued)}</td></tr>`:''}
         ${oblgPayablesShown>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Payables ${longTermPayables>0?`<span style="font-size:.65rem">${dashShowLongTerm?'(all)':'(operational)'}</span>`:''}</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgPayablesShown)}</td></tr>`:''}
         ${longTermPayables>0 && !dashShowLongTerm
@@ -7283,6 +7398,7 @@ function pgDSR(){
     <button class="btn btn-ghost btn-sm" onclick="window._dsrDate=addDays(window._dsrDate||today(),1);renderMain()">Next →</button>
     ${postBtn}
     <button class="btn btn-ghost btn-sm" onclick="printDSR()">🖨 Print</button>
+    <button class="btn btn-ghost btn-sm" onclick="exportDSRCSV()" title="Export DSR data as CSV in POS Z-reading format (one row per day) — handoff-ready for accountants">📥 Export</button>
   </div>
 </div>
 
@@ -7504,6 +7620,147 @@ function pgDSR(){
 
 </div>
 </div>`;
+}
+
+/* ── DSR EXPORT ─────────────────────────────────────────────────────────
+   Exports one row per posted (or filled) DSR day in a column layout that
+   mirrors a typical PH POS Z-reading: Gross → Disc → SC → Refunds → Net
+   → VATable → Output VAT → payment methods → SC collected → Tips → Pax.
+   Default scope: the currently-viewed DSR's calendar month. Falls back to
+   prompting if the user wants a different range. Output is CSV (opens in
+   Excel/Google Sheets directly; an accountant can pivot from it). For true
+   XLSX we'd need a library — CSV gets 99% of the value with 0 deps. ──── */
+function exportDSRCSV(){
+  const focus = window._dsrDate || today();
+  /* Default: month containing the currently-viewed DSR. */
+  const fy = focus.slice(0,4), fm = focus.slice(5,7);
+  const monthStart = `${fy}-${fm}-01`;
+  const lastDay = new Date(Number(fy), Number(fm), 0).getDate();
+  const monthEnd = `${fy}-${fm}-${String(lastDay).padStart(2,'0')}`;
+  let from = monthStart, to = monthEnd;
+  const useDefault = confirm(
+    `Export DSR for ${fy}-${fm} (${monthStart} → ${monthEnd})?\n\n`+
+    `Click OK to export this month, Cancel to pick a custom range.`
+  );
+  if (!useDefault){
+    const f = prompt('From date (YYYY-MM-DD):', monthStart);
+    if (!f) return;
+    const t = prompt('To date (YYYY-MM-DD):', monthEnd);
+    if (!t) return;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(f) || !/^\d{4}-\d{2}-\d{2}$/.test(t)){
+      toast('Invalid date format. Use YYYY-MM-DD.','error'); return;
+    }
+    from = f; to = t;
+  }
+
+  /* Z-reading column order — matches BIR-style sales report convention.
+     "VATable Sales" assumes VAT-inclusive pricing (Net / 1.12). If you run
+     VAT-Exempt, the VAT column will be 0 and VATable = Net naturally. */
+  const cols = [
+    'Date','Day','Cashier','Posted',
+    'Gross Receipts','Less: Discounts','Less: Service Charge','Less: Refunds/Voids','NET SALES',
+    'VATable Sales','VAT-Exempt','Zero-Rated','Output VAT',
+    'Food Sales','Alcohol Sales','Bev Sales',
+    'Cash','GCash','Card','Total Payments',
+    'SC Collected','Tips','Pax','Avg Check',
+    'Start Cash','Cash Reading','Short/Over'
+  ];
+
+  const rows = [];
+  const totals = new Array(cols.length).fill(0);
+  let rowCount = 0;
+
+  /* Walk every date from..to inclusive. Skip days with no DSR entry AND no
+     numeric input — keeps the export clean. */
+  const num = v => Number(v)||0;
+  let d = from;
+  while (d <= to){
+    const e = (dsrEntries||{})[d] || null;
+    if (e){
+      const nGross=num(e.nGross), lGross=num(e.lGross), tGross=nGross+lGross;
+      const nDisc=num(e.nDisc),   lDisc=num(e.lDisc),   tDisc=nDisc+lDisc;
+      const nSC=num(e.nSC),       lSC=num(e.lSC),       tSC=nSC+lSC;
+      const nRef=num(e.nRefund),  lRef=num(e.lRefund),  tRef=nRef+lRef;
+      const tNet = tGross - tDisc - tSC - tRef;
+      const tVAT = num(e.nVAT) + num(e.lVAT);
+      /* VATable Sales = Net Sales − Output VAT (BIR definition). No fallback
+         math: if VAT wasn't entered for that day, VATable just equals Net.
+         That's correct for VAT-Exempt operation AND honest for "VAT not
+         filled yet" — no silently-fabricated numbers in the export. */
+      const vatable = tNet - tVAT;
+      const tFood = num(e.nFood)+num(e.lFood);
+      const tAlc  = num(e.nAlc) +num(e.lAlc);
+      const tBev  = num(e.nBev) +num(e.lBev);
+      const tCash = num(e.nCash)+num(e.lCash);
+      const tGcash= num(e.nGcash)+num(e.lGcash);
+      const tCard = num(e.nCard)+num(e.lCard);
+      const tPay  = tCash+tGcash+tCard;
+      const tTips = num(e.nTips)+num(e.lTips);
+      const tPax  = num(e.nPax)+num(e.lPax);
+      const avgCheck = tPax>0 ? tNet/tPax : 0;
+      const startCash = num(e.nStartCash);
+      const cashRead  = tCash + startCash; // cash drawer = sales-cash + start float
+      const cashDec   = num(e.nCashDec)+num(e.lCashDec);
+      const shortOver = cashDec - cashRead;
+
+      const dow = new Date(d+'T12:00:00').toLocaleDateString('en-US',{weekday:'short'});
+      const row = [
+        d, dow, e.cashier||'', e.posted?'Yes':'No',
+        tGross, tDisc, tSC, tRef, tNet,
+        vatable, 0, 0, tVAT,
+        tFood, tAlc, tBev,
+        tCash, tGcash, tCard, tPay,
+        tSC, tTips, tPax, Math.round(avgCheck*100)/100,
+        startCash, cashRead, shortOver
+      ];
+      rows.push(row);
+      rowCount++;
+      /* Sum the numeric columns (skip Date/Day/Cashier/Posted at idx 0..3,
+         and Avg Check at the avg-check position — averages don't sum). */
+      const avgIdx = cols.indexOf('Avg Check');
+      for (let i=4;i<row.length;i++){
+        if (i===avgIdx) continue;
+        totals[i] += Number(row[i])||0;
+      }
+    }
+    d = addDays(d, 1);
+  }
+
+  if (rowCount === 0){
+    toast(`No DSR data in ${from} → ${to}`, 'error');
+    return;
+  }
+
+  /* Recompute average check on totals row from totals (correct weighted avg). */
+  const totalPax = totals[cols.indexOf('Pax')]||0;
+  const totalNet = totals[cols.indexOf('NET SALES')]||0;
+  totals[0] = 'TOTAL';
+  totals[1] = ''; totals[2] = ''; totals[3] = '';
+  totals[cols.indexOf('Avg Check')] = totalPax>0 ? Math.round((totalNet/totalPax)*100)/100 : 0;
+
+  /* CSV header lines — restaurant name, period, generated stamp. Helps the
+     accountant know what they're looking at. Restaurant name is a guess; if
+     you have it in settings somewhere, swap in here. */
+  const headerLines = [
+    ['FF Beach Shack — Daily Sales Summary (POS Z-Reading Format)'],
+    [`Period: ${from} to ${to}`],
+    [`Generated: ${new Date().toLocaleString('en-PH')}`],
+    [`Days with data: ${rowCount}`],
+    []
+  ];
+
+  const quote = v => `"${String(v??'').replace(/"/g,'""')}"`;
+  const csv = [
+    ...headerLines.map(r=>r.map(quote).join(',')),
+    cols.map(quote).join(','),
+    ...rows.map(r=>r.map(quote).join(',')),
+    totals.map(quote).join(',')
+  ].join('\r\n'); // CRLF — friendlier for Excel on Windows
+
+  /* UTF-8 BOM prefix so Excel auto-detects encoding and renders ₱ correctly. */
+  const blob = '﻿' + csv;
+  dl(`DSR_${from}_to_${to}.csv`, blob, 'text/csv;charset=utf-8');
+  toast(`Exported ${rowCount} DSR day${rowCount===1?'':'s'} ✓`);
 }
 
 function printDSR(){
@@ -9197,23 +9454,20 @@ function pgWeeklyCheck(){
   const wd=Array.from({length:7},(_,i)=>addDays(ws,i));
   const wTx=transactions.filter(t=>wd.includes(t.date)&&!t.voided);
 
-  /* Cash flow — include SC/Tip collections (inflows) and settlements (outflows)
-     so the expectedCash reconciliation matches actual account-balance movements. */
+  /* Cash flow this week — what actually moved in/out. Used by the Weekly Net
+     Cash Movement card. The old expectedCash/diff/diffStatus reconciliation
+     was tautological (beginningCash was back-derived from currentTotal, so
+     expectedCash always equaled currentTotal). Replaced; real reconciliation
+     against physical cash lives on the Cash Counts page. */
   const inflows=wTx.filter(t=>t.type==='sale'||t.type==='deposit'||t.type==='sc_collected'||t.type==='tip_collected').reduce((s,t)=>s+t.amount,0);
   const outflows=wTx.filter(t=>((t.type==='expense'||t.type==='withdrawal')&&t.status!=='unpaid')||t.type==='sc_paid'||t.type==='tip_paid'||t.type==='liability_payment').reduce((s,t)=>s+t.amount,0);
-  const currentTotal=treasuryService.getOperationalLiquidity();
-  const beginningCash=currentTotal-(inflows-outflows);
-  const expectedCash=beginningCash+inflows-outflows;
 
-  /* Actual split */
+  /* Actual split — cash vs digital balances (used by the B/C tables below). */
   const cashAccts=accounts.filter(a=>a.type==='cash'&&!a.excludeFromLiquidity&&!a.hiddenFromTreasury);
   const digAccts=accounts.filter(a=>a.type!=='cash'&&!a.excludeFromLiquidity&&!a.hiddenFromTreasury);
   const actualCash=cashAccts.reduce((s,a)=>s+a.balance,0);
   const actualDig=digAccts.reduce((s,a)=>s+a.balance,0);
   const totalActual=actualCash+actualDig;
-  const diff=totalActual-expectedCash;
-  const diffStatus=Math.abs(diff)<0.01?'Balanced':diff>0?'Over':'Short';
-  const diffColor=Math.abs(diff)<0.01?'var(--green)':diff>0?'var(--blue)':'var(--red)';
 
   /* Staff liabilities */
   const scOut=staffPayables.filter(p=>p.status==='unpaid'&&p.type==='sc'&&wd.includes(p.date)).reduce((s,p)=>s+p.amount,0);
@@ -9288,10 +9542,14 @@ function pgWeeklyCheck(){
     <span class="sec-title">Monthly Budget & Targets — ${currentMk}</span>
     <span style="font-size:.72rem;color:var(--muted2)">Used as budget basis on Dashboard</span>
   </div>
-  <div style="padding:14px;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px">
+  <!-- Grid alignment fix: align-items:end pushes every input to the bottom of
+       its grid cell, so labels of different heights (1 line vs 2 lines for
+       "Prime Cost Target % · auto: COGS + Labor") don't stagger the inputs.
+       Min label height pins single-line labels visually with their column. -->
+  <div style="padding:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;align-items:end">
 
     <div class="form-group">
-      <label>Monthly Sales Target (₱)</label>
+      <label style="min-height:2.2em;display:flex;align-items:flex-end">Monthly Sales Target (₱)</label>
       <input type="number" id="wt-sales" step="1000" min="0"
         value="${mb.sales||weeklyTargets.sales||0}"
         style="font-family:var(--fm)"
@@ -9299,21 +9557,21 @@ function pgWeeklyCheck(){
     </div>
 
     <div class="form-group">
-      <label>COGS Target %</label>
+      <label style="min-height:2.2em;display:flex;align-items:flex-end">COGS Target %</label>
       <input type="number" id="wt-cogs" step="0.5" min="0" max="100"
         value="${mb.cogsP||30}"
         oninput="monthlyBudget[getMonthKey()]={...(monthlyBudget[getMonthKey()]||{}),cogsP:parseFloat(this.value)||30};_recalcPrimeTarget();scheduleSave()">
     </div>
 
     <div class="form-group">
-      <label>Labor Target %</label>
+      <label style="min-height:2.2em;display:flex;align-items:flex-end">Labor Target %</label>
       <input type="number" id="wt-labor" step="0.5" min="0" max="100"
         value="${mb.laborP||weeklyTargets.laborP||32}"
         oninput="monthlyBudget[getMonthKey()]={...(monthlyBudget[getMonthKey()]||{}),laborP:parseFloat(this.value)||32};weeklyTargets.laborP=parseFloat(this.value)||32;_recalcPrimeTarget();scheduleSave()">
     </div>
 
     <div class="form-group">
-      <label>Prime Cost Target % <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· auto: COGS + Labor</span></label>
+      <label style="min-height:2.2em;display:flex;align-items:flex-end;flex-wrap:wrap;gap:4px">Prime Cost Target %<span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.68rem;letter-spacing:0">· auto: COGS + Labor</span></label>
       <input type="number" id="wt-prime" step="0.5" min="0" max="100" readonly
         value="${(mb.cogsP||30) + (mb.laborP||weeklyTargets.laborP||32)}"
         style="background:var(--bg3);color:var(--muted);cursor:not-allowed"
@@ -9321,58 +9579,65 @@ function pgWeeklyCheck(){
     </div>
 
     <div class="form-group">
-      <label>Net Profit Target (₱)</label>
+      <label style="min-height:2.2em;display:flex;align-items:flex-end">Net Profit Target (₱)</label>
       <input type="number" id="wt-profit" step="1000" min="0"
         value="${mb.netProfit||weeklyTargets.netProfit||0}"
         style="font-family:var(--fm)"
         oninput="monthlyBudget[getMonthKey()]={...(monthlyBudget[getMonthKey()]||{}),netProfit:parseFloat(this.value)||0};weeklyTargets.netProfit=parseFloat(this.value)||0;scheduleSave()">
     </div>
 
-    <div class="form-group" style="justify-content:flex-end;padding-top:16px">
-      <div style="font-size:.72rem;color:var(--muted2)">
-        Weekly sales budget:<br>
-        <span style="font-family:var(--fm);font-weight:600;color:var(--text)">${fmt(mb.sales?(mb.sales/4.33):weeklyTargets.sales||0)}</span>
-        <span style="color:var(--muted2)"> /week</span>
+    <div class="form-group">
+      <label style="min-height:2.2em;display:flex;align-items:flex-end;color:var(--muted2)">Weekly sales budget</label>
+      <div style="padding:7px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg3);font-family:var(--fm);font-weight:600;font-size:.84rem">
+        ${fmt(mb.sales?(mb.sales/4.33):weeklyTargets.sales||0)}<span style="color:var(--muted2);font-weight:400;font-size:.72rem"> /wk</span>
       </div>
     </div>
 
   </div>
 </div>
 
-<!-- ═══ RECONCILIATION ══════════════════════════ -->
-<div class="card" style="margin-bottom:14px;border:2px solid ${diffColor};background:${Math.abs(diff)<0.01?'var(--green-bg)':diff>0?'var(--blue-bg)':'var(--red-bg)'}">
-  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
-    <div>
-      <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px">Weekly Reconciliation</div>
-      <div style="font-family:var(--fh);font-size:1.6rem;font-weight:600;color:${diffColor}">${diffStatus}</div>
-      <div style="font-size:.82rem;color:${diffColor};margin-top:2px">
-        ${Math.abs(diff)<0.01?'Ledger and balances agree.':diff>0?`Over by ${fmt(Math.abs(diff))}`:`Short by ${fmt(Math.abs(diff))}`}
+<!-- ═══ WEEKLY NET CASH MOVEMENT — replaced the old "Reconciliation" card which
+     was tautological (expectedCash was back-derived from currentTotal, so
+     diff always = 0 → "Balanced" no matter what). This shows the REAL signal:
+     how much cash actually moved this week, in vs out, net. Real reconciliation
+     against physical cash still lives on the Cash Counts page. ════════════════ -->
+${(()=>{
+  const netFlow = inflows - outflows;
+  const flowColor = netFlow>=0 ? 'var(--green)' : 'var(--red)';
+  const flowBg = netFlow>=0 ? 'var(--green-bg)' : 'var(--red-bg)';
+  return `<div class="card" style="margin-bottom:14px;border:2px solid ${flowColor};background:${flowBg}">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+      <div>
+        <div style="font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin-bottom:4px">Weekly Net Cash Movement</div>
+        <div style="font-family:var(--fh);font-size:1.6rem;font-weight:600;color:${flowColor}">${netFlow>=0?'+':''}${fmt(netFlow)}</div>
+        <div style="font-size:.82rem;color:${flowColor};margin-top:2px">
+          ${netFlow>=0?'Cash up this week. ':'Cash down this week. '}${fmt(inflows)} in · ${fmt(outflows)} out
+        </div>
+      </div>
+      <div style="display:flex;gap:20px;flex-wrap:wrap">
+        <div style="text-align:center"><div class="stat-label">Inflows</div><div class="mono" style="font-size:1.1rem;font-weight:600;color:var(--green)">${fmt(inflows)}</div></div>
+        <div style="text-align:center"><div class="stat-label">Outflows</div><div class="mono" style="font-size:1.1rem;font-weight:600;color:var(--red)">${fmt(outflows)}</div></div>
+        <div style="text-align:center"><div class="stat-label">Current Cash</div><div class="mono" style="font-size:1.1rem;font-weight:600">${fmt(totalActual)}</div></div>
       </div>
     </div>
-    <div style="display:flex;gap:20px;flex-wrap:wrap">
-      <div style="text-align:center"><div class="stat-label">Expected</div><div class="mono" style="font-size:1.1rem;font-weight:600">${fmt(expectedCash)}</div></div>
-      <div style="text-align:center"><div class="stat-label">Actual</div><div class="mono" style="font-size:1.1rem;font-weight:600">${fmt(totalActual)}</div></div>
-      <div style="text-align:center"><div class="stat-label">Difference</div><div class="mono" style="font-size:1.1rem;font-weight:600;color:${diffColor}">${diff>=0?'+':''}${fmt(diff)}</div></div>
-    </div>
-  </div>
-</div>
+  </div>`;
+})()}
 
 <div class="g3" style="margin-bottom:14px">
   <div class="card-flush">
     <div style="padding:8px 13px;background:var(--bg3);border-bottom:1px solid var(--border)">
-      <span style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em">A — Expected Cash</span>
+      <span style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em">A — Cash In / Out This Week</span>
     </div>
     <table><tbody>
-      <tr><td style="font-size:.8rem">Beginning Cash</td><td class="mono" style="text-align:right;font-size:.8rem">${fmt(beginningCash)}</td></tr>
       <tr><td style="font-size:.8rem;color:var(--green)">+ Total Inflows</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--green)">+${fmt(inflows)}</td></tr>
       <tr><td style="font-size:.8rem;color:var(--red)">− Total Outflows</td><td class="mono" style="text-align:right;font-size:.8rem;color:var(--red)">−${fmt(outflows)}</td></tr>
-      <tr style="background:var(--bg3);font-weight:700"><td style="font-size:.8rem">Expected Cash</td><td class="mono" style="text-align:right;font-size:.9rem">${fmt(expectedCash)}</td></tr>
+      <tr style="background:var(--bg3);font-weight:700"><td style="font-size:.8rem">Net Movement</td><td class="mono" style="text-align:right;font-size:.9rem;color:${(inflows-outflows)>=0?'var(--green)':'var(--red)'}">${(inflows-outflows)>=0?'+':''}${fmt(inflows-outflows)}</td></tr>
     </tbody></table>
   </div>
 
   <div class="card-flush">
     <div style="padding:8px 13px;background:var(--bg3);border-bottom:1px solid var(--border)">
-      <span style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em">B — Actual Cash</span>
+      <span style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em">B — Cash on Hand Now</span>
     </div>
     <table><tbody>
       ${cashAccts.map(a=>`<tr><td style="font-size:.8rem">💵 ${esc(a.name)}</td><td class="mono" style="text-align:right;font-size:.8rem">${fmt(a.balance)}</td></tr>`).join('')}
