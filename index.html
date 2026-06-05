@@ -5682,9 +5682,24 @@ function pgDashboard(){
   /* Treasury */
   const treasury     = treasuryService.getLiquidityPosition();
   const totalCash    = treasury.totalCash;
-  const totalPayables= treasury.totalPayables;
+  const totalPayablesAll = treasury.totalPayables;
   const runway       = treasuryService.getRunway();
   const availableCash= treasuryService.getAvailableCash();
+
+  /* Split payables into long-term (loans) vs operational (supplier credit, etc).
+     A big BDO loan or owner loan dwarfs day-to-day supplier credit and skews
+     the dashboard's "Payables" figure into a number that looks scary but isn't
+     actually due this week. Show OPERATIONAL only by default; long-term debt
+     gets a separate line. Sticky toggle so user can flip back to "all" if they
+     want the totals. */
+  const _LONG_TERM_TYPES = new Set(['Loan','Owner Loan']);
+  const longTermPayables = (payables||[])
+    .filter(p=>p.status!=='paid' && _LONG_TERM_TYPES.has(p.type||''))
+    .reduce((s,p)=>s+(Number(p.balance)||0),0);
+  const operationalPayables = totalPayablesAll - longTermPayables;
+  const dashShowLongTerm = (()=>{ try{return localStorage.getItem('dash_payables_all')==='1';}catch(e){return false;} })();
+  /* Headline number for KPI/donut: respect the user's toggle preference. */
+  const totalPayables = dashShowLongTerm ? totalPayablesAll : operationalPayables;
 
   /* (leanBreakEven + leanAlerts moved DOWN — they now depend on twShiftLaborP /
      twShiftPrimeP which are computed later in the function. Old position here
@@ -5782,7 +5797,7 @@ function pgDashboard(){
   }
 
   /* ── WoW + Budget row builder ── */
-  function wowRow(label, twVal, lwVal, budget, isCurrency=true, lowerIsBetter=false){
+  function wowRow(label, twVal, lwVal, budget, isCurrency=true, lowerIsBetter=false, twAmount=null, lwAmount=null){
     const fv = isCurrency ? fmt : (v=>v.toFixed(1)+'%');
     const diff = twVal - lwVal;
     const vs_budget = budget ? twVal - budget : null;
@@ -5790,11 +5805,17 @@ function pgDashboard(){
     const budgOk  = vs_budget!==null ? (lowerIsBetter ? vs_budget<=0 : vs_budget>=0) : null;
     const diffColor = diffOk ? 'var(--green)' : 'var(--red)';
     const budgColor = budgOk===null ? 'var(--muted2)' : budgOk ? 'var(--green)' : 'var(--red)';
+    /* If caller passed amounts (for cost-% rows), show "X.X% · ₱amount" inline.
+       Keeps the table the same shape but surfaces the actual pesos behind each
+       percentage — answers "how much money is that, really?". */
+    const _withAmt = (pctStr, amt) => (amt!==null && amt!==undefined)
+      ? `${pctStr}<span style="color:var(--muted2);font-weight:400;font-size:.7rem;margin-left:4px">${fmt(amt)}</span>`
+      : pctStr;
     return `
       <tr>
         <td style="font-size:.79rem;padding:7px 10px;border-bottom:1px solid var(--border)">${label}</td>
-        <td class="mono" style="text-align:right;padding:7px 10px;border-bottom:1px solid var(--border);font-weight:600">${fv(twVal)}</td>
-        <td class="mono" style="text-align:right;padding:7px 10px;border-bottom:1px solid var(--border);color:var(--muted2)">${fv(lwVal)}</td>
+        <td class="mono" style="text-align:right;padding:7px 10px;border-bottom:1px solid var(--border);font-weight:600">${_withAmt(fv(twVal), twAmount)}</td>
+        <td class="mono" style="text-align:right;padding:7px 10px;border-bottom:1px solid var(--border);color:var(--muted2)">${_withAmt(fv(lwVal), lwAmount)}</td>
         <td class="mono" style="text-align:right;padding:7px 10px;border-bottom:1px solid var(--border);color:${diffColor};font-size:.76rem">
           ${diff>=0?'+':''}${isCurrency?fmt(diff):diff.toFixed(1)+'%'}
         </td>
@@ -6011,10 +6032,10 @@ function pgDashboard(){
       ${wowRow('NA Bev Sales', tw.naBevSales, lw.naBevSales, 0, true, false)}      <tr style="background:var(--bg3)">
         <td colspan="6" style="padding:4px 10px;font-size:.63rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)">Cost Controls</td>
       </tr>
-      ${wowRow('Food Cost (COGS%)', tw.cogsP, lw.cogsP, budgetCogsP, false, true)}
-      ${wowRow('Labor Cost % (operational · live shifts)', twShiftLaborP, lwShiftLaborP, budgetLaborP, false, true)}
-      ${wowRow('Labor Cost % (posted · accounting)', tw.laborP, lw.laborP, budgetLaborP, false, true)}
-      ${wowRow('Prime Cost %', twShiftPrimeP, lwShiftPrimeP, budgetPrimeP, false, true)}
+      ${wowRow('Food Cost (COGS%)', tw.cogsP, lw.cogsP, budgetCogsP, false, true, tw.cogs, lw.cogs)}
+      ${wowRow('Labor Cost % (operational · live shifts)', twShiftLaborP, lwShiftLaborP, budgetLaborP, false, true, twShiftLabor, lwShiftLabor)}
+      ${wowRow('Labor Cost % (posted · accounting)', tw.laborP, lw.laborP, budgetLaborP, false, true, tw.labor, lw.labor)}
+      ${wowRow('Prime Cost %', twShiftPrimeP, lwShiftPrimeP, budgetPrimeP, false, true, twShiftLabor + (tw.cogs||0), lwShiftLabor + (lw.cogs||0))}
       ${wowRow('EBITDA', twShiftEbitda, lwShiftEbitda, 0, true, false)}
     </tbody>
   </table>
@@ -6206,12 +6227,20 @@ ${(()=>{
   </div>
 
   <div class="card">
-    <div class="sec-title" style="margin-bottom:8px">Cash Position</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div class="sec-title">Cash Position</div>
+      ${longTermPayables>0
+        ? `<button class="btn btn-ghost btn-xs" style="font-size:.65rem;padding:2px 6px" onclick="try{localStorage.setItem('dash_payables_all','${dashShowLongTerm?'0':'1'}')}catch(e){};render()" title="${dashShowLongTerm?'Hide long-term debts so day-to-day payables are easier to read':'Include long-term debts (loans, owner loans) in the payables total'}">${dashShowLongTerm?'Hide long-term':'Show all'}</button>`
+        : ''}
+    </div>
     <table>
       <tbody>
         <tr><td style="font-size:.78rem">Available Cash</td><td class="mono" style="text-align:right;font-weight:700;color:${availableCash>=0?'var(--green)':'var(--red)'}">${fmt(availableCash)}</td></tr>
         <tr><td style="font-size:.78rem">Total Cash</td><td class="mono" style="text-align:right">${fmt(totalCash)}</td></tr>
-        <tr><td style="font-size:.78rem">Payables</td><td class="mono" style="text-align:right;color:var(--red)">${fmt(totalPayables)}</td></tr>
+        <tr><td style="font-size:.78rem">Payables ${longTermPayables>0?`<span style="font-size:.65rem;color:var(--muted2);font-weight:400">${dashShowLongTerm?'(incl. long-term)':'(operational only)'}</span>`:''}</td><td class="mono" style="text-align:right;color:var(--red)">${fmt(totalPayables)}</td></tr>
+        ${longTermPayables>0 && !dashShowLongTerm
+          ? `<tr><td style="font-size:.7rem;color:var(--muted2);padding-left:14px">└ long-term debt (hidden)</td><td class="mono" style="text-align:right;color:var(--muted2);font-size:.72rem">${fmt(longTermPayables)}</td></tr>`
+          : ''}
         <tr><td style="font-size:.78rem">Runway</td><td class="mono" style="text-align:right;color:${runway>=30?'var(--green)':runway>=14?'var(--amber)':'var(--red)'}">${runway.toFixed(0)} days</td></tr>
       </tbody>
     </table>
@@ -6235,20 +6264,93 @@ ${leanAlerts.length ? `
   </div>
 </div>` : ''}
 
-<!-- ═══ RECENT ACTIVITY ══════════════════════ -->
-<div class="card-flush">
-  <div style="padding:9px 14px;border-bottom:1px solid var(--border)"><span class="sec-title">Recent Activity</span></div>
-  <table>
-    <thead><tr><th>Date</th><th>Type</th><th>Category</th><th style="text-align:right">Amount</th></tr></thead>
-    <tbody>
-      ${[...transactions].filter(t=>!t.voided).sort((a,b)=>b.date.localeCompare(a.date)).slice(0,8).map(t=>`
-        <tr>
-          <td>${t.date}</td><td>${t.type}</td><td>${t.category||'—'}</td>
-          <td style="text-align:right">${fmt(t.amount)}</td>
-        </tr>`).join('')}
-    </tbody>
-  </table>
-</div>
+<!-- ═══ UPCOMING OBLIGATIONS — next 14 days ════════════════════════
+     Replaced "Recent Activity" with an actionable look-forward view: what
+     payments are coming due soon. Recent Activity was a passive log; this
+     surfaces stuff you can act on. Includes unpaid expense txs + manual
+     payables with a dueDate within the next 14 days, sorted by due date.
+     Long-term debt (Loan / Owner Loan) excluded — same reasoning as the
+     payables KPI: those aren't "due this week" obligations. */
+${(()=>{
+  const todayIso = today();
+  const horizonIso = addDays(todayIso, 14);
+  const _LONG_TERM = new Set(['Loan','Owner Loan']);
+  const upcomingExpenses = (transactions||[])
+    .filter(t=>t && !t.voided && t.type==='expense' && t.status==='unpaid' && t.dueDate && t.dueDate>=todayIso && t.dueDate<=horizonIso)
+    .map(t=>({
+      due: t.dueDate,
+      kind: 'expense',
+      label: t.supplier || t.category || t.note || 'Unpaid expense',
+      sub: `${t.category||'—'}${t.supplier?' · '+t.supplier:''}`,
+      amount: Number(t.amount)||0,
+      onclick: `editTransaction('${t.id}')`
+    }));
+  const upcomingPayables = (payables||[])
+    .filter(p=>p && p.status!=='paid' && p.dueDate && p.dueDate>=todayIso && p.dueDate<=horizonIso && !_LONG_TERM.has(p.type||''))
+    .map(p=>({
+      due: p.dueDate,
+      kind: 'payable',
+      label: p.name || 'Payable',
+      sub: `${p.type||'—'}${p.supplier?' · '+p.supplier:''}`,
+      amount: Number(p.balance)||0,
+      onclick: `payPayable('${p.id}')`
+    }));
+  const overdueExpenses = (transactions||[])
+    .filter(t=>t && !t.voided && t.type==='expense' && t.status==='unpaid' && t.dueDate && t.dueDate<todayIso)
+    .map(t=>({
+      due: t.dueDate,
+      kind: 'expense',
+      label: t.supplier || t.category || t.note || 'Overdue expense',
+      sub: `${t.category||'—'}${t.supplier?' · '+t.supplier:''}`,
+      amount: Number(t.amount)||0,
+      overdue: true,
+      onclick: `editTransaction('${t.id}')`
+    }));
+  const overduePayables = (payables||[])
+    .filter(p=>p && p.status!=='paid' && p.dueDate && p.dueDate<todayIso && !_LONG_TERM.has(p.type||''))
+    .map(p=>({
+      due: p.dueDate,
+      kind: 'payable',
+      label: p.name || 'Payable',
+      sub: `${p.type||'—'}${p.supplier?' · '+p.supplier:''}`,
+      amount: Number(p.balance)||0,
+      overdue: true,
+      onclick: `payPayable('${p.id}')`
+    }));
+  const items = [...overdueExpenses, ...overduePayables, ...upcomingExpenses, ...upcomingPayables]
+    .sort((a,b)=>(a.due||'').localeCompare(b.due||''));
+  const totalDue = items.reduce((s,i)=>s+(i.amount||0),0);
+  const totalOverdue = [...overdueExpenses, ...overduePayables].reduce((s,i)=>s+(i.amount||0),0);
+  const rows = items.length
+    ? items.slice(0,10).map(i=>{
+        const daysAway = Math.round((new Date(i.due+'T12:00:00')-new Date(todayIso+'T12:00:00'))/86400000);
+        const dueLabel = i.overdue
+          ? `<span style="color:var(--red);font-weight:600">${fmtDate(i.due)} · ${Math.abs(daysAway)}d overdue</span>`
+          : daysAway===0
+            ? `<span style="color:var(--amber);font-weight:600">Today</span>`
+            : daysAway===1
+              ? `<span style="color:var(--amber)">Tomorrow</span>`
+              : `<span style="color:${daysAway<=3?'var(--amber)':'var(--muted2)'}">${fmtDate(i.due)} · in ${daysAway}d</span>`;
+        return `<tr style="cursor:pointer" onclick="${i.onclick}">
+          <td style="font-size:.74rem;padding:6px 10px;border-bottom:1px solid var(--border);white-space:nowrap">${dueLabel}</td>
+          <td style="padding:6px 10px;border-bottom:1px solid var(--border)">
+            <div style="font-size:.8rem;font-weight:500">${esc(i.label)}</div>
+            <div style="font-size:.7rem;color:var(--muted2)">${esc(i.sub)}</div>
+          </td>
+          <td class="mono" style="text-align:right;padding:6px 10px;border-bottom:1px solid var(--border);font-weight:600;color:var(--red)">${fmt(i.amount)}</td>
+        </tr>`;
+      }).join('')
+    : `<tr><td colspan="3" class="empty" style="padding:20px;text-align:center;color:var(--muted2);font-size:.82rem">No obligations due in the next 14 days ✓</td></tr>`;
+  const moreCount = Math.max(0, items.length - 10);
+  return `<div class="card-flush">
+    <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+      <span class="sec-title">Upcoming Obligations <span style="font-size:.7rem;font-weight:500;color:var(--muted2);text-transform:none;letter-spacing:0;margin-left:4px">· next 14 days · operational only</span></span>
+      ${items.length?`<span style="font-size:.78rem;color:var(--red);font-weight:600">${fmt(totalDue)}${totalOverdue>0?` · <span style="color:var(--red);font-size:.7rem">${fmt(totalOverdue)} overdue</span>`:''}</span>`:''}
+    </div>
+    <table>${rows}</table>
+    ${moreCount>0?`<div style="padding:6px 14px;text-align:center;font-size:.72rem;color:var(--muted2)">+${moreCount} more · <a onclick="navigate('payables');event.preventDefault()" style="color:var(--blue);cursor:pointer">See all on Payables page</a></div>`:''}
+  </div>`;
+})()}
 `;
 }
 
