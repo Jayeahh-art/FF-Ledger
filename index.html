@@ -516,6 +516,43 @@ function onVatModeChange(){
   checkVatSanity();
 }
 
+/* Prime Cost = COGS + Labor by definition (it's not an independent variable).
+   Used by the Weekly Check page and Forecast Targets modal: when the user edits
+   COGS or Labor, this recomputes Prime live and writes it to both the
+   monthlyBudget snapshot AND weeklyTargets so the dashboard's budget reference
+   is always internally consistent. Re-render of the UI happens via the existing
+   oninput → scheduleSave → render pipeline. */
+function _recalcPrimeTarget(){
+  const cogsEl = document.getElementById('wt-cogs');
+  const laborEl = document.getElementById('wt-labor');
+  const primeEl = document.getElementById('wt-prime');
+  if(!cogsEl || !laborEl || !primeEl) return;
+  const cogs = parseFloat(cogsEl.value) || 0;
+  const labor = parseFloat(laborEl.value) || 0;
+  const prime = Math.round((cogs + labor) * 10) / 10;
+  primeEl.value = prime;
+  /* Mirror to state so dashboard's budget comparison reads the live value too. */
+  try{
+    const mk = (typeof getMonthKey === 'function') ? getMonthKey() : null;
+    if(mk){
+      monthlyBudget[mk] = {...(monthlyBudget[mk]||{}), primeP: prime};
+    }
+    if(typeof weeklyTargets === 'object') weeklyTargets.primeP = prime;
+  }catch(e){}
+}
+/* Same idea for the Forecast Targets modal — auto-recompute primeTarget when
+   COGS or Labor changes. Writes to the input element so the saved value (from
+   the inline onclick handler) picks it up. */
+function _recalcForecastPrimeTarget(){
+  const cogsEl = document.getElementById('ft-cogs');
+  const laborEl = document.getElementById('ft-labor');
+  const primeEl = document.getElementById('ft-prime');
+  if(!cogsEl || !laborEl || !primeEl) return;
+  const cogs = parseFloat(cogsEl.value) || 0;
+  const labor = parseFloat(laborEl.value) || 0;
+  primeEl.value = Math.round((cogs + labor) * 10) / 10;
+}
+
 /* Defer the local-cache write to the next macrotask so the synchronous
    JSON.stringify(collectState()) doesn't block the click handler. With growing
    state (snapshots, audit log, transactions), the serialize+localStorage write
@@ -1245,6 +1282,8 @@ let actPage=1, actPerPage=50;
    from unpaid expense txs). UI state, not persisted. */
 let payPage=1, payPerPage=25;
 let accrPage=1, accrPerPage=25;
+/* Weekly Check cash ledger pagination — same pattern as the others. UI state. */
+let wkLedgerPage=1, wkLedgerPerPage=25;
 let reportPeriod='month';
 let reportTab='pl'; /* 'pl' | 'balance' | 'cashflow' */
 /* Global date filter — affects all pages */
@@ -4352,7 +4391,7 @@ const MT={
   sale:'Record Sale',expense:'Log Expense',transfer:'Transfer Funds',
   deposit:'Deposit',withdrawal:'Withdrawal',editTx:'Edit Transaction',
   addAccount:'Add Account',editCoa:'Edit COA Account',addCoa:'Add COA Account',
-  forecastTargets:'Set Targets',
+  /* forecastTargets:'Set Targets', — removed: targets now edited on Weekly Check */
   addPayrollAdj:'Add Payroll Adjustment',
   giveAdvance:'Give Cash Advance',
   backfillMonth:'Backfill Historical Month',
@@ -4824,13 +4863,10 @@ function renderModal(){
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
     </div>`;
 
-  }else if(type==='forecastTargets'){
-    body=`<div class="form-row">
-      <div class="form-group"><label>COGS Target %</label><input id="ft-cogs" type="number" min="0" max="100" step="0.5" value="${forecastTargets.cogsTarget||30}"></div>
-      <div class="form-group"><label>Labor Target %</label><input id="ft-labor" type="number" min="0" max="100" step="0.5" value="${forecastTargets.laborTarget||32}"></div>
-      <div class="form-group"><label>Prime Cost Target %</label><input id="ft-prime" type="number" min="0" max="100" step="0.5" value="${forecastTargets.primeTarget||62}"></div>
-    </div>
-    <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="forecastTargets={cogsTarget:parseFloat(document.getElementById('ft-cogs').value),laborTarget:parseFloat(document.getElementById('ft-labor').value),primeTarget:parseFloat(document.getElementById('ft-prime').value)};saveTargets();closeModal();renderMain();toast('Targets saved ✓')">Save Targets</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
+  /* (forecastTargets modal removed — targets now edited on the Weekly Check
+     page only. Single source of truth: monthlyBudget + weeklyTargets. The
+     forecastTargets state var stays in collectState for legacy backward-compat
+     but is no longer user-editable.) */
 
   }else{
     // Transaction modal (sale, expense, transfer, deposit, withdrawal, editTx)
@@ -5684,14 +5720,13 @@ function pgDashboard(){
   const totalCash    = treasury.totalCash;
   const totalPayablesAll = treasury.totalPayables;
   const runway       = treasuryService.getRunway();
-  const availableCash= treasuryService.getAvailableCash();
 
-  /* Split payables into long-term (loans) vs operational (supplier credit, etc).
-     A big BDO loan or owner loan dwarfs day-to-day supplier credit and skews
-     the dashboard's "Payables" figure into a number that looks scary but isn't
-     actually due this week. Show OPERATIONAL only by default; long-term debt
-     gets a separate line. Sticky toggle so user can flip back to "all" if they
-     want the totals. */
+  /* Pull the obligation breakdown so we can show each component on the Cash
+     Position card AND so we can derive a "short-term only" available cash that
+     respects the long-term toggle. The previous version used getAvailableCash
+     (which subtracts ALL obligations including long-term) regardless of toggle
+     — that's why Available Cash looked scary while Payables looked tame. */
+  const obligs = treasuryService._getObligations() || { payroll:0, accrued:0, payablesDue:0 };
   const _LONG_TERM_TYPES = new Set(['Loan','Owner Loan']);
   const longTermPayables = (payables||[])
     .filter(p=>p.status!=='paid' && _LONG_TERM_TYPES.has(p.type||''))
@@ -5700,6 +5735,13 @@ function pgDashboard(){
   const dashShowLongTerm = (()=>{ try{return localStorage.getItem('dash_payables_all')==='1';}catch(e){return false;} })();
   /* Headline number for KPI/donut: respect the user's toggle preference. */
   const totalPayables = dashShowLongTerm ? totalPayablesAll : operationalPayables;
+  /* Obligation components for the Cash Position breakdown. payablesDueShown
+     respects the toggle so the breakdown lines tie back to Available Cash. */
+  const oblgPayroll = Number(obligs.payroll)||0;
+  const oblgAccrued = Number(obligs.accrued)||0;
+  const oblgPayablesShown = dashShowLongTerm ? Number(obligs.payablesDue)||0 : operationalPayables;
+  const obligationsShownTotal = oblgPayroll + oblgAccrued + oblgPayablesShown;
+  const availableCash = totalCash - obligationsShownTotal;
 
   /* (leanBreakEven + leanAlerts moved DOWN — they now depend on twShiftLaborP /
      twShiftPrimeP which are computed later in the function. Old position here
@@ -5761,23 +5803,30 @@ function pgDashboard(){
 
   /* ── SVG chart helpers ── */
   function svgBars(twVals, lwVals, height=110, color1='#22c55e', color2='#94a3b8'){
+    /* Old layout: fixed bar width (12 units) inside a 240 viewBox got scaled
+       down to ~5% of the chart width — bars looked anemic with huge whitespace
+       between them. New layout: groupW = W/n, bars take 42% each, gap 6%,
+       padding 5%. Result: bars fill ~84% of the chart horizontally, gaps are
+       just enough to keep the pair visually distinct. */
     const maxV=Math.max(...twVals,...lwVals,1);
-    const W=240, H=height, bw=12, gap=4, groupW=bw*2+gap+8;
-    const n=twVals.length;
-    const totalW=n*groupW;
-    const scaleX=W/totalW;
+    const W=240, H=height;
+    const n=twVals.length||1;
+    const groupW=W/n;
+    const bw=groupW*0.42;
+    const gap=groupW*0.06;
+    const pad=(groupW - bw*2 - gap)/2;
+    const lh=H-18;
     const bars=twVals.map((v,i)=>{
-      const x=(i*groupW)*scaleX;
+      const gx=i*groupW + pad;
       const h1=((lwVals[i]||0)/maxV)*(H-18);
       const h2=(v/maxV)*(H-18);
-      const lh=H-18;
       return `
-        <rect x="${x}" y="${lh-h1}" width="${bw*scaleX}" height="${h1}" fill="${color2}" rx="2"/>
-        <rect x="${x+(bw+gap)*scaleX}" y="${lh-h2}" width="${bw*scaleX}" height="${h2}" fill="${color1}" rx="2"/>
-        <text x="${(x+(bw+gap/2)*scaleX)}" y="${H}" font-size="7" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]}</text>
+        <rect x="${gx}" y="${lh-h1}" width="${bw}" height="${h1}" fill="${color2}" rx="2"/>
+        <rect x="${gx+bw+gap}" y="${lh-h2}" width="${bw}" height="${h2}" fill="${color1}" rx="2"/>
+        <text x="${gx+bw+gap/2}" y="${H-2}" font-size="9" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]||''}</text>
       `;
     }).join('');
-    return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${height}px">${bars}</svg>`;
+    return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${height}px" preserveAspectRatio="xMidYMid meet">${bars}</svg>`;
   }
 
   function svgDonut(pct, color, label, size=80){
@@ -5805,11 +5854,12 @@ function pgDashboard(){
     const budgOk  = vs_budget!==null ? (lowerIsBetter ? vs_budget<=0 : vs_budget>=0) : null;
     const diffColor = diffOk ? 'var(--green)' : 'var(--red)';
     const budgColor = budgOk===null ? 'var(--muted2)' : budgOk ? 'var(--green)' : 'var(--red)';
-    /* If caller passed amounts (for cost-% rows), show "X.X% · ₱amount" inline.
-       Keeps the table the same shape but surfaces the actual pesos behind each
-       percentage — answers "how much money is that, really?". */
+    /* If caller passed amounts (for cost-% rows), stack the peso amount BELOW
+       the percentage. Cleaner read than the inline version — the % is the
+       primary signal, the amount answers "how much is that in pesos?" without
+       crowding the same line. */
     const _withAmt = (pctStr, amt) => (amt!==null && amt!==undefined)
-      ? `${pctStr}<span style="color:var(--muted2);font-weight:400;font-size:.7rem;margin-left:4px">${fmt(amt)}</span>`
+      ? `<div>${pctStr}</div><div style="color:var(--muted2);font-weight:400;font-size:.7rem;margin-top:1px">${fmt(amt)}</div>`
       : pctStr;
     return `
       <tr>
@@ -6081,23 +6131,30 @@ function pgDashboard(){
   </div>
   <div style="padding:10px 14px">
     ${(()=>{
+      /* Three bars per group (Food / Alcohol / NA Bev). Old code capped bar
+         width at 10 units in a 400-unit viewBox → bars only used ~7.5% each
+         × 3 = 22% of horizontal space. New: each bar 27% of the group, gaps
+         2%. Bars fill ~85% of group → readable signal instead of pencil-thin
+         strokes lost in whitespace. */
       const maxV=Math.max(...twFood,...twAlc,...twBev,1);
       const H=110, W=400, n=curBuckets.length||1, groupW=W/n;
-      const bw=Math.min(10, (groupW-6)/3), gap=2;
+      const bw=groupW*0.27;
+      const gap=groupW*0.02;
+      const pad=(groupW - bw*3 - gap*2)/2;
+      const y=H-20;
       const bars=curBuckets.map((b,i)=>{
-        const x=i*groupW+4;
+        const x=i*groupW + pad;
         const hf=((twFood[i]||0)/maxV)*(H-20);
         const ha=((twAlc[i]||0)/maxV)*(H-20);
         const hb=((twBev[i]||0)/maxV)*(H-20);
-        const y=H-20;
         return `
           <rect x="${x}" y="${y-hf}" width="${bw}" height="${hf}" fill="#22c55e" rx="2"/>
           <rect x="${x+bw+gap}" y="${y-ha}" width="${bw}" height="${ha}" fill="#f59e0b" rx="2"/>
           <rect x="${x+bw*2+gap*2}" y="${y-hb}" width="${bw}" height="${hb}" fill="#3b82f6" rx="2"/>
-          <text x="${x+bw*1.5+gap}" y="${H}" font-size="7" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]||''}</text>
+          <text x="${x+(bw*3+gap*2)/2}" y="${H-2}" font-size="9" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]||''}</text>
         `;
       }).join('');
-      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:110px">${bars}</svg>`;
+      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:110px" preserveAspectRatio="xMidYMid meet">${bars}</svg>`;
     })()}
   </div>
 </div>
@@ -6235,12 +6292,14 @@ ${(()=>{
     </div>
     <table>
       <tbody>
-        <tr><td style="font-size:.78rem">Available Cash</td><td class="mono" style="text-align:right;font-weight:700;color:${availableCash>=0?'var(--green)':'var(--red)'}">${fmt(availableCash)}</td></tr>
         <tr><td style="font-size:.78rem">Total Cash</td><td class="mono" style="text-align:right">${fmt(totalCash)}</td></tr>
-        <tr><td style="font-size:.78rem">Payables ${longTermPayables>0?`<span style="font-size:.65rem;color:var(--muted2);font-weight:400">${dashShowLongTerm?'(incl. long-term)':'(operational only)'}</span>`:''}</td><td class="mono" style="text-align:right;color:var(--red)">${fmt(totalPayables)}</td></tr>
+        ${oblgPayroll>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Pending Payroll</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgPayroll)}</td></tr>`:''}
+        ${oblgAccrued>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Accrued Expenses (unpaid bills)</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgAccrued)}</td></tr>`:''}
+        ${oblgPayablesShown>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Payables ${longTermPayables>0?`<span style="font-size:.65rem">${dashShowLongTerm?'(all)':'(operational)'}</span>`:''}</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgPayablesShown)}</td></tr>`:''}
         ${longTermPayables>0 && !dashShowLongTerm
-          ? `<tr><td style="font-size:.7rem;color:var(--muted2);padding-left:14px">└ long-term debt (hidden)</td><td class="mono" style="text-align:right;color:var(--muted2);font-size:.72rem">${fmt(longTermPayables)}</td></tr>`
+          ? `<tr><td style="font-size:.7rem;color:var(--muted2);padding-left:24px;font-style:italic">long-term debt (hidden, not subtracted)</td><td class="mono" style="text-align:right;color:var(--muted2);font-size:.7rem;font-style:italic">${fmt(longTermPayables)}</td></tr>`
           : ''}
+        <tr style="border-top:2px solid var(--border)"><td style="font-size:.82rem;font-weight:700;padding-top:6px">= Available Cash</td><td class="mono" style="text-align:right;font-weight:700;padding-top:6px;color:${availableCash>=0?'var(--green)':'var(--red)'}">${fmt(availableCash)}</td></tr>
         <tr><td style="font-size:.78rem">Runway</td><td class="mono" style="text-align:right;color:${runway>=30?'var(--green)':runway>=14?'var(--amber)':'var(--red)'}">${runway.toFixed(0)} days</td></tr>
       </tbody>
     </table>
@@ -9170,8 +9229,17 @@ function pgWeeklyCheck(){
     };
   });
 
-  /* Cash ledger */
-  const logRows=wTx.sort((a,b)=>b.date.localeCompare(a.date)).slice(0,30).map(t=>`
+  /* Cash ledger — paginated. Previously hard-capped at slice(0,30) which
+     silently hid older movements once a busy week crossed 30 entries. */
+  const sortedLedger = wTx.slice().sort((a,b)=>b.date.localeCompare(a.date));
+  const wkTotal = sortedLedger.length;
+  const wkShowAll = !wkLedgerPerPage || wkLedgerPerPage<=0;
+  const wkTotalPages = wkShowAll ? 1 : Math.max(1, Math.ceil(wkTotal/wkLedgerPerPage));
+  if(wkLedgerPage > wkTotalPages) wkLedgerPage = wkTotalPages;
+  if(wkLedgerPage < 1) wkLedgerPage = 1;
+  const wkStart = wkShowAll ? 0 : (wkLedgerPage-1)*wkLedgerPerPage;
+  const wkEnd = wkShowAll ? wkTotal : Math.min(wkTotal, wkStart+wkLedgerPerPage);
+  const logRows=sortedLedger.slice(wkStart, wkEnd).map(t=>`
     <tr>
       <td style="font-size:.75rem;color:var(--muted);white-space:nowrap">${fmtDate(t.date)}</td>
       <td style="font-size:.76rem">${TL[t.type]||t.type}</td>
@@ -9182,6 +9250,20 @@ function pgWeeklyCheck(){
         ${fmt(t.amount)}${t.status==='unpaid'?'<span style="font-size:.65rem;margin-left:3px;color:var(--amber)">•</span>':''}
       </td>
     </tr>`).join('');
+  const _wkPagerBtn = (label,target,disabled,title) =>
+    `<button class="btn btn-ghost btn-xs" ${disabled?'disabled style="opacity:.35;cursor:not-allowed"':`onclick="wkLedgerPage=${target};renderMain()"`} title="${title||''}">${label}</button>`;
+  const _wkPerPageOpts = [10,25,50,100,0].map(n=>`<option value="${n}" ${wkLedgerPerPage===n?'selected':''}>${n===0?'All':n+' / page'}</option>`).join('');
+  const wkPager = wkTotal>0 ? `<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;border-top:1px solid var(--border);font-size:.74rem;flex-wrap:wrap">
+    <span style="color:var(--muted)">Showing <b style="color:var(--text)">${wkStart+1}</b>–<b style="color:var(--text)">${wkEnd}</b> of <b style="color:var(--text)">${wkTotal}</b></span>
+    ${!wkShowAll && wkTotalPages>1 ? `<div style="display:flex;align-items:center;gap:4px;margin-left:auto">
+      ${_wkPagerBtn('« First',1,wkLedgerPage<=1,'First page')}
+      ${_wkPagerBtn('‹ Prev',Math.max(1,wkLedgerPage-1),wkLedgerPage<=1,'Previous')}
+      <span style="padding:0 8px;color:var(--muted)">Page <b style="color:var(--text)">${wkLedgerPage}</b> of <b style="color:var(--text)">${wkTotalPages}</b></span>
+      ${_wkPagerBtn('Next ›',Math.min(wkTotalPages,wkLedgerPage+1),wkLedgerPage>=wkTotalPages,'Next')}
+      ${_wkPagerBtn('Last »',wkTotalPages,wkLedgerPage>=wkTotalPages,'Last page')}
+    </div>`:'<div style="flex:1"></div>'}
+    <select onchange="wkLedgerPerPage=parseInt(this.value)||0;wkLedgerPage=1;renderMain()" style="font-size:.72rem;padding:2px 6px;border-radius:4px;border:1px solid var(--border2);background:var(--bg);cursor:pointer">${_wkPerPageOpts}</select>
+  </div>` : '';
 
   /* Budget — read from monthlyBudget for current month */
   const currentMk = getMonthKey();
@@ -9220,21 +9302,22 @@ function pgWeeklyCheck(){
       <label>COGS Target %</label>
       <input type="number" id="wt-cogs" step="0.5" min="0" max="100"
         value="${mb.cogsP||30}"
-        oninput="monthlyBudget[getMonthKey()]={...(monthlyBudget[getMonthKey()]||{}),cogsP:parseFloat(this.value)||30};scheduleSave()">
+        oninput="monthlyBudget[getMonthKey()]={...(monthlyBudget[getMonthKey()]||{}),cogsP:parseFloat(this.value)||30};_recalcPrimeTarget();scheduleSave()">
     </div>
 
     <div class="form-group">
       <label>Labor Target %</label>
       <input type="number" id="wt-labor" step="0.5" min="0" max="100"
         value="${mb.laborP||weeklyTargets.laborP||32}"
-        oninput="monthlyBudget[getMonthKey()]={...(monthlyBudget[getMonthKey()]||{}),laborP:parseFloat(this.value)||32};weeklyTargets.laborP=parseFloat(this.value)||32;scheduleSave()">
+        oninput="monthlyBudget[getMonthKey()]={...(monthlyBudget[getMonthKey()]||{}),laborP:parseFloat(this.value)||32};weeklyTargets.laborP=parseFloat(this.value)||32;_recalcPrimeTarget();scheduleSave()">
     </div>
 
     <div class="form-group">
-      <label>Prime Cost Target %</label>
-      <input type="number" id="wt-prime" step="0.5" min="0" max="100"
-        value="${mb.primeP||weeklyTargets.primeP||62}"
-        oninput="monthlyBudget[getMonthKey()]={...(monthlyBudget[getMonthKey()]||{}),primeP:parseFloat(this.value)||62};weeklyTargets.primeP=parseFloat(this.value)||62;scheduleSave()">
+      <label>Prime Cost Target % <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· auto: COGS + Labor</span></label>
+      <input type="number" id="wt-prime" step="0.5" min="0" max="100" readonly
+        value="${(mb.cogsP||30) + (mb.laborP||weeklyTargets.laborP||32)}"
+        style="background:var(--bg3);color:var(--muted);cursor:not-allowed"
+        title="Prime Cost = COGS + Labor by definition. Edit COGS or Labor to change this.">
     </div>
 
     <div class="form-group">
@@ -9330,6 +9413,7 @@ function pgWeeklyCheck(){
       <tbody>${logRows||'<tr><td colspan="6" class="empty">No movements this week</td></tr>'}</tbody>
     </table>
   </div>
+  ${wkPager}
 </div>`;
 }
 
@@ -9473,6 +9557,19 @@ function handleKeyboard(e){
   const map=isStaff?{}:{s:()=>openModal('sale'),e:()=>openModal('expense'),t:()=>openModal('transfer')};
   if(map[e.key]){e.preventDefault();map[e.key]()}
 }
+/* Read the active operational targets from the single source of truth (Weekly
+   Check page → monthlyBudget + weeklyTargets). Falls back to legacy
+   forecastTargets if present (for users with saved data from when Forecast had
+   its own targets modal), then to global defaults. Returns {cogs, labor, prime}
+   where prime is always cogs+labor (derived, never independent). */
+function _getEffectiveTargets(){
+  const mk = (typeof getMonthKey === 'function') ? getMonthKey() : null;
+  const mb = (mk && monthlyBudget && monthlyBudget[mk]) || {};
+  const cogs = Number(mb.cogsP) || Number(forecastTargets?.cogsTarget) || 30;
+  const labor = Number(mb.laborP) || Number(weeklyTargets?.laborP) || Number(forecastTargets?.laborTarget) || 32;
+  return { cogs, labor, prime: Math.round((cogs+labor)*10)/10 };
+}
+
 /* forecastTargets now persists through collectState (server + JSON backup + sync
    recovery). The localStorage seed preserves targets for users who set them
    before this got wired into unified state — once they save once after the
@@ -9527,9 +9624,12 @@ function runForecast(days=30){const dm=buildDailyHistory(),wd=buildWeeklyTotals(
   const obligationsTotal=Number(obligations?.total)||0;
   const adjustedStart=tc-obligationsTotal;
   if(!wd.length)return{days:[],hasEnoughData:false,weeksOfData:0,dowIndex:[1,1,1,1,1,1,1],totalCash:tc,obligationsTotal,adjustedStart};
-  const wmaS=weightedMovingAvg(wd,'sales'),wmaO=weightedMovingAvg(wd,'otherExp');const di=buildDOWIndex(dm),sd=buildStdDev(dm),ads=wmaS/7;const result=[];let rc=adjustedStart;for(let i=1;i<=days;i++){const d=new Date();d.setDate(d.getDate()+i);const iso=localISO(d),dow=d.getDay();const fs=ads*di[dow],fc=fs*(forecastTargets.cogsTarget/100),fl=fs*(forecastTargets.laborTarget/100),fo=wmaO/7;const fe=fc+fl+fo,fn=fs-fe;rc+=fn;result.push({iso,dow,label:d.toLocaleDateString('en-US',{month:'short',day:'numeric'}),dayLabel:d.toLocaleDateString('en-US',{weekday:'short'}),forecastedSales:fs,forecastedCogs:fc,forecastedLabor:fl,forecastedOther:fo,forecastedExp:fe,forecastedNet:fn,bestSales:fs+sd*di[dow],worstSales:Math.max(0,fs-sd*di[dow]),forecastedPrime:fs>0?(fc+fl)/fs*100:0,runningCash:rc,isWeekend:dow===0||dow===6})}return{days:result,hasEnoughData:wd.length>=2,weeksOfData:wd.length,wmaWeeklySales:wmaS,avgDailySales:ads,dowIndex:di,stdDev:sd,totalCash:tc,obligationsTotal,adjustedStart}}
+  const _eff=_getEffectiveTargets();
+  const wmaS=weightedMovingAvg(wd,'sales'),wmaO=weightedMovingAvg(wd,'otherExp');const di=buildDOWIndex(dm),sd=buildStdDev(dm),ads=wmaS/7;const result=[];let rc=adjustedStart;for(let i=1;i<=days;i++){const d=new Date();d.setDate(d.getDate()+i);const iso=localISO(d),dow=d.getDay();const fs=ads*di[dow],fc=fs*(_eff.cogs/100),fl=fs*(_eff.labor/100),fo=wmaO/7;const fe=fc+fl+fo,fn=fs-fe;rc+=fn;result.push({iso,dow,label:d.toLocaleDateString('en-US',{month:'short',day:'numeric'}),dayLabel:d.toLocaleDateString('en-US',{weekday:'short'}),forecastedSales:fs,forecastedCogs:fc,forecastedLabor:fl,forecastedOther:fo,forecastedExp:fe,forecastedNet:fn,bestSales:fs+sd*di[dow],worstSales:Math.max(0,fs-sd*di[dow]),forecastedPrime:fs>0?(fc+fl)/fs*100:0,runningCash:rc,isWeekend:dow===0||dow===6})}return{days:result,hasEnoughData:wd.length>=2,weeksOfData:wd.length,wmaWeeklySales:wmaS,avgDailySales:ads,dowIndex:di,stdDev:sd,totalCash:tc,obligationsTotal,adjustedStart}}
 function pgForecast(){
-  const fc=runForecast(30);const targets=forecastTargets;
+  /* Targets now come from Weekly Check (monthlyBudget + weeklyTargets).
+     _getEffectiveTargets returns {cogs, labor, prime} with prime auto-derived. */
+  const fc=runForecast(30);const _eff=_getEffectiveTargets();const targets={cogsTarget:_eff.cogs,laborTarget:_eff.labor,primeTarget:_eff.prime};
   const cut30=new Date();cut30.setDate(cut30.getDate()-30);
   const past30=transactions.filter(t=>t.date>=localISO(cut30)&&t.date<today()&&!t.voided);
   const pastM=calcMetrics(past30);
@@ -9543,7 +9643,7 @@ function pgForecast(){
   const dowNames=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
   const dowCards=fc.dowIndex.map((idx,i)=>{const p=((idx-1)*100);const color=idx>=1.05?'var(--green)':idx<=0.95?'var(--red)':'var(--muted)';return`<div style="text-align:center;padding:9px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:7px"><div style="font-size:.67rem;color:var(--muted);margin-bottom:2px">${dowNames[i]}</div><div style="font-size:.82rem;font-weight:600;color:${color}">${idx>=1.05?'+'+p.toFixed(0)+'%':idx<=0.95?p.toFixed(0)+'%':'avg'}</div></div>`}).join('');
   const tableRows=fc.days.map(d=>`<tr style="${d.isWeekend?'background:var(--bg3)':''}"><td style="font-size:.75rem;white-space:nowrap;color:var(--muted)">${d.label}</td><td style="font-size:.72rem;color:var(--muted2)">${d.dayLabel}</td><td class="mono" style="text-align:right;color:var(--blue)">${fmt(d.forecastedSales)}</td><td class="mono" style="text-align:right;font-size:.74rem;color:var(--muted2)">${fmt(d.worstSales)}–${fmt(d.bestSales)}</td><td class="mono" style="text-align:right;font-size:.75rem;color:var(--red)">${fmt(d.forecastedExp)}</td><td class="mono" style="text-align:right;font-size:.75rem;color:${d.forecastedNet>=0?'var(--green)':'var(--red)'}">${d.forecastedNet>=0?'+':''}${fmt(d.forecastedNet)}</td><td style="text-align:right;font-size:.73rem;font-weight:600;color:${d.forecastedPrime<=60?'var(--green)':d.forecastedPrime<=68?'var(--amber)':'var(--red)'}">${d.forecastedPrime.toFixed(1)}%</td><td class="mono" style="text-align:right;font-size:.74rem;color:${d.runningCash>=0?'var(--text2)':'var(--red)'}">${fmt(d.runningCash)}</td></tr>`).join('');
-  return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Forecast</div><div class="page-sub">30-day projection · ${fc.weeksOfData} week${fc.weeksOfData===1?'':'s'} of history</div></div><button class="btn btn-ghost btn-sm" onclick="openModal('forecastTargets')">⚙ Targets</button></div>
+  return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Forecast</div><div class="page-sub">30-day projection · ${fc.weeksOfData} week${fc.weeksOfData===1?'':'s'} of history · targets from Weekly Check</div></div><button class="btn btn-ghost btn-sm" onclick="navigate('weekly')" title="Edit COGS / Labor / Prime targets on the Weekly Check page">⚙ Edit Targets</button></div>
 ${notEnoughBanner}
 <div class="g4" style="margin-bottom:12px"><div class="card"><div class="stat-label">Next 7 Days</div><div class="stat-value" style="color:var(--blue)">${fmt(nwSales)}</div></div><div class="card"><div class="stat-label">Forecasted Prime</div><div class="stat-value">${nwPrimeP}%</div>${pctBadge(parseFloat(nwPrimeP),'prime')}</div><div class="card"><div class="stat-label">Cash in 30 Days</div><div class="stat-value ${cashDiff>=0?'green':'red'}">${fmt(cashIn30)}</div><div class="stat-sub">${cashDiff>=0?'+':''}${fmt(cashDiff)} vs today</div></div><div class="card"><div class="stat-label">vs Actuals (30d)</div><div style="font-size:.77rem;margin-top:4px"><div style="display:flex;justify-content:space-between"><span class="muted">COGS</span><span class="mono" style="font-size:.79rem;color:${pastM.cogsP<=targets.cogsTarget?'var(--green)':'var(--red)'}">${pastM.cogsP.toFixed(1)}%</span></div><div style="display:flex;justify-content:space-between"><span class="muted">Labor</span><span class="mono" style="font-size:.79rem;color:${pastM.laborP<=targets.laborTarget?'var(--green)':'var(--red)'}">${pastM.laborP.toFixed(1)}%</span></div></div></div></div>
 <div class="card" style="margin-bottom:12px"><div class="sec-title" style="margin-bottom:8px">Day-of-Week Seasonality</div><div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px">${dowCards}</div></div>
