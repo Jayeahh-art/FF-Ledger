@@ -5978,18 +5978,37 @@ ${(()=>{
   const periods=getTrendPeriods(dashLens.gran, dashLens.anchor, count);
   const periodMetrics=periods.map(p=>{
     const txs=transactions.filter(t=>!t.voided && t.date>=p.from && t.date<=p.to);
-    return {...p, m:financialService.getMetrics(txs)};
+    const m=financialService.getMetrics(txs);
+    /* Shift-based labor for trend display: sum the actual day-by-day shift pay
+       across the period instead of the lump-sum posted wage tx that hits the
+       ledger on cutoff/payday dates. The posted version creates artificial
+       spikes on payday weeks (e.g., the May 25 cutoff dumps two weeks of
+       wages onto one day → that week looks 2x normal). Shift-based smooths
+       this back to reality: Monday's hours hit Monday, etc. The Reports →
+       P&L still uses posted (correct for journal entries / BIR); only this
+       operational trend chart switches to live shifts. */
+    let shiftLabor=0;
+    let d=p.from, _safety=0;
+    while(d<=p.to && _safety<400){
+      shiftLabor += dayLaborCostFromShifts(d) || 0;
+      d=addDays(d,1);
+      _safety++;
+    }
+    const shiftLaborP = m.netRevenue>0 ? (shiftLabor/m.netRevenue)*100 : 0;
+    const primeLiveP  = m.netRevenue>0 ? ((shiftLabor + (m.cogs||0)) / m.netRevenue) * 100 : 0;
+    return {...p, m, shiftLabor, shiftLaborP, primeLiveP};
   });
   const isPct = dashTrendMetric==='laborP' || dashTrendMetric==='primeP' || dashTrendMetric==='cogsP';
-  const pickVal = m => {
-    if(dashTrendMetric==='revenue') return m.netRevenue||0;
-    if(dashTrendMetric==='netProfit') return m.netProfit||0;
-    if(dashTrendMetric==='cogsP') return m.cogsP||0;
-    if(dashTrendMetric==='laborP') return m.laborP||0;
-    if(dashTrendMetric==='primeP') return m.primeP||0;
+  const pickVal = p => {
+    if(dashTrendMetric==='revenue') return p.m.netRevenue||0;
+    if(dashTrendMetric==='netProfit') return p.m.netProfit||0;
+    if(dashTrendMetric==='cogsP') return p.m.cogsP||0;
+    /* Labor and Prime: use shift-based numbers (smooth) instead of posted (spiky on payday). */
+    if(dashTrendMetric==='laborP') return p.shiftLaborP||0;
+    if(dashTrendMetric==='primeP') return p.primeLiveP||0;
     return 0;
   };
-  const vals=periodMetrics.map(p=>pickVal(p.m));
+  const vals=periodMetrics.map(p=>pickVal(p));
   const maxV=Math.max(...vals.map(Math.abs),1);
   /* Wider viewBox (1000 vs old 600) so weekly labels have horizontal room and
      font-size scales up proportionally with the card width. Taller too (160 vs
@@ -6026,7 +6045,7 @@ ${(()=>{
     <div style="padding:14px">
       <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="xMidYMid meet">
         ${periodMetrics.map((p,i)=>{
-          const v=pickVal(p.m), h=(Math.abs(v)/maxV)*(H-46), y=H-28-h, x=barX(i);
+          const v=pickVal(p), h=(Math.abs(v)/maxV)*(H-46), y=H-28-h, x=barX(i);
           return `<rect x="${x}" y="${y}" width="${bw}" height="${h}" fill="${activeColor}" rx="3" opacity="${i===periodMetrics.length-1?'1':'0.7'}"/>
             <text x="${x+bw/2}" y="${y-4}" font-size="12" fill="var(--muted)" text-anchor="middle" font-weight="600">${isPct?v.toFixed(1)+'%':fmt(v).replace('PHP','')}</text>
             <text x="${x+bw/2}" y="${H-8}" font-size="11" fill="var(--muted2)" text-anchor="middle">${trendLabel(p)}</text>`;
