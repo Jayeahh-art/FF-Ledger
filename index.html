@@ -181,6 +181,13 @@ textarea{resize:vertical;min-height:64px}
 .bar-label{font-size:.59rem;color:var(--muted2);margin-top:3px;white-space:nowrap}
 .chart-legend{display:flex;gap:11px;font-size:.69rem;color:var(--muted);margin-top:6px;flex-wrap:wrap}
 .legend-dot{display:inline-block;width:6px;height:6px;border-radius:2px;margin-right:3px}
+/* Dashboard donut cards (Gross Profit, Prime Cost) — override svgDonut's
+   fixed-px sizing so the donut fills its flex:1 wrapper. Without this, the
+   donut stays at the 90px the helper hardcoded even when the grid row gives
+   the card 280+px of vertical space (driven by the much-taller Cash Position
+   card on the right). Capped at 220px so on extremely tall rows the donut
+   doesn't balloon past legibility. */
+.dash-donut-wrap > svg{width:auto !important;height:100% !important;max-height:220px;max-width:100%}
 
 /* PROGRESS */
 .progress-bar{height:4px;background:var(--bg3);border-radius:2px;overflow:hidden;margin-top:5px}
@@ -5561,27 +5568,50 @@ function pgDashboard(){
   /* periodLaborP / periodPrimeP defined AFTER twShiftLabor below — they now use
      the shift-based values so KPI cards + donuts match the trend chart. */
 
-  /* Shift-based labor for the operational dashboard view (KPI cards, donuts,
-     trend chart, Prime Cost, EBITDA). Spreads each shift's pay across the days
-     work actually happened — no payday spikes from posted lump wages. Posted
-     labor (tw.laborP) is still shown in the WoW table as a "(posted)" row for
-     reference, and Reports → P&L continues to use posted for accounting. */
-  const twShiftLabor = thisWeekDates.reduce((s,d)=>s+dayLaborCostFromShifts(d),0);
-  const lwShiftLabor = lastWeekDates.reduce((s,d)=>s+dayLaborCostFromShifts(d),0);
+  /* TRUE LABOR for the operational dashboard view (KPI cards, donuts, trend
+     chart, Prime Cost, EBITDA). Two components, summed:
+       1. SHIFT-BASED WAGES — sum of dayLaborCostFromShifts() per day.
+          Spreads each shift's pay across the day work actually happened —
+          no payday spikes from posted lump wages.
+       2. NON-SHIFT LABOR — anything in the Labor COA group that ISN'T a
+          direct wage account (x6000–x6070). Catches Staff Meals (x6090),
+          Uniforms & Welfare (x6100), Training & Recruitment (x6110),
+          Payroll Taxes & Benefits (x6080, employer SSS/PhilHealth/HDMF
+          contributions), and Management Salaries (x6200).
+          Direct wage accounts are EXCLUDED here because they're already
+          counted in the shift-based portion — including them would double-
+          count posted wages on payroll-finalize dates.
+     Posted labor (tw.laborP) is still surfaced in the WoW table at month+
+     granularity for accountant cross-check, and Reports → P&L continues to
+     use posted for journal entries / BIR. */
+  const twShiftWages = thisWeekDates.reduce((s,d)=>s+dayLaborCostFromShifts(d),0);
+  const lwShiftWages = lastWeekDates.reduce((s,d)=>s+dayLaborCostFromShifts(d),0);
+  const _WAGE_IDS = new Set(['x6000','x6010','x6020','x6030','x6040','x6050','x6060','x6070']);
+  const _nonShiftLaborFor = (txs) => (txs||[]).filter(t=>{
+    if(!t || t.voided || t.type!=='expense') return false;
+    if(_WAGE_IDS.has(t.coaId)) return false; // direct wages — already in shifts
+    const c = (coa||[]).find(x=>x.id===t.coaId||x.name===t.category);
+    return c?.group === 'Labor';
+  }).reduce((s,t)=>s+(Number(t.amount)||0),0);
+  const twNonShiftLabor = _nonShiftLaborFor(twTx);
+  const lwNonShiftLabor = _nonShiftLaborFor(lwTx);
+  /* Total labor = shift wages + ancillary labor costs. This is what the
+     dashboard percentages and Prime Cost are now derived from. */
+  const twShiftLabor = twShiftWages + twNonShiftLabor;
+  const lwShiftLabor = lwShiftWages + lwNonShiftLabor;
   const twShiftLaborP = tw.netRevenue>0 ? (twShiftLabor/tw.netRevenue*100) : 0;
   const lwShiftLaborP = lw.netRevenue>0 ? (lwShiftLabor/lw.netRevenue*100) : 0;
-  /* Prime Cost = COGS + Labor. Swap labor for shift-based; keep posted COGS
-     (DSR posts COGS daily already, no spike). */
+  /* Prime Cost = COGS + Labor. Swap labor for total (shift+ancillaries);
+     keep posted COGS (DSR posts COGS daily already, no spike). */
   const twShiftPrimeP = tw.netRevenue>0 ? ((twShiftLabor + (tw.cogs||0))/tw.netRevenue*100) : 0;
   const lwShiftPrimeP = lw.netRevenue>0 ? ((lwShiftLabor + (lw.cogs||0))/lw.netRevenue*100) : 0;
   /* EBITDA = grossProfit - labor - opex. Swap labor: take posted ebitda, add
-     posted labor back, subtract shift labor. Same trick as the trend chart's
+     posted labor back, subtract total labor. Same trick as the trend chart's
      netProfitLive — no need to re-derive every component. */
   const twShiftEbitda = (tw.ebitda||0) + (tw.labor||0) - twShiftLabor;
   const lwShiftEbitda = (lw.ebitda||0) + (lw.labor||0) - lwShiftLabor;
-  /* periodLaborP / periodPrimeP: now the shift-based versions so KPI cards +
-     donuts show the operational view (matching the trend chart). The posted
-     versions are still surfaced in the WoW table for accounting reference. */
+  /* periodLaborP / periodPrimeP: now total-labor-based so KPI cards + donuts
+     show true labor cost (matching the trend chart and WoW row). */
   const periodLaborP = twShiftLaborP;
   const periodPrimeP = twShiftPrimeP;
 
@@ -5755,10 +5785,39 @@ function pgDashboard(){
         <td colspan="6" style="padding:4px 10px;font-size:.63rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)">Cost Controls</td>
       </tr>
       ${wowRow('Food Cost (COGS%)', tw.cogsP, lw.cogsP, budgetCogsP, false, true, tw.cogs, lw.cogs)}
-      ${wowRow('Labor Cost % (operational · live shifts)', twShiftLaborP, lwShiftLaborP, budgetLaborP, false, true, twShiftLabor, lwShiftLabor)}
-      ${wowRow('Labor Cost % (posted · accounting)', tw.laborP, lw.laborP, budgetLaborP, false, true, tw.labor, lw.labor)}
+      ${(()=>{
+        /* Labor row strategy by lens granularity:
+             week → ONE row, shift-based only ("Labor Cost %"), because the
+                    posted view is misleading at this granularity (no wages
+                    in the ledger between payroll finalize events, then a
+                    huge cliff on the finalize date).
+             month/quarter/year → BOTH rows, labelled "(live shifts)" and
+                    "(posted · accounting)" so the user can cross-check.
+                    At these granularities the two numbers should match
+                    within a few percent (provided every cutoff in the
+                    period is finalized) — divergence highlights ancillary
+                    labor (staff meals, training, uniforms) not captured by
+                    the shift-based view.
+             custom → treat as week (hide posted) — custom ranges are usually
+                    ad-hoc lookups, not month-end accounting.            */
+        const showPosted = ['month','quarter','year'].includes(dashLens.gran);
+        /* Breakdown tooltip on the label — surface what's in "true labor":
+           shift wages vs ancillaries (meals/uniforms/training/MGT/benefits). */
+        const _breakdown = (shiftAmt, nonShiftAmt) =>
+          `Shift wages: ${fmt(shiftAmt)}&#10;Ancillaries (meals, uniforms, training, MGT, benefits): ${fmt(nonShiftAmt)}`;
+        const laborLabel = `Labor Cost % <span title="${_breakdown(twShiftWages, twNonShiftLabor)}" style="cursor:help;color:var(--muted2);font-size:.7rem">ⓘ</span>`;
+        const liveLabel  = `Labor Cost % (live shifts + ancillaries) <span title="${_breakdown(twShiftWages, twNonShiftLabor)}" style="cursor:help;color:var(--muted2);font-size:.7rem">ⓘ</span>`;
+        if (showPosted){
+          return `${wowRow(liveLabel, twShiftLaborP, lwShiftLaborP, budgetLaborP, false, true, twShiftLabor, lwShiftLabor)}
+      ${wowRow('Labor Cost % (posted · accounting)', tw.laborP, lw.laborP, budgetLaborP, false, true, tw.labor, lw.labor)}`;
+        }
+        return wowRow(laborLabel, twShiftLaborP, lwShiftLaborP, budgetLaborP, false, true, twShiftLabor, lwShiftLabor);
+      })()}
       ${wowRow('Prime Cost %', twShiftPrimeP, lwShiftPrimeP, budgetPrimeP, false, true, twShiftLabor + (tw.cogs||0), lwShiftLabor + (lw.cogs||0))}
       ${wowRow('EBITDA', twShiftEbitda, lwShiftEbitda, 0, true, false)}
+      ${['month','quarter','year'].includes(dashLens.gran)
+        ? `<tr><td colspan="6" style="padding:6px 10px;font-size:.66rem;color:var(--muted2);font-style:italic;border-top:1px solid var(--border)">Live shifts + ancillaries = (shifts × rates per day) + posted meals/uniforms/training/MGT/benefits. Honest for period-level review with no payday cliff. Posted = same set but using ledger wage txs (cliffs on finalize date). Should match within a few % if every cutoff in this period is finalized.</td></tr>`
+        : ''}
     </tbody>
   </table>
 </div>
@@ -5857,26 +5916,37 @@ ${(()=>{
        this back to reality: Monday's hours hit Monday, etc. The Reports →
        P&L still uses posted (correct for journal entries / BIR); only this
        operational trend chart switches to live shifts. */
-    let shiftLabor=0;
+    let shiftWages=0;
     let d=p.from, _safety=0;
     /* _safety cap was 400 (covered weekly/monthly/quarterly periods up to ~13mo).
        Bumped to 2500 so multi-year periods don't get silently chopped — a yearly
        trend showing 3 years iterates ~1100 days per period. Cap stays as a
        runaway-loop guard, just sized generously. */
     while(d<=p.to && _safety<2500){
-      shiftLabor += dayLaborCostFromShifts(d) || 0;
+      shiftWages += dayLaborCostFromShifts(d) || 0;
       d=addDays(d,1);
       _safety++;
     }
+    /* Non-shift labor for this trend bucket: ancillary labor costs in the
+       Labor COA group that aren't direct wages (meals, uniforms, training,
+       MGT, benefits). Matches the dashboard's "true labor" definition so
+       the trend chart agrees with the WoW row and KPI cards. */
+    const _WAGE = new Set(['x6000','x6010','x6020','x6030','x6040','x6050','x6060','x6070']);
+    const nonShiftLabor = txs.filter(t=>{
+      if(!t || t.voided || t.type!=='expense') return false;
+      if(_WAGE.has(t.coaId)) return false;
+      const c = (coa||[]).find(x=>x.id===t.coaId||x.name===t.category);
+      return c?.group === 'Labor';
+    }).reduce((s,t)=>s+(Number(t.amount)||0),0);
+    const shiftLabor = shiftWages + nonShiftLabor; // true labor for this trend point
     const shiftLaborP = m.netRevenue>0 ? (shiftLabor/m.netRevenue)*100 : 0;
     const primeLiveP  = m.netRevenue>0 ? ((shiftLabor + (m.cogs||0)) / m.netRevenue) * 100 : 0;
-    /* Net Profit using shift-based labor — swap posted labor for shift labor
-       in the net-profit formula. m.netProfit already subtracts m.labor (posted),
-       so adding m.labor back and subtracting shiftLabor gives the live version
-       without re-deriving all other components. Same reasoning as labor %:
-       payday lumps distort the weekly read; shifts spread the cost honestly. */
+    /* Net Profit using true labor — swap posted labor for total (shift +
+       ancillaries) in the net-profit formula. m.netProfit already subtracts
+       m.labor (posted), so adding m.labor back and subtracting shiftLabor
+       gives the live version without re-deriving all other components. */
     const netProfitLive = (m.netProfit||0) + (m.labor||0) - shiftLabor;
-    return {...p, m, shiftLabor, shiftLaborP, primeLiveP, netProfitLive};
+    return {...p, m, shiftLabor, shiftWages, nonShiftLabor, shiftLaborP, primeLiveP, netProfitLive};
   });
   const isPct = dashTrendMetric==='laborP' || dashTrendMetric==='primeP' || dashTrendMetric==='cogsP';
   const pickVal = p => {
@@ -5943,15 +6013,26 @@ ${(()=>{
 <!-- ═══ DONUTS + CASH POSITION ════════════════ -->
 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:14px">
 
+  <!-- Donut cards: the donut wrapper is flex:1 with a min-height of 0 so it
+       expands to fill whatever vertical space the grid row gives this card
+       (driven by the tallest sibling, usually the Cash Position card). The
+       inner SVG inherits 100% height/width from that wrapper, capped at 220px
+       so on very tall rows the donut doesn't balloon beyond legibility. The
+       svgDonut helper returns a 80×80 viewBox SVG with preserveAspectRatio,
+       so it scales cleanly. -->
   <div class="card" style="display:flex;flex-direction:column;align-items:center;gap:6px">
     <div class="sec-title" style="align-self:flex-start">Gross Profit</div>
-    ${svgDonut(grossProfitP, grossProfitP>=60?'#22c55e':grossProfitP>=50?'#f59e0b':'#ef4444', 'GP%', 90)}
+    <div class="dash-donut-wrap" style="flex:1;min-height:0;width:100%;display:flex;align-items:center;justify-content:center">
+      ${svgDonut(grossProfitP, grossProfitP>=60?'#22c55e':grossProfitP>=50?'#f59e0b':'#ef4444', 'GP%', 90)}
+    </div>
     <div style="font-size:.75rem;color:var(--muted2);text-align:center">${fmt(tw.grossProfit)} · ${currentRange.label}</div>
   </div>
 
   <div class="card" style="display:flex;flex-direction:column;align-items:center;gap:6px">
     <div class="sec-title" style="align-self:flex-start">Prime Cost</div>
-    ${svgDonut(periodPrimeP, periodPrimeP<=62?'#22c55e':periodPrimeP<=68?'#f59e0b':'#ef4444', 'Prime%', 90)}
+    <div class="dash-donut-wrap" style="flex:1;min-height:0;width:100%;display:flex;align-items:center;justify-content:center">
+      ${svgDonut(periodPrimeP, periodPrimeP<=62?'#22c55e':periodPrimeP<=68?'#f59e0b':'#ef4444', 'Prime%', 90)}
+    </div>
     <div style="font-size:.75rem;color:var(--muted2);text-align:center">COGS ${periodCogsP.toFixed(1)}% + Labor ${periodLaborP.toFixed(1)}%</div>
   </div>
 
