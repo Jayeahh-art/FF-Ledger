@@ -6887,6 +6887,7 @@ function recalcDSR(date){
   const nCard   = g('n-card');
   const nTips   = g('n-tips');
   const nStartCash = g('n-startcash');
+  const lStartCash = g('l-startcash');
   const nCashDec= g('n-cashdec');
   const nFoodTab= g('n-foodtab');
 
@@ -6954,8 +6955,8 @@ function recalcDSR(date){
 
   /* ── CASH READINGS ── */
   const nCashReading = nCash + nStartCash;
-  const lCashReading = lCash;
-  const tStartCash   = nStartCash;
+  const lCashReading = lCash + lStartCash;
+  const tStartCash   = nStartCash + lStartCash;
   const tCashReading = nCashReading + lCashReading;
 
   /* ── SHORT/OVER ── */
@@ -7039,7 +7040,7 @@ function recalcDSR(date){
   const lGrossCurrent=g('l-gross');
   const fields={
     nGross,nDisc,nSC,nRefund,nVAT,nFood,nAlc,nBev,nPax,nCash,nGcash,nCard,nTips,nStartCash,nCashDec,nFoodTab,
-    lGross:lGrossCurrent,lDisc,lSC,lRefund,lFood,lAlc,lBev,lPax,lCash,lGcash,lCard,lTips,lCashDec,lFoodTab,lVAT,
+    lGross:lGrossCurrent,lDisc,lSC,lRefund,lFood,lAlc,lBev,lPax,lCash,lGcash,lCard,lTips,lStartCash,lCashDec,lFoodTab,lVAT,
     foodOnly,foodBev
   };
   if(!dsrEntries[date])dsrEntries[date]={};
@@ -7096,6 +7097,7 @@ function pgDSR(){
   const nVAT=e.nVAT||0, nFood=e.nFood||0, nAlc=e.nAlc||0, nBev=e.nBev||0, nPax=e.nPax||0;
   const nCash=e.nCash||0, nGcash=e.nGcash||0, nCard=e.nCard||0, nTips=e.nTips||0;
   const nStartCash=e.nStartCash||0, nCashDec=e.nCashDec||0, nFoodTab=e.nFoodTab||0;
+  const lStartCash=e.lStartCash||0;
   const lDisc=e.lDisc||0, lSC=e.lSC||0, lRefund=e.lRefund||0;
   const lFood=e.lFood||0, lAlc=e.lAlc||0, lBev=e.lBev||0, lPax=e.lPax||0;
   const lCash=e.lCash||0, lGcash=e.lGcash||0, lCard=e.lCard||0;
@@ -7111,7 +7113,7 @@ function pgDSR(){
   const nFBVariance = (nFood>0||nAlc>0||nBev>0)?(nFood+nAlc+nBev)-nNet:0;
   const lFBVariance = (lFood>0||lAlc>0||lBev>0)?(lFood+lAlc+lBev)-lNet:0;
   const nCashRd = nCash+nStartCash;
-  const lCashRd = lCash;
+  const lCashRd = lCash+lStartCash;
   const tCashRd = nCashRd+lCashRd;
   const nSO=nCashDec-nCashRd, lSO=lCashDec-lCashRd, tSO=(nCashDec+lCashDec)-tCashRd;
   /* Sales recon: collections minus SC should equal Net Sales. Only show once
@@ -7284,9 +7286,9 @@ function pgDSR(){
         <tr><td colspan="4" style="height:4px;background:var(--bg3);padding:0"></td></tr>
         <tr>
           <td style="font-size:.82rem">STARTING CASH</td>
-          <td style="text-align:right"><span id="dsr-out-startcash-t" class="mono" style="font-size:.82rem">${fmt(nStartCash)}</span></td>
+          <td style="text-align:right"><span id="dsr-out-startcash-t" class="mono" style="font-size:.82rem">${fmt(nStartCash+lStartCash)}</span></td>
           <td style="text-align:right">${IN('n-startcash',nStartCash)}</td>
-          <td style="text-align:right"><span class="mono" style="font-size:.78rem;color:var(--muted2)">—</span></td>
+          <td style="text-align:right">${IN('l-startcash',lStartCash)}</td>
         </tr>
         <tr style="background:var(--bg3)">
           <td style="font-size:.82rem;font-weight:600">CASH READING</td>
@@ -7502,8 +7504,8 @@ function exportDSRCSV(){
       const tTips = num(e.nTips)+num(e.lTips);
       const tPax  = nPax+lPax;
       const avgCheck = tPax>0 ? tNet/tPax : 0;
-      const startCash = num(e.nStartCash);
-      const cashRead  = tCash + startCash; // cash drawer = sales-cash + start float
+      const startCash = num(e.nStartCash) + num(e.lStartCash);
+      const cashRead  = tCash + startCash; // cash drawer = sales-cash + start float (both POS funds combined)
       const cashDec   = num(e.nCashDec)+num(e.lCashDec);
       const shortOver = cashDec - cashRead;
 
