@@ -555,19 +555,6 @@ function _recalcPrimeTarget(){
     if(typeof weeklyTargets === 'object') weeklyTargets.primeP = prime;
   }catch(e){}
 }
-/* Same idea for the Forecast Targets modal — auto-recompute primeTarget when
-   COGS or Labor changes. Writes to the input element so the saved value (from
-   the inline onclick handler) picks it up. */
-function _recalcForecastPrimeTarget(){
-  const cogsEl = document.getElementById('ft-cogs');
-  const laborEl = document.getElementById('ft-labor');
-  const primeEl = document.getElementById('ft-prime');
-  if(!cogsEl || !laborEl || !primeEl) return;
-  const cogs = parseFloat(cogsEl.value) || 0;
-  const labor = parseFloat(laborEl.value) || 0;
-  primeEl.value = Math.round((cogs + labor) * 10) / 10;
-}
-
 /* Defer the local-cache write to the next macrotask so the synchronous
    JSON.stringify(collectState()) doesn't block the click handler. With growing
    state (snapshots, audit log, transactions), the serialize+localStorage write
@@ -586,6 +573,12 @@ function _scheduleCacheWrite(){
   },0);
 }
 function scheduleSave(){
+  /* Bust _getObligations cache on every state mutation. scheduleSave is the
+     funnel for all writes — if data changed, the next render's first
+     _getObligations call must recompute. (render() also busts the cache, so
+     this is belt-and-suspenders for the case where a non-render flow reads
+     obligations between save and the next render — e.g. forecast snapshot.) */
+  if (typeof window !== 'undefined') window._oblCache = null;
   setSyncStatus('saving');
   pendingSave=true;
   _scheduleCacheWrite();          // deferred — non-blocking
@@ -1617,8 +1610,12 @@ function pgCashPosition(){
       <table>
         <tbody>
           <tr>
-            <td>Pending Payroll <span style="font-size:.7rem;color:var(--muted2)">· accrued wages</span></td>
-            <td class="mono" style="text-align:right;color:var(--red)">${fmt(obligs.payroll||0)}</td>
+            <td>Pending Payroll <span style="font-size:.7rem;color:var(--muted2)">· finalized but unpaid wages</span></td>
+            <td class="mono" style="text-align:right;color:${(obligs.payroll||0)>0?'var(--red)':'var(--muted2)'}">${fmt(obligs.payroll||0)}</td>
+          </tr>
+          <tr>
+            <td>Accrued Wages <span style="font-size:.7rem;color:var(--muted2)">· logged shifts not yet finalized</span></td>
+            <td class="mono" style="text-align:right;color:${(obligs.accruedWages||0)>0?'var(--red)':'var(--muted2)'}">${fmt(obligs.accruedWages||0)}</td>
           </tr>
           ${(obligs.accrued||0)>0?`<tr>
             <td>Accrued Expenses <span style="font-size:.7rem;color:var(--muted2)">· supplier credit + Input VAT</span></td>
@@ -1803,41 +1800,13 @@ function logActivity(msg){
 /* ═══════════════════════════════════════════════
    COA HELPERS
 ═══════════════════════════════════════════════ */
-const saleCats=()=>coa.filter(c=>c.type==='revenue'&&c.isDefault!==false).map(c=>c.name);
-const expCats=()=>coa.filter(c=>c.type==='expense'||c.type==='cogs').map(c=>c.name);
-const cogsCats=()=>coa.filter(c=>c.type==='cogs').map(c=>c.name);
-const laborCats=()=>coa
-  .filter(c=>c.group==='Labor')
-  .map(c=>c.name);
-const isLabor=cat=>{
-  if(!cat)return false;
-  const item=coa.find(a=>a.name===cat);
-  // Labor subcategory = 'Labor' or 'Benefits' (staff-related)
-  if(item?.group==='Labor'||item?.group==='Benefits')return true;
-  // Fallback keyword match for manually typed categories
-  return['wage','salary','overtime','differential','staff meal','uniform','training','recruit','foh','boh','management','manager'].some(k=>cat.toLowerCase().includes(k));
-};
-const isCOGS=cat=>{
-  const item=coa.find(a=>a.name===cat);
-  return item?.type==='cogs'||false;
-};
+/* Category predicates kept: coaFor + isFixedCost are still referenced by
+   getBreakEvenStatus. The old saleCats/expCats/cogsCats/laborCats arrays
+   and isLabor/isCOGS/isVariableCost/getDepartment/financialAccountGroups
+   block — all replaced by direct coa[].type / coa[].group / coaId lookups
+   elsewhere — was removed during the dead-code sweep. */
 const coaFor=cat=>coa.find(a=>a.name===cat)||null;
 const isFixedCost=cat=>{const item=coaFor(cat);return item?.fixed_variable==='fixed'};
-const isVariableCost=cat=>{const item=coaFor(cat);return item?.fixed_variable==='variable'||item?.fixed_variable==='semi-variable'};
-const getDepartment=cat=>coaFor(cat)?.department||null;
-
-
-/* ═══════════════════════════════════════════════
-   FINANCIAL ACCOUNT GROUPS — Phase 3
-═══════════════════════════════════════════════ */
-const financialAccountGroups={
-  LABOR:()=>coa.filter(c=>c.group==='Labor').map(c=>c.id),
-  REVENUE:()=>coa.filter(c=>c.type==='revenue').map(c=>c.id),
-  COGS:()=>coa.filter(c=>c.type==='cogs').map(c=>c.id),
-  OPERATING_EXPENSES:()=>coa.filter(c=>c.type==='expense'&&c.group!=='Labor'&&c.group!=='Other Expenses').map(c=>c.id),
-  OTHER_EXPENSES:()=>coa.filter(c=>c.group==='Other Expenses').map(c=>c.id),
-  OTHER_INCOME:()=>coa.filter(c=>c.group==='Other Income').map(c=>c.id)
-};
 
 function resolveLegacyCategory(category=''){
   const map={
@@ -2086,13 +2055,24 @@ const treasuryService={
   },
 
   _getObligations(){
-    /* Hotfix: previous implementation read r.netPay (which doesn't exist on the
-       payrollRuns shape — they store totalPayroll/totalNet) AND filtered by r.status
-       which is never set. Both broken → payroll obligations always 0. Now mirrors
-       pendingPayroll: sum of unpaid wage expense txs tagged with payrollRunId.
-       Also includes other accrued expenses (unpaid non-payroll expense/withdrawal
-       txs) so the obligations view is complete: wages + supplier credit + Input VAT
-       half of unpaid bills + manual payables. */
+    /* Returns the four obligation buckets that draw from operational cash:
+         payroll       — finalized but unpaid wage txs (have payrollRunId)
+         accruedWages  — labor from logged shifts not yet rolled into any
+                         finalized payroll run (real owed labor in the open
+                         pay period; invisible without this since no tx exists yet)
+         accrued       — supplier credit + Input VAT half of unpaid bills
+                         (non-payroll unpaid expense/withdrawal txs)
+         payablesDue   — manual AP rows still unpaid
+       Single source of truth: dashboard Cash Position card AND Cash Position
+       page both read from here so the numbers tie.
+
+       PERFORMANCE: called from 8+ sites per render (dashboard card, lean
+       alerts, runForecast, forecast metrics). The accruedWages branch is
+       O(unique-shift-dates × shifts) because dayLaborCostFromShifts re-walks
+       the shifts array per call. Cached per-render via window._oblCache,
+       which is cleared at the top of render() and at the start of
+       scheduleSave (so any state mutation busts the cache). */
+    if (typeof window !== 'undefined' && window._oblCache) return window._oblCache;
     const txs = (transactions||[]).filter(t=>t&&!t.voided);
     const payroll = txs
       .filter(t=>t.payrollRunId&&t.type==='expense'&&t.status==='unpaid')
@@ -2103,7 +2083,23 @@ const treasuryService={
     const payablesDue = (payables||[])
       .filter(p=>p.status!=='paid')
       .reduce((s,p)=>s+(Number(p.balance)||0),0);
-    return { payroll, accrued, payablesDue, total:payroll+accrued+payablesDue };
+    /* Accrued Wages: walk unique shift-dates, skip any covered by a finalized
+       payroll run (already accounted for in `payroll`), sum dayLaborCostFromShifts.
+       Wrapped in try/catch so a misshapen shift can't break the obligations call
+       (this is read on every dashboard render — must not throw). */
+    let accruedWages = 0;
+    try{
+      const seen={};
+      (shifts||[]).forEach(s=>{
+        if(!s||!s.date||seen[s.date])return;
+        seen[s.date]=true;
+        if(typeof findFinalizedRunForDate==='function' && findFinalizedRunForDate(s.date))return;
+        accruedWages += (typeof dayLaborCostFromShifts==='function' ? dayLaborCostFromShifts(s.date) : 0) || 0;
+      });
+    }catch(e){ accruedWages = 0; }
+    const result = { payroll, accruedWages, accrued, payablesDue, total:payroll+accruedWages+accrued+payablesDue };
+    if (typeof window !== 'undefined') window._oblCache = result;
+    return result;
   },
 
   /* ── Average daily burn (30-day rolling) ── */
@@ -2623,33 +2619,9 @@ function pctBadge(val,type){
    LEAN TREASURY ENGINE
 ═══════════════════════════════════════════════ */
 
-function addTreasuryEvent(){
-  const accountId=document.getElementById('treasury-account')?.value||'';
-  const type=document.getElementById('treasury-type')?.value||'adjustment';
-  const amount=parseFloat(document.getElementById('treasury-amount')?.value||0)||0;
-  const note=document.getElementById('treasury-note')?.value||'';
-  if(!accountId||!amount){ toast('Missing treasury details','error'); return; }
-  assertPeriodUnlocked(today());
-  /* Phase 0A: NO direct balance mutation. Post as a ledger transaction so
-     rebuildAccountBalances() derives the new balance deterministically.
-     Hotfix M4: dropped the treasuryEvents.unshift() — the array was written
-     here but never read anywhere. The audit log captures the equivalent
-     event via createLedgerTransaction → appendAudit('create', tx). The
-     persistence layer for treasuryEvents is kept intact for any pre-existing
-     historical rows in the user's Sheet. */
-  const txType=amount>0?'deposit':'withdrawal';
-  /* Hotfix C7: removed broken ternary (both branches were 'a1000') and dropped
-     coaId entirely — treasury adjustments are cash movements, not P&L events.
-     The tx still hits the selected account's cash balance via rebuildAccountBalances. */
-  createLedgerTransaction({
-    date:today(), type:txType, account:accountId,
-    amount:Math.abs(amount),
-    note:`Treasury ${type}: ${note}`,
-    category:'Treasury Adjustment', handler:currentUser,
-    treasuryEventRef:true
-  });
-  toast('Treasury adjustment saved ✓');
-}
+/* addTreasuryEvent removed — manual treasury-adjustment UI was never wired.
+   Cash movements all flow through createLedgerTransaction directly via the
+   normal forms (deposit/withdrawal/transfer). */
 
 /* Removed: getUpcomingObligations — dead code (defined but never called) with
    three latent bugs (r.netPay didn't exist on runs; !p.paid wasn't how payables
@@ -2693,21 +2665,8 @@ function getTreasuryReconciliation(dateRangeTx=null){
 /* Hotfix M1: deleted getLiquidityPosition free function — 1-line wrapper,
    zero callers. Use treasuryService.getLiquidityPosition() directly. */
 
-function saveWeeklyTargets(){
-
-  weeklyTargets={
-    sales:parseFloat(document.getElementById('target-sales')?.value||0)||0,
-    laborP:parseFloat(document.getElementById('target-labor')?.value||32)||32,
-    primeP:parseFloat(document.getElementById('target-prime')?.value||65)||65,
-    netProfit:parseFloat(document.getElementById('target-profit')?.value||0)||0
-  };
-
-  scheduleSave();
-
-  toast('Weekly targets updated ✓');
-
-  render();
-}
+/* saveWeeklyTargets removed — replaced by inline oninput handlers on the
+   Monthly Budget & Targets card in pgWeeklyCheck. */
 
 
 /* ═══════════════════════════════════════════════
@@ -2986,7 +2945,11 @@ const leanOpsService={
        but rent + payroll hit on the same Friday next week" scenarios. */
     try{
       if (typeof runForecast === 'function') {
-        const f = runForecast(14);
+        /* Use the same long-term toggle as the Forecast page + dashboard so a
+           user who's hidden long-term debt doesn't get phantom "cash will go
+           negative" alerts triggered solely by an unsettleable owner loan. */
+        const _showAll = (()=>{ try{return localStorage.getItem('dash_payables_all')==='1';}catch(e){return false;} })();
+        const f = runForecast(14, {excludeLongTerm: !_showAll});
         const series = (f && Array.isArray(f.days)) ? f.days : [];
         let negDay=null, negVal=0;
         for (const d of series) {
@@ -3638,7 +3601,8 @@ function validateLedgerIntegrity(){
 
 const _ASSERTION_TOLERANCE = 0.01; /* peso rounding tolerance */
 let _assertionsEnabled = true;
-function setAssertionsEnabled(b){ _assertionsEnabled = !!b; }
+/* setAssertionsEnabled removed — toggle is done via window._assertionsEnabled
+   from the console directly (see assertion-block intro comment). */
 
 function assertLedgerIntegrity(){
   const errors=[];
@@ -4022,32 +3986,9 @@ function appendAudit(action,tx){
   auditLog.unshift({id:uid(),action,txId:tx?.id||'',timestamp:new Date().toISOString(),user:currentUser,snapshot:JSON.parse(JSON.stringify(tx||{}))});
   if(auditLog.length>AUDIT_LOG_CAP) auditLog.length=AUDIT_LOG_CAP;
 }
-function updateOpeningCash(amount,countedBy='',verifiedBy=''){
-  const previous=Number(openingCashState.amount||0);
-  const next=Number(amount||0);
-  const delta=next-previous;
-  /* openingCashState is the anchor for treasury-wide reconciliation:
-       expectedCash = openingCashState + ALL inflows ever - ALL outflows ever
-     So editing it RETROACTIVELY shifts the reconciliation variance for every
-     historical period. If the change is non-trivial AND there's existing
-     transaction history, confirm so the user knows what they're about to do. */
-  const hasHistory=Array.isArray(transactions) && transactions.some(t=>t&&!t.voided);
-  if(hasHistory && Math.abs(delta)>=0.01 && previous!==0){
-    if(typeof confirm==='function' && !confirm(
-      `⚠ Changing opening cash from ${fmt(previous)} to ${fmt(next)} (Δ ${delta>=0?'+':''}${fmt(delta)}).\n\n`+
-      `This is the anchor for treasury reconciliation across ALL history. Every prior month's\n`+
-      `"expected cash" and "variance" figures will shift by ${fmt(delta)}.\n\n`+
-      `Only change this if you really mean to correct the all-time starting balance.\n`+
-      `For monthly opening balances, use the Cash Position page's "Apply as opening" instead.\n\n`+
-      `Proceed?`
-    )){
-      return; /* user cancelled — leave state untouched */
-    }
-  }
-  openingCashState={amount:next,lastUpdated:new Date().toISOString(),countedBy,verifiedBy};
-  try{ localStorage.setItem('opening_liquidity',openingCashState.amount); }catch(e){}
-  cashVarianceHistory.unshift({id:uid(),timestamp:new Date().toISOString(),previous,current:openingCashState.amount,variance:delta,countedBy,verifiedBy});
-}
+/* updateOpeningCash removed — function had no caller. If you need to set the
+   opening-cash anchor from a flow, write to openingCashState directly there
+   and push cashVarianceHistory in the same step. */
 function exportDashboardPDF(){
   const budgetRevenue = Number(
     (weeklyTargets && weeklyTargets.sales) ||
@@ -4390,16 +4331,7 @@ function barChart(data,h=110){
   }).join('')}</div><div class="chart-legend"><span><span class="legend-dot" style="background:var(--green)"></span>Sales</span><span><span class="legend-dot" style="background:var(--red)"></span>Expenses</span></div>`;
 }
 
-function areaChart(data){
-  if(!data.length)return`<div class="empty">No data for this period</div>`;
-  const max=Math.max(...data.flatMap(d=>[d.sales||0,d.expenses||0]),1);
-  const W=600,H=120,px=4,py=6,step=(W-px*2)/Math.max(data.length-1,1);
-  const pts=k=>data.map((d,i)=>`${px+i*step},${H-py-(d[k]/max)*(H-py*2)}`).join(' ');
-  const area=(k,c)=>{const p=pts(k);return`<polygon points="${px},${H-py} ${p} ${px+(data.length-1)*step},${H-py}" fill="${c}" opacity="0.09"/><polyline points="${p}" fill="none" stroke="${c}" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>`};
-  const s2=Math.max(Math.floor(data.length/7),1);
-  const lbls=data.filter((_,i)=>i%s2===0||i===data.length-1).map(d=>{const i=data.indexOf(d);return`<text x="${px+i*step}" y="${H+13}" text-anchor="middle" fill="#a8a29e" font-size="9" font-family="DM Sans">${esc(d.label)}</text>`}).join('');
-  return`<div style="width:100%;overflow-x:auto"><svg width="100%" viewBox="0 0 ${W} ${H+18}" preserveAspectRatio="none" style="display:block;min-width:240px">${area('sales','#2d6a4f')}${area('expenses','#b91c1c')}${lbls}</svg></div><div class="chart-legend" style="margin-top:5px"><span><span class="legend-dot" style="background:#2d6a4f"></span>Sales</span><span><span class="legend-dot" style="background:#b91c1c"></span>Expenses</span></div>`;
-}
+/* areaChart removed — replaced everywhere by barChart / svgBars. */
 
 /* ═══════════════════════════════════════════════
    BADGE / AMOUNT
@@ -4425,10 +4357,8 @@ function amountCell(tx){
 }
 const an=id=>esc(accounts.find(a=>a.id===id)?.name??id);
 
-/* Cash Ledger Movement Types */
-const MOVE_TYPES=['Sale Deposit','Bank Deposit','Bank Withdrawal','Supplier Payment','Payroll','Transfer','GCash In','GCash Out','Owner Draw','Owner Injection','Refund','SC Payout','Tips Payout','Misc'];
-const MOVE_IN=['Sale Deposit','Bank Withdrawal','Owner Injection','GCash In'];
-const MOVE_OUT=['Supplier Payment','Payroll','Bank Deposit','GCash Out','Owner Draw','Refund','SC Payout','Tips Payout'];
+/* MOVE_TYPES / MOVE_IN / MOVE_OUT removed — old Cash Ledger taxonomy was
+   never read anywhere (txType / coaId classify movements now). */
 
 /* Positions are state-managed via positions[] (seeded by getDefaultPositions()).
    Helpers below resolve color and department from the current state list.
@@ -5304,33 +5234,11 @@ function getPlanningModel(){
 }
 
 
-function getTxInRange(start,end){
-  return (transactions||[]).filter(t=>{
-    if(t.voided)return false;
-    return t.date >= start && t.date <= end;
-  });
-}
+/* getTxInRange removed — only caller was the deleted getDailyMetrics. Callers
+   that need a range filter use transactions.filter(t=>!t.voided && t.date>=a
+   && t.date<=b) inline (or txInRange for the global-date variant). */
 
-function getDailyMetrics(days=30){
-  const out=[];
-
-  for(let i=days-1;i>=0;i--){
-    const d = new Date();
-    d.setDate(d.getDate()-i);
-
-    const ds=d.toISOString().slice(0,10);
-
-    const tx=getTxInRange(ds,ds);
-    const m=calcMetrics(tx);
-
-    out.push({
-      date:ds,
-      ...m
-    });
-  }
-
-  return out;
-}
+/* getDailyMetrics removed — only caller was the deleted paceToBreakEven. */
 
 function getWeeklyMetrics(weeks=8){
 
@@ -5382,362 +5290,23 @@ function getMonthlyMetrics(months=12){
   return out;
 }
 
-function rollingAverage(values,windowSize=7){
-
-  const out=[];
-
-  for(let i=0;i<values.length;i++){
-
-    const slice=values.slice(
-      Math.max(0,i-windowSize+1),
-      i+1
-    );
-
-    const avg=slice.reduce((s,v)=>s+v,0)/slice.length;
-
-    out.push(avg);
-  }
-
-  return out;
-}
-
-function trendSlope(values){
-
-  if(values.length<2)return 0;
-
-  const first=values[0];
-  const last=values[values.length-1];
-
-  return ((last-first)/(Math.abs(first)||1))*100;
-}
-
-function volatilityIndex(values){
-
-  if(!values.length)return 0;
-
-  const mean=values.reduce((s,v)=>s+v,0)/values.length;
-
-  const variance=values.reduce((s,v)=>
-    s+Math.pow(v-mean,2)
-  ,0)/values.length;
-
-  return Math.sqrt(variance);
-}
-
-function forecastRevenue(){
-
-  const today=new Date();
-
-  const daysElapsed=Math.max(today.getDate(),1);
-
-  const daysInMonth=new Date(
-    today.getFullYear(),
-    today.getMonth()+1,
-    0
-  ).getDate();
-
-  const currentMonth=today.toISOString().slice(0,7);
-
-  const tx=(transactions||[]).filter(t=>
-    t.date.startsWith(currentMonth)&&!t.voided
-  );
-
-  const m=calcMetrics(tx);
-
-  return (m.netRevenue/daysElapsed)*daysInMonth;
-}
-
-function forecastEBITDA(){
-
-  const projectedRevenue=forecastRevenue();
-
-  const currentMonth=new Date().toISOString().slice(0,7);
-
-  const tx=(transactions||[]).filter(t=>
-    t.date.startsWith(currentMonth)&&!t.voided
-  );
-
-  const m=calcMetrics(tx);
-
-  const ebitdaMargin=m.netRevenue>0
-    ? (m.ebitda/m.netRevenue)
-    : 0;
-
-  return projectedRevenue*ebitdaMargin;
-}
-
-function forecastCashflow(){
-
-  const projectedRevenue=forecastRevenue();
-
-  const currentMonth=new Date().toISOString().slice(0,7);
-
-  const tx=(transactions||[]).filter(t=>
-    t.date.startsWith(currentMonth)&&!t.voided
-  );
-
-  const m=calcMetrics(tx);
-
-  const profitMargin=m.netRevenue>0
-    ? (m.netProfit/m.netRevenue)
-    : 0;
-
-  return projectedRevenue*profitMargin;
-}
-
-function getForecastMetrics(days=30){
-
-  return {
-    projectedRevenue:forecastRevenue(days),
-    projectedEBITDA:forecastEBITDA(days),
-    projectedCashflow:forecastCashflow(days)
-  };
-}
-
-function paceToRevenue(){
-
-  const plan=getPlanningModel();
-
-  const today=new Date();
-
-  const daysElapsed=today.getDate();
-
-  const daysInMonth=new Date(
-    today.getFullYear(),
-    today.getMonth()+1,
-    0
-  ).getDate();
-
-  const currentMonth=today.toISOString().slice(0,7);
-
-  const tx=(transactions||[]).filter(t=>
-    t.date.startsWith(currentMonth)&&!t.voided
-  );
-
-  const m=calcMetrics(tx);
-
-  const projected=(m.netRevenue/Math.max(daysElapsed,1))*daysInMonth;
-
-  const remainingNeeded=
-    Math.max(plan.monthlyRevenueTarget-m.netRevenue,0);
-
-  const remainingDays=
-    Math.max(daysInMonth-daysElapsed,1);
-
-  return {
-    actual:m.netRevenue,
-    projected,
-    target:plan.monthlyRevenueTarget,
-    variance:projected-plan.monthlyRevenueTarget,
-    paceP: plan.monthlyRevenueTarget>0
-      ? (projected/plan.monthlyRevenueTarget)*100
-      : 0,
-    neededPerDay: remainingNeeded/remainingDays
-  };
-}
-
-function paceToBreakEven(){
-
-  const p=paceToRevenue();
-
-  const fixed=(transactions||[])
-    .filter(t=>t.type==='expense'&&isFixedCost(t.category))
-    .reduce((s,t)=>s+t.amount,0);
-
-  const recent=calcMetrics(
-    getDailyMetrics(30).flatMap(d=>
-      getTxInRange(d.date,d.date)
-    )
-  );
-
-  const variableRatio=recent.netRevenue>0
-    ? ((recent.cogs+recent.labor)/recent.netRevenue)
-    : 0;
-
-  const be=variableRatio<1
-    ? fixed/(1-variableRatio)
-    : 0;
-
-  return {
-    projectedRevenue:p.projected,
-    breakEvenRevenue:be,
-    gap:p.projected-be
-  };
-}
-
-function paceToLaborTarget(){
-
-  const currentMonth=new Date().toISOString().slice(0,7);
-
-  const tx=(transactions||[]).filter(t=>
-    t.date.startsWith(currentMonth)&&!t.voided
-  );
-
-  const m=calcMetrics(tx);
-
-  return {
-    actual:m.laborP,
-    target:getPlanningModel().laborTargetP,
-    variance:m.laborP-getPlanningModel().laborTargetP
-  };
-}
-
-
-/* ═══════════════════════════════════════════════
-   DASHBOARD CHART HELPERS
-═══════════════════════════════════════════════ */
-
-
-function metricTooltip(text){
-  return `
-    <span title="${text.replace(/"/g,'&quot;')}"
-      style="
-        cursor:help;
-        color:var(--muted2);
-        margin-left:6px;
-        font-size:.72rem;
-        border:1px solid var(--border);
-        border-radius:50%;
-        display:inline-flex;
-        align-items:center;
-        justify-content:center;
-        width:16px;
-        height:16px;
-      "
-    >?</span>
-  `;
-}
-
-
-function miniLineChart(values,height=80,color='var(--green)'){
-  if(!values.length)return '';
-  const max=Math.max(...values,1);
-  const min=Math.min(...values,0);
-  const range=Math.max(max-min,1);
-
-  const pts=values.map((v,i)=>{
-    const x=(i/(values.length-1))*100;
-    const y=100-(((v-min)/range)*100);
-    return `${x},${y}`;
-  }).join(' ');
-
-  return `
-    <svg viewBox="0 0 100 100" preserveAspectRatio="none"
-      style="width:100%;height:${height}px">
-      <polyline
-        fill="none"
-        stroke="${color}"
-        stroke-width="3"
-        points="${pts}"
-      />
-    </svg>
-  `;
-}
-
-function comparisonBars(curVals,prevVals,labels,height=140){
-  const max=Math.max(...curVals,...prevVals,1);
-
-  return `
-  <div style="display:flex;align-items:end;gap:10px;height:${height}px;padding:10px">
-    ${labels.map((l,i)=>{
-      const ch=(curVals[i]/max)*100;
-      const ph=(prevVals[i]/max)*100;
-
-      return `
-        <div style="flex:1;text-align:center">
-          <div style="display:flex;align-items:end;justify-content:center;gap:4px;height:${height-35}px">
-            <div style="width:14px;height:${ph}%;background:#94a3b8;border-radius:4px"></div>
-            <div style="width:14px;height:${ch}%;background:#22c55e;border-radius:4px"></div>
-          </div>
-          <div style="font-size:.7rem;margin-top:6px">${l}</div>
-        </div>
-      `;
-    }).join('')}
-  </div>
-  `;
-}
-
-
-
-
-
-function renderWeeklyPerformanceSection(){
-
-  function getWeekRevenue(offset=0){
-
-    const now=new Date();
-    const currentDay=(now.getDay()+6)%7;
-
-    const start=new Date(now);
-    start.setDate(now.getDate()-currentDay+(offset*7));
-
-    const end=new Date(start);
-    end.setDate(start.getDate()+6);
-
-    const startIso=localISO(start);
-    const endIso=localISO(end);
-
-    return (transactions||[])
-      .filter(t=>!t.voided)
-      .filter(t=>t.date>=startIso&&t.date<=endIso)
-      .filter(t=>{
-        const c=coa.find(x=>x.id===t.coaId||x.name===t.category);
-        return c?.type==='revenue';
-      })
-      .reduce((s,t)=>s+(Number(t.amount)||0),0);
-  }
-
-  const thisWeek=getWeekRevenue(0);
-  const lastWeek=getWeekRevenue(-1);
-
-  const rollingAverage=(
-    getWeekRevenue(0)+
-    getWeekRevenue(-1)+
-    getWeekRevenue(-2)+
-    getWeekRevenue(-3)
-  )/4;
-
-  let trend='Flat';
-
-  if(thisWeek>lastWeek)trend='Up';
-  if(thisWeek<lastWeek)trend='Down';
-
-  return `
-  <div class="card" style="margin-bottom:12px">
-
-    <div class="sec-hd">
-      <div class="sec-title">Weekly Performance</div>
-    </div>
-
-    <div class="g4" style="margin-bottom:0">
-
-      <div class="card">
-        <div class="stat-label">This Week Revenue</div>
-        <div class="stat-value">${fmt(thisWeek)}</div>
-      </div>
-
-      <div class="card">
-        <div class="stat-label">Last Week Revenue</div>
-        <div class="stat-value">${fmt(lastWeek)}</div>
-      </div>
-
-      <div class="card">
-        <div class="stat-label">Rolling 4-Week Average</div>
-        <div class="stat-value">${fmt(rollingAverage)}</div>
-      </div>
-
-      <div class="card">
-        <div class="stat-label">Trend Direction</div>
-        <div class="stat-value">${trend}</div>
-      </div>
-
-    </div>
-
-  </div>
-  `;
-}
-
-
+/* rollingAverage removed — only caller was the deleted
+   renderWeeklyPerformanceSection. The forecast module uses weightedMovingAvg
+   instead, which weighs recent weeks more heavily. */
+
+/* Removed during dead-code sweep:
+   - trendSlope, volatilityIndex (math helpers, no callers)
+   - forecastRevenue, forecastEBITDA, forecastCashflow, getForecastMetrics
+     (replaced by runForecast — same outputs, better moving-average math)
+   - paceToRevenue, paceToBreakEven, paceToLaborTarget
+     (planning-model surface that was superseded by Weekly Check + Forecast pages)
+   - metricTooltip, miniLineChart, comparisonBars
+     (chart helpers from old dashboard, replaced by svgBars/svgDonut/barChart) */
+
+
+
+/* renderWeeklyPerformanceSection removed — old dashboard card replaced by the
+   current Net Revenue / Prime / Cash Position KPI grid in pgDashboard. */
 
 function pgDashboard(){
 
@@ -5831,30 +5400,19 @@ function pgDashboard(){
   const dashShowLongTerm = (()=>{ try{return localStorage.getItem('dash_payables_all')==='1';}catch(e){return false;} })();
   /* Headline number for KPI/donut: respect the user's toggle preference. */
   const totalPayables = dashShowLongTerm ? totalPayablesAll : operationalPayables;
-  /* Obligation components for the Cash Position breakdown. payablesDueShown
-     respects the toggle so the breakdown lines tie back to Available Cash. */
+  /* Obligation components for the Cash Position breakdown. Reads directly from
+     _getObligations (single source of truth, also used by the Cash Position page
+     so the numbers tie). payablesDueShown respects the long-term toggle. */
   const oblgPayroll = Number(obligs.payroll)||0;
+  const oblgAccruedWages = Number(obligs.accruedWages)||0;
+  /* Combined "Wages Owed" — merges finalized-but-unpaid payroll with accrued
+     wages from unfinalized shifts. Shown as ONE line on the compact dashboard
+     card (with a tooltip breakdown) to keep the card from outgrowing its grid
+     row. The Cash Position page shows them split out separately. */
+  const oblgWagesOwed = oblgPayroll + oblgAccruedWages;
   const oblgAccrued = Number(obligs.accrued)||0;
   const oblgPayablesShown = dashShowLongTerm ? Number(obligs.payablesDue)||0 : operationalPayables;
-  /* Accrued Wages — shifts logged but not yet rolled into a finalized payroll run.
-     This is real owed labor that doesn't show up in Pending Payroll (which only
-     counts wage txs already created by a finalize action). Without this line the
-     dashboard underestimates obligations during the open pay period — e.g. you've
-     worked 6 days into a weekly cycle, that labor is owed but invisible. */
-  const oblgAccruedWages = (()=>{
-    try{
-      const seen={};
-      let total=0;
-      (shifts||[]).forEach(s=>{
-        if(!s||!s.date||seen[s.date])return;
-        seen[s.date]=true;
-        if(findFinalizedRunForDate(s.date))return; // already paid (or baked into a finalized run)
-        total += dayLaborCostFromShifts(s.date)||0;
-      });
-      return total;
-    }catch(e){return 0;}
-  })();
-  const obligationsShownTotal = oblgPayroll + oblgAccruedWages + oblgAccrued + oblgPayablesShown;
+  const obligationsShownTotal = oblgWagesOwed + oblgAccrued + oblgPayablesShown;
   const availableCash = totalCash - obligationsShownTotal;
 
   /* (leanBreakEven + leanAlerts moved DOWN — they now depend on twShiftLaborP /
@@ -6407,8 +5965,7 @@ ${(()=>{
     <table>
       <tbody>
         <tr><td style="font-size:.78rem">Total Cash</td><td class="mono" style="text-align:right">${fmt(totalCash)}</td></tr>
-        <tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Pending Payroll</td><td class="mono" style="text-align:right;color:${oblgPayroll>0?'var(--red)':'var(--muted2)'};font-size:.76rem">${fmt(oblgPayroll)}</td></tr>
-        <tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px" title="Wages from logged shifts not yet rolled into a finalized payroll run">− Accrued Wages <span style="font-size:.65rem;color:var(--muted2)">(unfinalized shifts)</span></td><td class="mono" style="text-align:right;color:${oblgAccruedWages>0?'var(--red)':'var(--muted2)'};font-size:.76rem">${fmt(oblgAccruedWages)}</td></tr>
+        ${oblgWagesOwed>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px" title="Pending Payroll (finalized but unpaid): ${fmt(oblgPayroll)}&#10;Accrued Wages (logged shifts, not yet finalized): ${fmt(oblgAccruedWages)}">− Wages Owed</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgWagesOwed)}</td></tr>`:''}
         ${oblgAccrued>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Accrued Expenses (unpaid bills)</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgAccrued)}</td></tr>`:''}
         ${oblgPayablesShown>0?`<tr><td style="font-size:.74rem;color:var(--muted2);padding-left:14px">− Payables ${longTermPayables>0?`<span style="font-size:.65rem">${dashShowLongTerm?'(all)':'(operational)'}</span>`:''}</td><td class="mono" style="text-align:right;color:var(--red);font-size:.76rem">${fmt(oblgPayablesShown)}</td></tr>`:''}
         ${longTermPayables>0 && !dashShowLongTerm
@@ -6561,10 +6118,10 @@ function pgTransactions(){
   const startIdx=showAll?0:(txPage-1)*txPerPage;
   const endIdx=showAll?totalRows:Math.min(totalRows,startIdx+txPerPage);
   const pageRows=f.slice(startIdx,endIdx);
-  const rows=pageRows.length?pageRows.map(tx=>`<tr style="${tx.voided?'opacity:.55':''}"><td style="font-size:.76rem;white-space:nowrap;color:var(--muted)">${fmtDate(tx.date)}</td><td>${badge(tx)}</td><td><div style="font-weight:500">${esc(tx.category)||(tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:'—')}</div>${tx.note?`<div style="font-size:.72rem;color:var(--muted2)">${esc(tx.note)}</div>`:''}</td><td style="font-size:.76rem;color:var(--muted2)">${tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:an(tx.account)}</td><td style="text-align:right">${amountCell(tx)}</td><td style="font-size:.72rem;color:var(--muted2)">${esc(tx.handler||'')}</td><td><div class="row-actions">
+  const rows=pageRows.length?pageRows.map(tx=>`<tr style="${tx.voided?'opacity:.55':''}"><td style="font-size:.76rem;white-space:nowrap;color:var(--muted)">${fmtDate(tx.date)}</td><td>${badge(tx)}</td><td><div style="font-weight:500">${esc(tx.category)||(tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:'—')}</div>${tx.note?`<div style="font-size:.72rem;color:var(--muted2)">${esc(tx.note)}</div>`:''}</td><td style="font-size:.76rem;color:var(--muted2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(tx.supplier||'')}">${esc(tx.supplier||'')||'<span style="color:var(--muted2)">—</span>'}</td><td style="font-size:.76rem;color:var(--muted2)">${tx.type==='transfer'?`${an(tx.fromAccount)} → ${an(tx.toAccount)}`:an(tx.account)}</td><td style="text-align:right">${amountCell(tx)}</td><td style="font-size:.72rem;color:var(--muted2)">${esc(tx.handler||'')}</td><td><div class="row-actions">
   ${isStaff?`<span style="font-size:.68rem;color:var(--muted2)">${tx.voided?'voided':'view only'}</span>`:`${tx.type==='expense'&&tx.status==='unpaid'&&!tx.voided?`<button class="row-btn" style="color:var(--green)" onclick="markExpensePaid('${tx.id}')" title="Mark Paid">✓</button>`:''}
   ${!tx.voided?`<button class="row-btn" onclick="editTransaction('${tx.id}')" title="Edit">✎</button><button class="row-btn del" onclick="deleteTransaction('${tx.id}')" title="Delete">✕</button>`:`<span style="font-size:.68rem;color:var(--muted2)">voided</span>`}`}
-</div></td></tr>`).join(''):`<tr><td colspan="7" class="empty">No transactions match filters.</td></tr>`;
+</div></td></tr>`).join(''):`<tr><td colspan="8" class="empty">No transactions match filters.</td></tr>`;
   /* Pagination controls — only render when there's something to paginate. */
   const pagerBtn=(label,targetPage,disabled,title)=>`<button class="btn btn-ghost btn-xs" ${disabled?'disabled style="opacity:.35;cursor:not-allowed"':`onclick="txPage=${targetPage};renderMain()"`} title="${title||''}">${label}</button>`;
   const perPageOpts=[25,50,100,250,0].map(n=>`<option value="${n}" ${txPerPage===n?'selected':''}>${n===0?'All':n+' / page'}</option>`).join('');
@@ -6583,7 +6140,7 @@ function pgTransactions(){
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Transactions</div><div class="page-sub">All movements — edit, void, or delete</div></div></div>
 <div class="filter-row"><input placeholder="Search…" value="${esc(filters.search)}" oninput="filters.search=this.value;txPage=1;renderMain()" style="flex:1;min-width:100px;max-width:200px"><select onchange="filters.type=this.value;txPage=1;renderMain()"><option value="" ${sel('',filters.type)}>All Types</option><option value="sale" ${sel('sale',filters.type)}>Sales</option><option value="expense" ${sel('expense',filters.type)}>Expenses</option><option value="transfer" ${sel('transfer',filters.type)}>Transfers</option><option value="deposit" ${sel('deposit',filters.type)}>Deposits</option><option value="withdrawal" ${sel('withdrawal',filters.type)}>Withdrawals</option><option value="sc_collected" ${sel('sc_collected',filters.type)}>SC Collected</option><option value="tip_collected" ${sel('tip_collected',filters.type)}>Tip Collected</option><option value="sc_paid" ${sel('sc_paid',filters.type)}>SC Paid Out</option><option value="tip_paid" ${sel('tip_paid',filters.type)}>Tip Paid Out</option><option value="liability_payment" ${sel('liability_payment',filters.type)}>Liability Remittance</option><option value="dsr_adjustment" ${sel('dsr_adjustment',filters.type)}>DSR Adjustment (VAT/Discount)</option></select><input type="date" value="${filters.dateFrom}" onchange="filters.dateFrom=this.value;txPage=1;renderMain()"><input type="date" value="${filters.dateTo}" onchange="filters.dateTo=this.value;txPage=1;renderMain()"><button class="btn btn-ghost btn-sm" onclick="filters={type:'',search:'',dateFrom:'',dateTo:''};txPage=1;renderMain()">Clear</button><div style="flex:1"></div><button class="btn btn-ghost btn-sm" onclick="exportTransactionsCSV()" title="Export current filtered transactions as CSV (round-trip-compatible with Import CSV)">↓ CSV</button></div>
 ${isStaff?`<div class="info-box" style="margin-bottom:10px;font-size:.78rem">Viewing in <b>staff (read-only)</b> mode — ad-hoc transactions, edits, voids, and deletes are manager-only.</div>`:`<div class="action-bar"><button class="btn btn-primary btn-sm" onclick="openModal('sale')">+ Sale</button><button class="btn btn-ghost btn-sm" onclick="openModal('expense')">+ Expense</button><button class="btn btn-ghost btn-sm" onclick="openModal('transfer')">↕ Transfer</button><button class="btn btn-ghost btn-sm" onclick="openModal('deposit')">↓ Deposit</button><button class="btn btn-ghost btn-sm" onclick="openModal('withdrawal')">↑ Withdraw</button><button class="btn btn-ghost btn-sm" onclick="triggerCSVImport()">↑ Import CSV</button><input type="file" id="csv-import-input" accept=".csv" style="display:none" onchange="handleCSVImport(this.files[0])"></div>`}
-<div class="card-flush"><table><thead><tr><th>Date</th><th>Type</th><th>Category / Note</th><th>Account</th><th style="text-align:right">Amount</th><th>Handler</th><th></th></tr></thead><tbody>${rows}</tbody></table>${pager}${summary}</div>`;
+<div class="card-flush"><table><thead><tr><th>Date</th><th>Type</th><th>Category / Note</th><th>Supplier</th><th>Account</th><th style="text-align:right">Amount</th><th>Handler</th><th></th></tr></thead><tbody>${rows}</tbody></table>${pager}${summary}</div>`;
 }
 
 /* ═══════════════════════════════════════════════
@@ -6684,10 +6241,8 @@ ${blocks.join('')}${others}`;
    DSR HELPERS
 ───────────────────────────────────────────── */
 function getDSREntry(date){return dsrEntries[date]||{}}
-function saveDSREntry(date,fields){
-  dsrEntries[date]={...(dsrEntries[date]||{}),...fields};
-  scheduleSave();
-}
+/* saveDSREntry removed — DSR fields all flow through saveDSRField below
+   (per-field debounce + immediate local cache mirror). */
 /* DSR save timer — separate from main scheduleSave so DSR fields
    save quickly (500ms) without interfering with other saves */
 let _dsrSaveTimer=null;
@@ -7653,16 +7208,30 @@ function exportDSRCSV(){
     from = f; to = t;
   }
 
-  /* Z-reading column order — matches BIR-style sales report convention.
-     "VATable Sales" assumes VAT-inclusive pricing (Net / 1.12). If you run
-     VAT-Exempt, the VAT column will be 0 and VATable = Net naturally. */
+  /* Z-reading column order — matches BIR-style sales report convention plus
+     per-POS breakdown. Order:
+       1. ID columns (Date / Day / Cashier / Posted)
+       2. COMBINED totals — the headline numbers (Gross / Net / VAT etc.)
+       3. NEUTRON POS columns (N. prefix) — full breakdown
+       4. LOYVERSE POS columns (L. prefix) — full breakdown
+       5. Combined operational rows (SC / Tips / Pax / cash drawer / etc.)
+     Accountant can hide whichever POS column block they don't need. */
   const cols = [
     'Date','Day','Cashier','Posted',
+    // Combined headline
     'Gross Receipts','Less: Discounts','Less: Service Charge','Less: Refunds/Voids','NET SALES',
     'VATable Sales','VAT-Exempt','Zero-Rated','Output VAT',
-    'Food Sales','Alcohol Sales','Bev Sales',
-    'Cash','GCash','Card','Total Payments',
-    'SC Collected','Tips','Pax','Avg Check',
+    // Neutron POS
+    'N. Gross','N. Disc','N. SC','N. Refunds','N. Net','N. VAT',
+    'N. Food','N. Alcohol','N. Beverage',
+    'N. Cash','N. GCash','N. Card','N. Pax',
+    // Loyverse POS
+    'L. Gross','L. Disc','L. SC','L. Refunds','L. Net','L. VAT',
+    'L. Food','L. Alcohol','L. Beverage',
+    'L. Cash','L. GCash','L. Card','L. Pax',
+    // Combined operational
+    'Total Cash','Total GCash','Total Card','Total Payments',
+    'SC Collected','Tips','Total Pax','Avg Check',
     'Start Cash','Cash Reading','Short/Over'
   ];
 
@@ -7677,26 +7246,31 @@ function exportDSRCSV(){
   while (d <= to){
     const e = (dsrEntries||{})[d] || null;
     if (e){
+      /* Per-POS values (Neutron / Loyverse) */
       const nGross=num(e.nGross), lGross=num(e.lGross), tGross=nGross+lGross;
       const nDisc=num(e.nDisc),   lDisc=num(e.lDisc),   tDisc=nDisc+lDisc;
       const nSC=num(e.nSC),       lSC=num(e.lSC),       tSC=nSC+lSC;
       const nRef=num(e.nRefund),  lRef=num(e.lRefund),  tRef=nRef+lRef;
-      const tNet = tGross - tDisc - tSC - tRef;
-      const tVAT = num(e.nVAT) + num(e.lVAT);
+      const nVAT=num(e.nVAT),     lVAT=num(e.lVAT),     tVAT=nVAT+lVAT;
+      const nNet = nGross - nDisc - nSC - nRef;
+      const lNet = lGross - lDisc - lSC - lRef;
+      const tNet = nNet + lNet;
       /* VATable Sales = Net Sales − Output VAT (BIR definition). No fallback
-         math: if VAT wasn't entered for that day, VATable just equals Net.
-         That's correct for VAT-Exempt operation AND honest for "VAT not
-         filled yet" — no silently-fabricated numbers in the export. */
+         math: if VAT wasn't entered for that day, VATable just equals Net. */
       const vatable = tNet - tVAT;
-      const tFood = num(e.nFood)+num(e.lFood);
-      const tAlc  = num(e.nAlc) +num(e.lAlc);
-      const tBev  = num(e.nBev) +num(e.lBev);
-      const tCash = num(e.nCash)+num(e.lCash);
-      const tGcash= num(e.nGcash)+num(e.lGcash);
-      const tCard = num(e.nCard)+num(e.lCard);
+      const nFood = num(e.nFood), lFood = num(e.lFood);
+      const nAlc  = num(e.nAlc),  lAlc  = num(e.lAlc);
+      const nBev  = num(e.nBev),  lBev  = num(e.lBev);
+      const nCash = num(e.nCash), lCash = num(e.lCash);
+      const nGcash= num(e.nGcash),lGcash= num(e.lGcash);
+      const nCard = num(e.nCard), lCard = num(e.lCard);
+      const nPax  = num(e.nPax),  lPax  = num(e.lPax);
+      const tCash = nCash+lCash;
+      const tGcash= nGcash+lGcash;
+      const tCard = nCard+lCard;
       const tPay  = tCash+tGcash+tCard;
       const tTips = num(e.nTips)+num(e.lTips);
-      const tPax  = num(e.nPax)+num(e.lPax);
+      const tPax  = nPax+lPax;
       const avgCheck = tPax>0 ? tNet/tPax : 0;
       const startCash = num(e.nStartCash);
       const cashRead  = tCash + startCash; // cash drawer = sales-cash + start float
@@ -7706,9 +7280,18 @@ function exportDSRCSV(){
       const dow = new Date(d+'T12:00:00').toLocaleDateString('en-US',{weekday:'short'});
       const row = [
         d, dow, e.cashier||'', e.posted?'Yes':'No',
+        // Combined headline
         tGross, tDisc, tSC, tRef, tNet,
         vatable, 0, 0, tVAT,
-        tFood, tAlc, tBev,
+        // Neutron
+        nGross, nDisc, nSC, nRef, nNet, nVAT,
+        nFood, nAlc, nBev,
+        nCash, nGcash, nCard, nPax,
+        // Loyverse
+        lGross, lDisc, lSC, lRef, lNet, lVAT,
+        lFood, lAlc, lBev,
+        lCash, lGcash, lCard, lPax,
+        // Combined operational
         tCash, tGcash, tCard, tPay,
         tSC, tTips, tPax, Math.round(avgCheck*100)/100,
         startCash, cashRead, shortOver
@@ -7716,7 +7299,7 @@ function exportDSRCSV(){
       rows.push(row);
       rowCount++;
       /* Sum the numeric columns (skip Date/Day/Cashier/Posted at idx 0..3,
-         and Avg Check at the avg-check position — averages don't sum). */
+         and Avg Check — averages don't sum, recomputed below from totals). */
       const avgIdx = cols.indexOf('Avg Check');
       for (let i=4;i<row.length;i++){
         if (i===avgIdx) continue;
@@ -7732,7 +7315,7 @@ function exportDSRCSV(){
   }
 
   /* Recompute average check on totals row from totals (correct weighted avg). */
-  const totalPax = totals[cols.indexOf('Pax')]||0;
+  const totalPax = totals[cols.indexOf('Total Pax')]||0;
   const totalNet = totals[cols.indexOf('NET SALES')]||0;
   totals[0] = 'TOTAL';
   totals[1] = ''; totals[2] = ''; totals[3] = '';
@@ -8481,21 +8064,8 @@ function deletePayrollAdjustment(id){
   scheduleSave();renderMain();toast('Removed');
 }
 
-/* ─── SC/TIPS DISTRIBUTION ─── */
-function distributePoolByHours({fromDate,toDate,amount,type='SC'}){
-  const eligible=roster.filter(r=>type==='SC'?r.scEligible!==false:r.tipsEligible!==false);
-  const hoursMap={};let totalHours=0;
-  eligible.forEach(emp=>{
-    const hrs=shifts.filter(s=>s.employeeId===emp.id&&s.date>=fromDate&&s.date<=toDate)
-      .reduce((sum,s)=>sum+Number(s.hoursWorked||0),0);
-    hoursMap[emp.id]=hrs;totalHours+=hrs;
-  });
-  return eligible.map(emp=>{
-    const hrs=hoursMap[emp.id]||0;
-    return{employeeId:emp.id,employeeName:emp.name,hoursWorked:hrs,
-      amount:totalHours>0?(hrs/totalHours)*amount:0};
-  });
-}
+/* distributePoolByHours removed — SC/Tips distribution now goes through
+   calcSCTipDistribution (uses cutoff windows + eligibility flags correctly). */
 
 function finalizePayroll({fromDate,toDate}){
   if(!fromDate||!toDate){toast('Enter from and to dates','error');return}
@@ -8873,15 +8443,8 @@ function submitBackfillMonth(){
   closeModal();
   toast(`Backfilled ${monthKey} — ${txs.length} entries posted ✓`,'success');
 }
-function deleteCashAdvance(id){
-  const adv=(cashAdvances||[]).find(a=>a&&a.id===id);
-  if(!adv)return;
-  if(round2(adv.balance)!==round2(adv.amount)){toast('Advance already has repayments — unfinalize the relevant payroll first','error');return}
-  if(!confirm(`Delete advance ${fmt(adv.amount)} to ${roster.find(r=>r.id===adv.employeeId)?.name||'employee'}? This voids the cash-out entry and returns the cash.`))return;
-  ledgerReplaceTransactions(transactions.map(t=>(t&&t.advanceId===id&&!t.voided)?{...t,voided:true,voidedAt:new Date().toISOString(),voidedBy:currentUser,voidReason:'Advance deleted'}:t),'delete_advance');
-  cashAdvances=cashAdvances.filter(a=>a.id!==id);
-  scheduleSave();render();toast('Advance deleted');
-}
+/* deleteCashAdvance removed — UI was never wired. Advances get voided via
+   the cash-advance row's void button + unfinalize-payroll flow instead. */
 /* Apply an employee's scheduled installment against their open advances (oldest
    first). Returns the list of {advanceId, amount} actually applied. Mutates balances. */
 function applyAdvanceRepayment(empId,totalRepay){
@@ -9282,12 +8845,244 @@ function renderPayrollTab(co){
   </div>
   ${roster.length?payCards:`<div class="empty">No employees on roster. <button class="btn btn-ghost btn-sm" onclick="openModal('addRoster')">Add Employee</button></div>`}`;
 }
+/* ═══ PAYROLL HISTORY EXPORT ═══════════════════════════════════════════════
+   Lazy-loads SheetJS from CDN on first click, then builds a 3-sheet .xlsx
+   workbook for handoff to accounting:
+     · Summary     — one row per finalized run (period totals)
+     · Detail      — one row per employee per run with full PH-style breakdown
+                     (base / OT / ND / Holiday / SC / Tips / SSS / PhilHealth /
+                     HDMF / Withholding / Tardiness / Cash Advance / etc.)
+     · Adjustments — every payroll adjustment in scope (drill-down for the
+                     statutory-deduction columns on the Detail sheet)
+   Government benefits (SSS/PhilHealth/HDMF/Withholding) come from
+   payrollAdjustments rows typed sss_ee/philhealth_ee/pagibig_ee/withholding_tax.
+   They're bucketed into their own columns on the Detail sheet so the accountant
+   can tie each per-employee deduction to a remittance form (R5/SBR/EC). */
+function exportPayrollHistoryXLSX(){
+  /* Lazy-load SheetJS. Library is ~600KB so we don't ship it on every page
+     load — most users never export. Cached after first load, so subsequent
+     exports in the same session are instant. The _xlsxLoading flag prevents
+     a rapid double-click from spawning two <script> tags / two re-entrant
+     export attempts. */
+  if (typeof XLSX === 'undefined'){
+    if (window._xlsxLoading) { toast('Still loading Excel library…'); return; }
+    window._xlsxLoading = true;
+    toast('Loading Excel library…');
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js';
+    s.onload = () => { window._xlsxLoading = false; exportPayrollHistoryXLSX(); };
+    s.onerror = () => { window._xlsxLoading = false; toast('Could not load Excel library — check your internet connection and retry','error'); };
+    document.head.appendChild(s);
+    return;
+  }
+
+  const runs = [...(payrollRuns||[])].sort((a,b)=>(a.fromDate||'').localeCompare(b.fromDate||''));
+  if (!runs.length){ toast('No finalized payrolls to export','error'); return; }
+
+  const firstDate = runs[0].fromDate;
+  const lastDate  = runs[runs.length-1].toDate;
+
+  /* Range picker — OK = all runs ever, Cancel = pick a window. */
+  const useAll = confirm(
+    `Export ${runs.length} finalized payroll run${runs.length===1?'':'s'} (${firstDate} → ${lastDate})?\n\n`+
+    `Click OK to export everything, Cancel to pick a date range.`
+  );
+  let from = firstDate, to = lastDate;
+  if (!useAll){
+    const f = prompt('From date (YYYY-MM-DD):', firstDate);
+    if (!f) return;
+    const t = prompt('To date (YYYY-MM-DD):', lastDate);
+    if (!t) return;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(f) || !/^\d{4}-\d{2}-\d{2}$/.test(t)){
+      toast('Invalid date format. Use YYYY-MM-DD.','error'); return;
+    }
+    from = f; to = t;
+  }
+  /* A run is "in scope" if its period overlaps the requested range — we don't
+     want to silently drop a fortnightly run because its toDate spilled one day
+     past the window end. */
+  const inScope = runs.filter(r => r && r.fromDate && r.toDate && !(r.toDate < from || r.fromDate > to));
+  if (!inScope.length){ toast(`No runs in ${from} → ${to}`,'error'); return; }
+
+  const num = v => Number(v)||0;
+
+  /* ── SHEET 1: SUMMARY (one row per run) ── */
+  const summaryRows = inScope.map(r => {
+    const empCount = (r.rows||[]).length;
+    const totalGross = (r.rows||[]).reduce((s,p)=>s+num(p.grossPay),0);
+    const totalAdvRepay = (r.rows||[]).reduce((s,p)=>s+num(p.advanceRepayment),0);
+    return {
+      'Period From': r.fromDate || '',
+      'Period To': r.toDate || '',
+      'Finalized At': r.finalizedAt ? new Date(r.finalizedAt).toLocaleString() : '',
+      'Finalized By': r.finalizedBy || '',
+      'Employees': empCount,
+      'Total Wages Gross': r.totalWageGross !== undefined ? num(r.totalWageGross) : num(r.totalPayroll),
+      'Total SC': num(r.totalSC),
+      'Total Tips': num(r.totalTip),
+      'Total Gross Earnings': totalGross + num(r.totalSC) + num(r.totalTip),
+      'Total Advance Repayments': totalAdvRepay,
+      'Total Net Pay': num(r.totalPayroll)
+    };
+  });
+
+  /* ── SHEET 2: DETAIL (one row per employee per run) ──
+     This is the workhorse sheet for accounting. Every standard PH payroll
+     register column is here. Statutory deductions read from payrollAdjustments
+     bucketed by category. */
+  const detailRows = [];
+  for (const r of inScope){
+    const periodKey = `${r.fromDate}_${r.toDate}`;
+    for (const p of (r.rows||[])){
+      const empId = (p.emp && p.emp.id) || p.employeeId;
+      const emp = p.emp || roster.find(rr => rr.id===empId) || {};
+      const adjs = (payrollAdjustments||[]).filter(a => a.employeeId===empId && a.payrollPeriod===periodKey);
+
+      /* Bucket adjustments. amount is signed (≥0 = addition, <0 = deduction).
+         For deduction categories we Math.abs() so the column shows a positive
+         peso figure (accountant convention — deductions are positive in their
+         own column, signs come from the column header). */
+      const sumPos = (cat) => adjs.filter(a => a.category===cat && a.amount>=0).reduce((s,a)=>s+num(a.amount),0);
+      const sumAbs = (cat) => adjs.filter(a => a.category===cat).reduce((s,a)=>s+Math.abs(num(a.amount)),0);
+
+      const bonus     = sumPos('bonus');
+      const allowance = sumPos('allowance');
+      const incentive = sumPos('incentive');
+      const knownAddCats = new Set(['bonus','allowance','incentive']);
+      const otherAdds = adjs.filter(a => a.amount>=0 && !knownAddCats.has(a.category)).reduce((s,a)=>s+num(a.amount),0);
+
+      const sss     = sumAbs('sss_ee');
+      const phic    = sumAbs('philhealth_ee');
+      const hdmf    = sumAbs('pagibig_ee');
+      const wht     = sumAbs('withholding_tax');
+      const meal    = sumAbs('meal_deduction');
+      const uniform = sumAbs('uniform');
+      const penalty = sumAbs('penalty');
+      /* Cash advance shows up in TWO places: as a payrollAdjustment row (rare
+         manual entry) AND as p.advanceRepayment (the scheduled installment).
+         Keep them in separate columns so the accountant can see both. */
+      const cashAdvAdj = sumAbs('cash_advance');
+      const knownDedCats = new Set(['sss_ee','philhealth_ee','pagibig_ee','withholding_tax','meal_deduction','uniform','penalty','cash_advance']);
+      const otherDeds = adjs.filter(a => a.amount<0 && !knownDedCats.has(a.category)).reduce((s,a)=>s+Math.abs(num(a.amount)),0);
+
+      const payoutAcct = accounts.find(a => a.id===p.payoutAccount);
+
+      detailRows.push({
+        'Period From': r.fromDate || '',
+        'Period To': r.toDate || '',
+        'Employee No': emp.employeeNo || '',
+        'Name': emp.name || p.employeeName || '',
+        'Position': emp.position || '',
+        'Department': emp.department || '',
+        'Employment Type': emp.employmentType || '',
+        'Daily Rate': num(emp.dailyRate),
+        'Days Worked': num(p.daysWorked),
+        'Total Hours': num(p.totalHours),
+        'OT Hours': num(p.totalOTHours),
+        'Undertime Hours': num(p.totalUndertimeHours),
+        // ── Earnings
+        'Base Pay': num(p.totalBasePay),
+        'OT Pay': num(p.totalOTPay),
+        'ND Pay': num(p.totalNDPay),
+        'Holiday Premium': num(p.totalHolidayPremium),
+        'Absent Holiday Pay': num(p.absentHolidayPay),
+        'Bonus': bonus,
+        'Allowance': allowance,
+        'Incentive': incentive,
+        'Other Additions': otherAdds,
+        'Service Charge': num(p.scShare),
+        'Tips': num(p.tipShare),
+        'GROSS PAY': num(p.grossPay) + num(p.scShare) + num(p.tipShare),
+        // ── Deductions (positive figures; column header denotes the sign)
+        'Tardiness': num(p.totalTardinessDeduction),
+        'Undertime Deduction': num(p.totalUndertimePay),
+        'SSS (EE)': sss,
+        'PhilHealth (EE)': phic,
+        'HDMF/Pag-IBIG (EE)': hdmf,
+        'Withholding Tax': wht,
+        'Cash Advance Repayment': num(p.advanceRepayment),
+        'Cash Advance Adj.': cashAdvAdj,
+        'Meal Deduction': meal,
+        'Uniform': uniform,
+        'Penalty': penalty,
+        'Other Deductions': otherDeds,
+        'NET PAY': num(p.netPay || p.grossPay),
+        // ── Payout
+        'Payout Account': payoutAcct ? payoutAcct.name : '',
+        'Payout Account No': emp.payoutAccountNo || ''
+      });
+    }
+  }
+
+  /* ── SHEET 3: ADJUSTMENTS (raw drill-down) ── */
+  const adjRows = [];
+  for (const r of inScope){
+    const periodKey = `${r.fromDate}_${r.toDate}`;
+    const adjs = (payrollAdjustments||[]).filter(a => a.payrollPeriod === periodKey);
+    for (const a of adjs){
+      const emp = roster.find(rr => rr.id===a.employeeId) || {};
+      adjRows.push({
+        'Period From': r.fromDate || '',
+        'Period To': r.toDate || '',
+        'Employee No': emp.employeeNo || '',
+        'Name': emp.name || '',
+        'Type': a.type || '',
+        'Category': (a.category||'').replace(/_/g,' '),
+        'Amount': num(a.amount),
+        'Sign': num(a.amount) >= 0 ? 'Addition' : 'Deduction',
+        'Note': a.note || '',
+        'Created At': a.createdAt ? new Date(a.createdAt).toLocaleString() : ''
+      });
+    }
+  }
+
+  /* Build workbook. Each sheet gets reasonable column widths so the file
+     opens already readable without an accountant manually resizing. */
+  const wb = XLSX.utils.book_new();
+
+  const autoWidth = (rows) => {
+    if (!rows.length) return [];
+    return Object.keys(rows[0]).map(k => {
+      const maxLen = Math.max(
+        k.length,
+        ...rows.map(r => String(r[k]==null?'':r[k]).length)
+      );
+      return { wch: Math.min(Math.max(maxLen+1, 8), 40) };
+    });
+  };
+
+  const wsSummary = XLSX.utils.json_to_sheet(summaryRows);
+  wsSummary['!cols'] = autoWidth(summaryRows);
+  XLSX.utils.book_append_sheet(wb, wsSummary, 'Summary');
+
+  const wsDetail = XLSX.utils.json_to_sheet(detailRows);
+  wsDetail['!cols'] = autoWidth(detailRows);
+  /* Freeze the first row (column headers) so the accountant can scroll through
+     hundreds of employee rows without losing the column names. */
+  wsDetail['!freeze'] = { ySplit: 1 };
+  XLSX.utils.book_append_sheet(wb, wsDetail, 'Detail');
+
+  const adjSheetData = adjRows.length ? adjRows : [{'Period From':'(no payroll adjustments in this range)'}];
+  const wsAdj = XLSX.utils.json_to_sheet(adjSheetData);
+  wsAdj['!cols'] = autoWidth(adjSheetData);
+  XLSX.utils.book_append_sheet(wb, wsAdj, 'Adjustments');
+
+  XLSX.writeFile(wb, `Payroll_${from}_to_${to}.xlsx`);
+  toast(`Exported ${inScope.length} run${inScope.length===1?'':'s'} · ${detailRows.length} employee row${detailRows.length===1?'':'s'} ✓`);
+}
+
 function renderPayrollHistoryTab(){
   const runs=[...(payrollRuns||[])].sort((a,b)=>b.finalizedAt.localeCompare(a.finalizedAt));
   if(!runs.length){
     return`<div class="card"><div class="empty">No finalized payrolls yet.<br><br><button class="btn btn-ghost btn-sm" onclick="_laborTab='payroll';renderMain()">Go to Payroll tab to finalize</button></div></div>`;
   }
-  return runs.map(run=>{
+  /* Export bar — sits above the run cards. Single button does everything
+     (range picker is a confirm/prompt flow inside exportPayrollHistoryXLSX). */
+  const exportBar = `<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+    <div style="font-size:.78rem;color:var(--muted2)">${runs.length} finalized run${runs.length===1?'':'s'}</div>
+    <button class="btn btn-ghost btn-sm" onclick="exportPayrollHistoryXLSX()" title="Export all finalized payroll runs as an Excel workbook with detailed per-employee breakdown — for handoff to accounting">📥 Export to Excel (.xlsx)</button>
+  </div>`;
+  return exportBar + runs.map(run=>{
     const rows=run.rows||[];
     /* Tier 2 runs include totalSC/totalTip/totalWageGross. Pre-Tier-2 runs only
        have totalPayroll (= wage gross). Compute fallbacks so display works on
@@ -9841,14 +9636,10 @@ function _getEffectiveTargets(){
    upgrade, the server copy takes over and the localStorage value is just a
    fast-mirror fallback (no longer the source of truth). */
 let forecastTargets=JSON.parse(localStorage.getItem('ledger_targets')||'null')||{cogsTarget:30,laborTarget:32,primeTarget:62};
-function saveTargets(){
-  /* Keep the localStorage mirror so existing migration logic still works AND
-     push to the server via scheduleSave so targets now sync across devices. */
-  try{ localStorage.setItem('ledger_targets',JSON.stringify(forecastTargets)); }catch(e){}
-  scheduleSave();
-}
-function getFixedMonthlyExpenses(){const ft=transactions.filter(t=>t.type==='expense'&&t.expenseType==='fixed'&&t.status==='paid'&&!t.voided);if(!ft.length)return 0;const bm={};ft.forEach(t=>{const m=t.date.slice(0,7);bm[m]=(bm[m]||0)+t.amount});const mv=Object.values(bm);return mv.reduce((s,v)=>s+v,0)/mv.length}
-function getVariableExpenseRatio(){const vt=transactions.filter(t=>t.type==='expense'&&t.expenseType==='variable'&&t.status==='paid'&&!t.voided);const st=transactions.filter(t=>t.type==='sale'&&!t.voided);const ts=st.reduce((s,t)=>s+t.amount,0);const tv=vt.reduce((s,t)=>s+t.amount,0);return ts>0?tv/ts:0}
+/* Removed during dead-code sweep:
+   - saveTargets (replaced by inline oninput on Weekly Check)
+   - getFixedMonthlyExpenses, getVariableExpenseRatio
+     (replaced by inline math in getBreakEvenStatus) */
 /* Builds the per-day {sales, cogs, labor, otherExp} history that runForecast
    feeds into its moving averages and DOW index. ACCRUAL basis to match the rest
    of the system (P&L, dashboard KPIs) — using cash-basis here would make the
@@ -9880,21 +9671,120 @@ function buildWeeklyTotals(dm){const w={};Object.entries(dm).forEach(([iso,d])=>
 function weightedMovingAvg(wt,field){const n=wt.length;if(!n)return 0;const weights=wt.map((_,i)=>Math.max(1,3-(n-1-i)));const sumW=weights.reduce((a,b)=>a+b,0);return wt.reduce((s,w,i)=>s+w[field]*weights[i],0)/sumW}
 function buildDOWIndex(dm){const ds=[0,0,0,0,0,0,0],dc=[0,0,0,0,0,0,0];Object.entries(dm).forEach(([iso,d])=>{const dow=new Date(iso+'T12:00:00').getDay();ds[dow]+=d.sales;dc[dow]++});const da=ds.map((s,i)=>dc[i]>0?s/dc[i]:null);const oa=da.filter(Boolean).reduce((a,b)=>a+b,0)/(da.filter(Boolean).length||1);return da.map(v=>v!=null?v/oa:1.0)}
 function buildStdDev(dm){const vals=Object.values(dm).map(d=>d.sales).filter(v=>v>0);if(vals.length<2)return 0;const mean=vals.reduce((a,b)=>a+b,0)/vals.length;return Math.sqrt(vals.reduce((s,v)=>s+(v-mean)**2,0)/vals.length)}
-function runForecast(days=30){const dm=buildDailyHistory(),wd=buildWeeklyTotals(dm);const tc=treasuryService.getOperationalLiquidity();
+function runForecast(days=30, opts){
+  opts = opts || {};
+  const dm=buildDailyHistory(),wd=buildWeeklyTotals(dm);
+  const tc=treasuryService.getOperationalLiquidity();
   /* Subtract pending obligations from the starting cash so the projection reflects
      "cash you can actually count on" — unpaid wages, supplier credit, manual
      payables. Without this, the running-cash curve is optimistic and can hide an
-     impending payday cliff. Total cash is still exposed separately. */
+     impending payday cliff. Total cash is still exposed separately.
+
+     OPERATIONAL vs FULL view: if opts.excludeLongTerm is true, strip long-term
+     debt (Loan / Owner Loan) out of the payablesDue portion. Reflects the day-
+     to-day operational stance — you're not settling a 5-year owner loan from
+     the cash drawer next week. Same idea as the dashboard "Hide long-term"
+     toggle. Default (no opt) = full view, which is the conservative number. */
   const obligations=treasuryService._getObligations();
-  const obligationsTotal=Number(obligations?.total)||0;
-  const adjustedStart=tc-obligationsTotal;
-  if(!wd.length)return{days:[],hasEnoughData:false,weeksOfData:0,dowIndex:[1,1,1,1,1,1,1],totalCash:tc,obligationsTotal,adjustedStart};
+  let obligationsTotal=Number(obligations?.total)||0;
+  let longTermExcluded = 0;
+  const _LT = new Set(['Loan','Owner Loan']);
+  if (opts.excludeLongTerm){
+    longTermExcluded = (payables||[])
+      .filter(p=>p&&p.status!=='paid' && _LT.has(p.type||''))
+      .reduce((s,p)=>s+(Number(p.balance)||0),0);
+    obligationsTotal = Math.max(0, obligationsTotal - longTermExcluded);
+  }
+
+  /* ── DATED-OBLIGATION OVERLAY ──
+     Find payables AND unpaid expense txs with a dueDate inside the forecast
+     horizon. Instead of letting them sit in the upfront obligationsTotal
+     subtraction (which smears them across the starting cash), we:
+       1. Subtract their amount BACK OUT of obligationsTotal (so starting cash
+          on day 0 reflects only the undated/overdue obligations)
+       2. Add them as targeted outflows on their actual due date
+     Net effect: by end of horizon the total cash position equals the old
+     model's, but the DAY-BY-DAY curve now shows real cliffs on real dates
+     instead of a smooth slide. Lets you spot "rent + payroll hit the same
+     Friday" before it stings. */
+  const todayIso = today();
+  const horizonEnd = addDays(todayIso, days);
+  const scheduledByDate = {};
+  const scheduledDetailByDate = {};
+  let futureScheduledTotal = 0;
+  const addScheduled = (date, amount, label) => {
+    if (amount <= 0 || !date) return;
+    scheduledByDate[date] = (scheduledByDate[date]||0) + amount;
+    (scheduledDetailByDate[date] = scheduledDetailByDate[date] || []).push({label, amount});
+    futureScheduledTotal += amount;
+  };
+  (payables||[]).forEach(p=>{
+    if(!p || p.status === 'paid' || !p.dueDate) return;
+    if(p.dueDate < todayIso || p.dueDate > horizonEnd) return;
+    if(opts.excludeLongTerm && _LT.has(p.type||'')) return;
+    addScheduled(p.dueDate, Number(p.balance)||0, p.name || p.type || 'Payable');
+  });
+  (transactions||[]).forEach(t=>{
+    if(!t || t.voided || t.type!=='expense' || t.status!=='unpaid' || !t.dueDate) return;
+    if(t.dueDate < todayIso || t.dueDate > horizonEnd) return;
+    addScheduled(t.dueDate, Number(t.amount)||0, t.supplier || t.category || 'Expense');
+  });
+  /* Restore the future-dated portion to starting cash — they'll hit on their
+     real day. Clamped at zero in case of accounting quirks (shouldn't happen
+     but defends the cash projection from showing a phantom positive bump). */
+  const obligationsAfterOverlay = Math.max(0, obligationsTotal - futureScheduledTotal);
+  const adjustedStart = tc - obligationsAfterOverlay;
+
+  if(!wd.length)return{days:[],hasEnoughData:false,weeksOfData:0,dowIndex:[1,1,1,1,1,1,1],totalCash:tc,obligationsTotal,longTermExcluded,adjustedStart,excludeLongTerm:!!opts.excludeLongTerm,scheduledByDate,scheduledDetailByDate,futureScheduledTotal};
   const _eff=_getEffectiveTargets();
-  const wmaS=weightedMovingAvg(wd,'sales'),wmaO=weightedMovingAvg(wd,'otherExp');const di=buildDOWIndex(dm),sd=buildStdDev(dm),ads=wmaS/7;const result=[];let rc=adjustedStart;for(let i=1;i<=days;i++){const d=new Date();d.setDate(d.getDate()+i);const iso=localISO(d),dow=d.getDay();const fs=ads*di[dow],fc=fs*(_eff.cogs/100),fl=fs*(_eff.labor/100),fo=wmaO/7;const fe=fc+fl+fo,fn=fs-fe;rc+=fn;result.push({iso,dow,label:d.toLocaleDateString('en-US',{month:'short',day:'numeric'}),dayLabel:d.toLocaleDateString('en-US',{weekday:'short'}),forecastedSales:fs,forecastedCogs:fc,forecastedLabor:fl,forecastedOther:fo,forecastedExp:fe,forecastedNet:fn,bestSales:fs+sd*di[dow],worstSales:Math.max(0,fs-sd*di[dow]),forecastedPrime:fs>0?(fc+fl)/fs*100:0,runningCash:rc,isWeekend:dow===0||dow===6})}return{days:result,hasEnoughData:wd.length>=2,weeksOfData:wd.length,wmaWeeklySales:wmaS,avgDailySales:ads,dowIndex:di,stdDev:sd,totalCash:tc,obligationsTotal,adjustedStart}}
+  const wmaS=weightedMovingAvg(wd,'sales'),wmaO=weightedMovingAvg(wd,'otherExp');
+  const di=buildDOWIndex(dm),sd=buildStdDev(dm),ads=wmaS/7;
+  const result=[];
+  let rc=adjustedStart;
+  for(let i=1;i<=days;i++){
+    const d=new Date(); d.setDate(d.getDate()+i);
+    const iso=localISO(d), dow=d.getDay();
+    const fs=ads*di[dow];
+    const fc=fs*(_eff.cogs/100), fl=fs*(_eff.labor/100), fo=wmaO/7;
+    /* Scheduled outflows for THIS specific date (dated obligations overlay).
+       Added to the day's expense AND surfaced as its own field so the table
+       can show "₱X is one-off, ₱Y is run-rate" distinction. */
+    const scheduled = scheduledByDate[iso] || 0;
+    const scheduledDetail = scheduledDetailByDate[iso] || [];
+    const fe = fc + fl + fo + scheduled;
+    const fn = fs - fe;
+    rc += fn;
+    result.push({
+      iso, dow,
+      label: d.toLocaleDateString('en-US',{month:'short',day:'numeric'}),
+      dayLabel: d.toLocaleDateString('en-US',{weekday:'short'}),
+      forecastedSales: fs,
+      forecastedCogs: fc,
+      forecastedLabor: fl,
+      forecastedOther: fo,
+      scheduledOutflow: scheduled,
+      scheduledDetail,
+      forecastedExp: fe,
+      forecastedNet: fn,
+      bestSales: fs + sd*di[dow],
+      worstSales: Math.max(0, fs - sd*di[dow]),
+      forecastedPrime: fs>0 ? (fc+fl)/fs*100 : 0,
+      runningCash: rc,
+      isWeekend: dow===0 || dow===6
+    });
+  }
+  return{days:result,hasEnoughData:wd.length>=2,weeksOfData:wd.length,wmaWeeklySales:wmaS,avgDailySales:ads,dowIndex:di,stdDev:sd,totalCash:tc,obligationsTotal,longTermExcluded,adjustedStart,excludeLongTerm:!!opts.excludeLongTerm,scheduledByDate,scheduledDetailByDate,futureScheduledTotal};
+}
 function pgForecast(){
-  /* Targets now come from Weekly Check (monthlyBudget + weeklyTargets).
-     _getEffectiveTargets returns {cogs, labor, prime} with prime auto-derived. */
-  const fc=runForecast(30);const _eff=_getEffectiveTargets();const targets={cogsTarget:_eff.cogs,laborTarget:_eff.labor,primeTarget:_eff.prime};
+  /* Targets come from Weekly Check (monthlyBudget + weeklyTargets).
+     _getEffectiveTargets returns {cogs, labor, prime} with prime auto-derived.
+
+     Long-term toggle: reuses the SAME localStorage key as the dashboard
+     ('dash_payables_all') so the user has ONE source of truth — flipping the
+     toggle on either page persists app-wide. excludeLongTerm = !showAll. */
+  const showAll = (()=>{ try{return localStorage.getItem('dash_payables_all')==='1';}catch(e){return false;} })();
+  const fc=runForecast(30, {excludeLongTerm: !showAll});
+  const _eff=_getEffectiveTargets();const targets={cogsTarget:_eff.cogs,laborTarget:_eff.labor,primeTarget:_eff.prime};
   const cut30=new Date();cut30.setDate(cut30.getDate()-30);
   const past30=transactions.filter(t=>t.date>=localISO(cut30)&&t.date<today()&&!t.voided);
   const pastM=calcMetrics(past30);
@@ -9907,8 +9797,49 @@ function pgForecast(){
   const notEnoughBanner=!fc.hasEnoughData?`<div class="warn-box">⚠ <b>Limited history</b> — ${fc.weeksOfData} week${fc.weeksOfData===1?'':'s'} of data. Forecasts improve with 4+ weeks.</div>`:'';
   const dowNames=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
   const dowCards=fc.dowIndex.map((idx,i)=>{const p=((idx-1)*100);const color=idx>=1.05?'var(--green)':idx<=0.95?'var(--red)':'var(--muted)';return`<div style="text-align:center;padding:9px 4px;background:var(--bg2);border:1px solid var(--border);border-radius:7px"><div style="font-size:.67rem;color:var(--muted);margin-bottom:2px">${dowNames[i]}</div><div style="font-size:.82rem;font-weight:600;color:${color}">${idx>=1.05?'+'+p.toFixed(0)+'%':idx<=0.95?p.toFixed(0)+'%':'avg'}</div></div>`}).join('');
-  const tableRows=fc.days.map(d=>`<tr style="${d.isWeekend?'background:var(--bg3)':''}"><td style="font-size:.75rem;white-space:nowrap;color:var(--muted)">${d.label}</td><td style="font-size:.72rem;color:var(--muted2)">${d.dayLabel}</td><td class="mono" style="text-align:right;color:var(--blue)">${fmt(d.forecastedSales)}</td><td class="mono" style="text-align:right;font-size:.74rem;color:var(--muted2)">${fmt(d.worstSales)}–${fmt(d.bestSales)}</td><td class="mono" style="text-align:right;font-size:.75rem;color:var(--red)">${fmt(d.forecastedExp)}</td><td class="mono" style="text-align:right;font-size:.75rem;color:${d.forecastedNet>=0?'var(--green)':'var(--red)'}">${d.forecastedNet>=0?'+':''}${fmt(d.forecastedNet)}</td><td style="text-align:right;font-size:.73rem;font-weight:600;color:${d.forecastedPrime<=60?'var(--green)':d.forecastedPrime<=68?'var(--amber)':'var(--red)'}">${d.forecastedPrime.toFixed(1)}%</td><td class="mono" style="text-align:right;font-size:.74rem;color:${d.runningCash>=0?'var(--text2)':'var(--red)'}">${fmt(d.runningCash)}</td></tr>`).join('');
-  return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Forecast</div><div class="page-sub">30-day projection · ${fc.weeksOfData} week${fc.weeksOfData===1?'':'s'} of history · targets from Weekly Check</div></div><button class="btn btn-ghost btn-sm" onclick="navigate('weekly')" title="Edit COGS / Labor / Prime targets on the Weekly Check page">⚙ Edit Targets</button></div>
+  /* Table rows: when a day has a scheduled outflow, surface it with a 📌 pin
+     icon (tooltip lists the events) AND show the scheduled portion under the
+     Expenses cell as a small annotation so the user understands what's
+     run-rate vs what's one-off. */
+  const tableRows=fc.days.map(d=>{
+    const hasScheduled = (d.scheduledOutflow||0) > 0;
+    const schedTooltip = hasScheduled
+      ? (d.scheduledDetail||[]).map(ev=>`${ev.label}: ${fmt(ev.amount)}`).join('\n').replace(/"/g,'&quot;')
+      : '';
+    const dateCell = hasScheduled
+      ? `<td style="font-size:.75rem;white-space:nowrap;color:var(--muted)"><span title="${schedTooltip}" style="cursor:help">📌</span> ${d.label}</td>`
+      : `<td style="font-size:.75rem;white-space:nowrap;color:var(--muted)">${d.label}</td>`;
+    const expCell = hasScheduled
+      ? `<td class="mono" style="text-align:right;font-size:.75rem;color:var(--red)" title="Run-rate ${fmt(d.forecastedExp - d.scheduledOutflow)} + scheduled ${fmt(d.scheduledOutflow)}">${fmt(d.forecastedExp)}<br><span style="font-size:.65rem;color:var(--amber);font-weight:600">incl ${fmt(d.scheduledOutflow)} sched</span></td>`
+      : `<td class="mono" style="text-align:right;font-size:.75rem;color:var(--red)">${fmt(d.forecastedExp)}</td>`;
+    return `<tr style="${d.isWeekend?'background:var(--bg3)':''}${hasScheduled?';border-left:2px solid var(--amber)':''}">${dateCell}<td style="font-size:.72rem;color:var(--muted2)">${d.dayLabel}</td><td class="mono" style="text-align:right;color:var(--blue)">${fmt(d.forecastedSales)}</td><td class="mono" style="text-align:right;font-size:.74rem;color:var(--muted2)">${fmt(d.worstSales)}–${fmt(d.bestSales)}</td>${expCell}<td class="mono" style="text-align:right;font-size:.75rem;color:${d.forecastedNet>=0?'var(--green)':'var(--red)'}">${d.forecastedNet>=0?'+':''}${fmt(d.forecastedNet)}</td><td style="text-align:right;font-size:.73rem;font-weight:600;color:${d.forecastedPrime<=60?'var(--green)':d.forecastedPrime<=68?'var(--amber)':'var(--red)'}">${d.forecastedPrime.toFixed(1)}%</td><td class="mono" style="text-align:right;font-size:.74rem;color:${d.runningCash>=0?'var(--text2)':'var(--red)'}">${fmt(d.runningCash)}</td></tr>`;
+  }).join('');
+  /* Toggle button: only show if there's actually long-term debt to hide,
+     otherwise it's a no-op control that adds visual noise. */
+  const hasLongTerm = (fc.longTermExcluded||0) > 0 || (payables||[]).some(p=>p&&p.status!=='paid' && (p.type==='Loan' || p.type==='Owner Loan'));
+  const toggleBtn = hasLongTerm
+    ? `<button class="btn btn-ghost btn-sm" onclick="try{localStorage.setItem('dash_payables_all','${showAll?'0':'1'}')}catch(e){};render()" title="${showAll?'Hide long-term debts (loans, owner loans) from the cash projection — see the day-to-day operational view':'Include long-term debts in the cash projection — see the full conservative view'}">${showAll?'👁 Hide long-term debt':'👁 Show all debt'}</button>`
+    : '';
+  /* Subtitle: tell the user which view they're looking at + how much was
+     excluded if applicable. The fc.adjustedStart is "today's cash after
+     obligations" — the starting point of the running-cash column. */
+  const viewSub = `${fc.excludeLongTerm
+    ? `<span style="color:var(--blue)">Operational view</span> · long-term debt ${fmt(fc.longTermExcluded||0)} excluded from starting cash`
+    : `<span style="color:var(--muted)">Full view</span> · all obligations subtracted from starting cash`}`;
+  /* Scheduled-outflow banner: total of dated obligations modeled in the
+     horizon. Only shown when non-zero — otherwise it's noise. Links to the
+     Payables page so the user can adjust dueDates if a date looks wrong. */
+  const schedBanner = (fc.futureScheduledTotal||0) > 0
+    ? `<div class="info-box" style="margin-bottom:12px;background:var(--amber-bg);border-color:var(--amber-bd);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <div style="font-size:.82rem">
+          <span style="font-weight:700;color:var(--amber)">📌 ${fmt(fc.futureScheduledTotal)} in scheduled outflows</span>
+          <span style="color:var(--muted2)"> modeled on their due dates over the next 30 days · pinned rows below show which days are affected</span>
+        </div>
+        <button class="btn btn-ghost btn-xs" onclick="navigate('payables')" title="Edit due dates on the Payables page">Review payables →</button>
+      </div>`
+    : '';
+  return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Forecast</div><div class="page-sub">30-day projection · ${fc.weeksOfData} week${fc.weeksOfData===1?'':'s'} of history · targets from Weekly Check<br><span style="font-size:.72rem">${viewSub}</span></div></div><div style="display:flex;gap:6px;align-items:center">${toggleBtn}<button class="btn btn-ghost btn-sm" onclick="navigate('weekly')" title="Edit COGS / Labor / Prime targets on the Weekly Check page">⚙ Edit Targets</button></div></div>
+${schedBanner}
 ${notEnoughBanner}
 <div class="g4" style="margin-bottom:12px"><div class="card"><div class="stat-label">Next 7 Days</div><div class="stat-value" style="color:var(--blue)">${fmt(nwSales)}</div></div><div class="card"><div class="stat-label">Forecasted Prime</div><div class="stat-value">${nwPrimeP}%</div>${pctBadge(parseFloat(nwPrimeP),'prime')}</div><div class="card"><div class="stat-label">Cash in 30 Days</div><div class="stat-value ${cashDiff>=0?'green':'red'}">${fmt(cashIn30)}</div><div class="stat-sub">${cashDiff>=0?'+':''}${fmt(cashDiff)} vs today</div></div><div class="card"><div class="stat-label">vs Actuals (30d)</div><div style="font-size:.77rem;margin-top:4px"><div style="display:flex;justify-content:space-between"><span class="muted">COGS</span><span class="mono" style="font-size:.79rem;color:${pastM.cogsP<=targets.cogsTarget?'var(--green)':'var(--red)'}">${pastM.cogsP.toFixed(1)}%</span></div><div style="display:flex;justify-content:space-between"><span class="muted">Labor</span><span class="mono" style="font-size:.79rem;color:${pastM.laborP<=targets.laborTarget?'var(--green)':'var(--red)'}">${pastM.laborP.toFixed(1)}%</span></div></div></div></div>
 <div class="card" style="margin-bottom:12px"><div class="sec-title" style="margin-bottom:8px">Day-of-Week Seasonality</div><div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px">${dowCards}</div></div>
@@ -10304,9 +10235,7 @@ let weeklyMetrics=[];
 let monthlyMetrics=[];
 let forecastSnapshots=[];
 
-function getTxInGlobalRange(){
-  return (transactions||[]).filter(txInRange);
-}
+/* getTxInGlobalRange removed — callers use transactions.filter(txInRange) inline. */
 
 function buildDailyMetricsSnapshot(dateStr){
   const tx=(transactions||[]).filter(t=>!t.voided && t.date===dateStr);
@@ -10494,7 +10423,14 @@ operationalIntelligenceService.generatePredictiveAlerts=function(metrics){
   return alerts;
 };
 
-function render(){renderNav();renderMain();/* Hotfix N-H3: removed applyRecurring() call — feature was dead. */}
+function render(){
+  /* Bust _getObligations cache at the top of every render so the dashboard
+     sees fresh numbers after any UI action that triggered render(). Within
+     the SAME render pass, multiple consumers (dashboard card, alerts, forecast)
+     hit the cache and skip the O(shifts²) recompute. */
+  if (typeof window !== 'undefined') window._oblCache = null;
+  renderNav();renderMain();/* Hotfix N-H3: removed applyRecurring() call — feature was dead. */
+}
 
 // Phase 3 global date bar injection
 const __phase3_original_render=render;
