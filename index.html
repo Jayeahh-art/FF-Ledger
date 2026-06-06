@@ -4042,6 +4042,13 @@ function normalizeTx(tx){
     department:    tx.department||coaItem?.department||'',
     tags:          tx.tags||[],
     metadata:      tx.metadata||{},
+    /* eeShare — for x6080 (Payroll Taxes & Benefits) entries, captures the
+       employee-deducted portion of a combined statutory remittance so the
+       dashboard true-labor calc subtracts it (no double-count with wages
+       already netted at payroll finalize). Must be on the explicit whitelist
+       — normalizeTx returns a fixed-shape object, anything not listed gets
+       stripped silently. 0 / undefined = no linkage. */
+    eeShare:       Number(tx.eeShare)||0,
     /* Linkage tags — MUST be preserved through normalization. Without these,
        unfinalizePayroll (filters by payrollRunId) and cash-advance void/undo
        (filters by advanceId) silently match nothing. paidAt records when an
