@@ -538,6 +538,99 @@ function onVatModeChange(){
   checkVatSanity();
 }
 
+/* Show/hide the EE Portion field based on whether the selected category is
+   x6080 (Payroll Taxes & Benefits). Called from the category select onchange
+   AND once on modal mount so the field appears immediately when editing an
+   existing x6080 expense. The data-coaid attribute on each <option> comes from
+   the catOpts builder. */
+function _toggleEEField(){
+  const sel = document.getElementById('m-cat');
+  const wrap = document.getElementById('m-ee-wrap');
+  if (!sel || !wrap) return;
+  const opt = sel.selectedOptions && sel.selectedOptions[0];
+  const coaid = (opt && opt.dataset && opt.dataset.coaid) || '';
+  wrap.style.display = (coaid === 'x6080') ? '' : 'none';
+}
+
+/* EE Prefill panel — surfaces finalized payroll runs with their per-agency
+   employee-share totals (SSS_EE / PhilHealth_EE / HDMF_EE / Withholding), so
+   the user doesn't have to dig into individual payslips to know what they're
+   remitting. Checkboxes let them combine cycles (e.g., two fortnights for a
+   monthly remittance). Total of checked rows auto-writes into m-ee-share. */
+function _toggleEEPrefill(){
+  const panel = document.getElementById('m-ee-prefill-panel');
+  if (!panel) return;
+  if (panel.style.display === 'none' || !panel.style.display){
+    _renderEEPrefillPanel();
+    panel.style.display = '';
+  } else {
+    panel.style.display = 'none';
+  }
+}
+
+function _renderEEPrefillPanel(){
+  const panel = document.getElementById('m-ee-prefill-panel');
+  if (!panel) return;
+  const _STAT_CATS = ['sss_ee','philhealth_ee','pagibig_ee','withholding_tax'];
+  const runs = [...(payrollRuns||[])]
+    .filter(r => r && r.fromDate && r.toDate)
+    .sort((a,b) => (b.toDate||'').localeCompare(a.toDate||''))
+    .slice(0, 8); // last 8 cycles — enough for a fortnightly shop's worth of recent history
+  if (!runs.length){
+    panel.innerHTML = '<div style="font-size:.74rem;color:var(--muted2);padding:4px">No finalized payrolls yet. Finalize a cutoff on the Payroll tab first.</div>';
+    return;
+  }
+  /* Build per-run EE breakdown from payrollAdjustments. Math.abs because EE
+     deductions are stored as NEGATIVE amounts (they reduce net pay) but we
+     want positive figures for the remittance side. */
+  const runData = runs.map(r => {
+    const periodKey = `${r.fromDate}_${r.toDate}`;
+    const adjs = (payrollAdjustments||[]).filter(a => a && a.payrollPeriod===periodKey && _STAT_CATS.includes(a.category));
+    const sumCat = (cat) => adjs.filter(a => a.category===cat).reduce((s,a) => s + Math.abs(Number(a.amount)||0), 0);
+    const sss  = sumCat('sss_ee');
+    const phic = sumCat('philhealth_ee');
+    const hdmf = sumCat('pagibig_ee');
+    const wht  = sumCat('withholding_tax');
+    const total = sss + phic + hdmf + wht;
+    return { r, periodKey, sss, phic, hdmf, wht, total };
+  });
+  /* Hide runs with zero EE totals — they have no deductions to remit, so
+     listing them is just noise. */
+  const withDeductions = runData.filter(d => d.total > 0);
+  if (!withDeductions.length){
+    panel.innerHTML = '<div style="font-size:.74rem;color:var(--muted2);padding:4px">No employee deductions recorded on recent finalized payrolls. Add them as payroll adjustments (categories: SSS EE, PhilHealth EE, Pag-IBIG EE, Withholding Tax) before finalizing.</div>';
+    return;
+  }
+  const rows = withDeductions.map((d,i) => `
+    <label style="display:flex;align-items:center;gap:8px;padding:6px 4px;cursor:pointer;border-bottom:1px solid var(--border)">
+      <input type="checkbox" class="ee-prefill-row" data-total="${d.total}" onchange="_updateEEPrefillTotal()" style="width:auto;flex-shrink:0">
+      <div style="flex:1;font-size:.75rem;min-width:0">
+        <div style="font-weight:600">${fmtDate(d.r.fromDate)} – ${fmtDate(d.r.toDate)}</div>
+        <div style="color:var(--muted2);font-size:.68rem;margin-top:1px">SSS ${fmt(d.sss)} · PhilHealth ${fmt(d.phic)} · HDMF ${fmt(d.hdmf)} · WHT ${fmt(d.wht)}</div>
+      </div>
+      <div class="mono" style="font-weight:600;color:var(--red);flex-shrink:0;font-size:.78rem">${fmt(d.total)}</div>
+    </label>
+  `).join('');
+  panel.innerHTML = `
+    <div style="font-size:.71rem;color:var(--muted2);margin-bottom:6px">Check the payroll cycles this remittance covers — the sum auto-fills the EE Portion field above.</div>
+    <div style="max-height:240px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:0 8px;background:var(--bg)">${rows}</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;font-size:.78rem">
+      <span style="color:var(--muted2)">Selected total:</span>
+      <span class="mono" style="font-weight:700;color:var(--red)" id="m-ee-prefill-total">${fmt(0)}</span>
+    </div>
+  `;
+}
+
+function _updateEEPrefillTotal(){
+  const boxes = document.querySelectorAll('.ee-prefill-row:checked');
+  let total = 0;
+  boxes.forEach(b => { total += Number(b.dataset.total)||0; });
+  const totEl = document.getElementById('m-ee-prefill-total');
+  if (totEl) totEl.textContent = fmt(total);
+  const eeEl = document.getElementById('m-ee-share');
+  if (eeEl) eeEl.value = total > 0 ? total.toFixed(2) : '';
+}
+
 /* Prime Cost = COGS + Labor by definition (it's not an independent variable).
    Used by the Weekly Check page and Forecast Targets modal: when the user edits
    COGS or Labor, this recomputes Prime live and writes it to both the
@@ -4115,6 +4208,17 @@ function saveEditTx(id){
       if(expt!==undefined) payload.expenseType=expt;
       if(st) payload.status=st;
       if(due!==undefined) payload.dueDate=due;
+      /* Persist eeShare for x6080 (Payroll Taxes & Benefits) edits. Clear it
+         entirely if the category is no longer x6080 OR the user blanked the
+         field — prevents a stale linked-EE value from secretly suppressing
+         labor in the dashboard. */
+      const _eeEl = document.getElementById('m-ee-share');
+      const _eeRaw = _eeEl ? (parseFloat(_eeEl.value||0)||0) : 0;
+      if (payload.coaId === 'x6080' && _eeRaw > 0){
+        payload.eeShare = round2(Math.max(0, Math.min(_eeRaw, amt)));
+      } else {
+        delete payload.eeShare;
+      }
     }
   }
   /* Phase 1: no direct mutation — rebuild will derive new state.
@@ -4928,7 +5032,7 @@ function renderModal(){
       const fromOpts=fromList.map(a=>`<option value="${a.id}" ${(data?.fromAccount||data?.account||fromList[0]?.id)===a.id?'selected':''}>${esc(a.name)}${a.type==='clearing'?' · clearing':''}</option>`).join('');
       catField=`<div class="form-row"><div class="form-group"><label>From Account</label><select id="m-from">${fromOpts}</select></div><div class="form-group"><label>To Account</label><select id="m-to">${acctOpts2}</select></div></div>`;
     }else{
-      catField=`<div class="form-group"><label>Category</label><select id="m-cat"><option value="">— select —</option>${catOpts}</select></div>`;
+      catField=`<div class="form-group"><label>Category</label><select id="m-cat" onchange="if(typeof _toggleEEField==='function')_toggleEEField()"><option value="">— select —</option>${catOpts}</select></div>`;
       acctField=`<div class="form-group"><label>${txType==='expense'?'Paid From':'Deposit To'}</label><select id="m-acct">${acctOpts}</select></div>`;
     }
     const saveCall=isEdit?`saveEditTx('${data.id}')`:' submitTx(\''+txType+'\')';
@@ -4957,11 +5061,36 @@ function renderModal(){
         </div>
         <div class="form-group"><label>Input VAT <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· claimable from BIR</span></label><input id="m-input-vat" type="number" step="0.01" min="0" placeholder="0.00" oninput="checkVatSanity()"></div>
       </div>
-      <div id="m-vat-hint" style="font-size:.7rem;color:var(--muted2);margin:-2px 0 8px;line-height:1.45"></div>`}`:'';
+      <div id="m-vat-hint" style="font-size:.7rem;color:var(--muted2);margin:-2px 0 8px;line-height:1.45"></div>`}
+      <!-- EE Portion field: only meaningful for x6080 (Payroll Taxes & Benefits)
+           remittances. Toggled visible by _toggleEEField() when that category is
+           picked. Lets the user log a combined SSS/PhilHealth/HDMF payment in
+           one entry without the dashboard double-counting the employee-deducted
+           portion that was already netted from wages on payroll finalize. Lives
+           OUTSIDE the isEdit gate so it's available when editing too. -->
+      <div id="m-ee-wrap" class="form-group" style="display:none">
+        <label>EE Portion (already in payroll)
+          <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· dashboard labor calc subtracts this to avoid double-count</span>
+        </label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input id="m-ee-share" type="number" step="0.01" min="0" placeholder="0.00" value="${data?.eeShare||''}" style="flex:1">
+          <button type="button" class="btn btn-ghost btn-xs" onclick="_toggleEEPrefill()" title="Auto-compute the EE total from finalized payroll runs — no more digging through payslips">📊 Pull from payroll</button>
+        </div>
+        <div style="font-size:.7rem;color:var(--muted2);margin-top:3px;line-height:1.4">
+          Portion of this remittance deducted from employee pay (SSS/PhilHealth/HDMF/withholding employee share). Leave blank if purely employer-side.
+        </div>
+        <!-- Prefill panel: populated lazily by _renderEEPrefillPanel() on first
+             toggle. Checkboxes for each finalized run, with per-agency totals.
+             Sum of checked rows auto-writes into m-ee-share. -->
+        <div id="m-ee-prefill-panel" style="display:none;margin-top:8px;border:1px solid var(--border);border-radius:6px;padding:10px;background:var(--bg2)"></div>
+      </div>`:'';
     body=`<div class="form-row"><div class="form-group"><label>Date</label><input id="m-date" type="date" value="${data?.date||today()}"></div><div class="form-group"><label>Amount (₱)</label><input id="m-amt" type="number" step="0.01" min="0.01" placeholder="0.00" value="${data?.amount||''}" oninput="recalcAutoVat()"></div></div>${catField}${acctField}${accrualFields}<div class="form-row"><div class="form-group"><label>Note</label><input id="m-note" placeholder="Description…" value="${esc(data?.note||'')}"></div><div class="form-group"><label>Handler</label><input id="m-handler" placeholder="Your name" value="${esc(data?.handler||currentUser)}"></div></div><div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="${saveCall}">${isEdit?'Update':'Save'}</button>${isEdit?`<button class="btn btn-danger" onclick="voidTransaction('${data.id}');closeModal()">Void</button>`:''}<button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
     /* Apply initial VAT-mode state after modal mounts — sets the hint text, enables/
-       disables the Input VAT field, and runs the first auto-compute if needed. */
+       disables the Input VAT field, and runs the first auto-compute if needed.
+       Same tick: prime the EE-field visibility from the currently-selected
+       category (so editing an existing x6080 tx shows the field immediately). */
     if(isExpense && !isEdit) setTimeout(onVatModeChange, 30);
+    if(isExpense) setTimeout(_toggleEEField, 30);
   }
 
   const ov=document.getElementById('modal-wrap');
@@ -5040,6 +5169,11 @@ function submitTx(type){
     }
   }
   const expenseAmt=round2(amt-inputVat);
+  /* eeShare — only meaningful for x6080 (Payroll Taxes & Benefits). Captures
+     the EE-deducted portion of a combined statutory remittance so the
+     dashboard labor calc doesn't double-count it. Clamped 0..expenseAmt. */
+  const _rawEE = parseFloat(document.getElementById('m-ee-share')?.value||0)||0;
+  const eeShare = (coaId==='x6080') ? round2(Math.max(0, Math.min(_rawEE, expenseAmt))) : 0;
   const expenseTx=createLedgerTransaction({
     type, account:acct,
     category, coaId,
@@ -5048,6 +5182,7 @@ function submitTx(type){
     expenseType:document.getElementById('m-exptype')?.value||'',
     status,
     dueDate:document.getElementById('m-duedate')?.value||'',
+    ...(eeShare>0 ? {eeShare} : {}),
   },{skipRender:inputVat>0});
   if(inputVat>0){
     /* Withdrawal (cash-debiting) tagged to a1080 — cash leaves with the expense,
@@ -5592,7 +5727,14 @@ function pgDashboard(){
     if(_WAGE_IDS.has(t.coaId)) return false; // direct wages — already in shifts
     const c = (coa||[]).find(x=>x.id===t.coaId||x.name===t.category);
     return c?.group === 'Labor';
-  }).reduce((s,t)=>s+(Number(t.amount)||0),0);
+  }).reduce((s,t)=>{
+    /* eeShare opt-in (x6080 statutory remittances): the user logged the FULL
+       agency payment as one expense for simplicity, but flagged the employee-
+       deducted portion that was already netted from wages during payroll
+       finalize. Subtract it here so the dashboard counts only the EMPLOYER
+       share as new labor cost — no double-count with shift wages. */
+    return s + Math.max(0, (Number(t.amount)||0) - (Number(t.eeShare)||0));
+  }, 0);
   const twNonShiftLabor = _nonShiftLaborFor(twTx);
   const lwNonShiftLabor = _nonShiftLaborFor(lwTx);
   /* Total labor = shift wages + ancillary labor costs. This is what the
@@ -5937,7 +6079,7 @@ ${(()=>{
       if(_WAGE.has(t.coaId)) return false;
       const c = (coa||[]).find(x=>x.id===t.coaId||x.name===t.category);
       return c?.group === 'Labor';
-    }).reduce((s,t)=>s+(Number(t.amount)||0),0);
+    }).reduce((s,t)=>s + Math.max(0, (Number(t.amount)||0) - (Number(t.eeShare)||0)), 0); // see _nonShiftLaborFor — same eeShare opt-in
     const shiftLabor = shiftWages + nonShiftLabor; // true labor for this trend point
     const shiftLaborP = m.netRevenue>0 ? (shiftLabor/m.netRevenue)*100 : 0;
     const primeLiveP  = m.netRevenue>0 ? ((shiftLabor + (m.cogs||0)) / m.netRevenue) * 100 : 0;
