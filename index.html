@@ -1869,9 +1869,26 @@ function pgCashPosition(){
 
 
 
+/* Pages that actually USE the global date filter via txInRange. Other pages
+   either have their own date controls (Dashboard lens, Weekly Check week
+   nav, DSR date picker, Labor cut-off, Forecast horizon) or are not
+   date-scoped at all (Funds, COA, Tabs, etc.). Showing the bar on those
+   was pure confusion — toggling it did nothing visible. */
+const GLOBAL_DATE_PAGES = new Set(['transactions','activity']);
+
 function renderGlobalDateBar(){
   const bar=document.getElementById('global-date-bar');
   if(!bar)return;
+  /* Hide the bar entirely on pages that don't consume it. Wrapper gets
+     display:none so the surrounding flex layout collapses cleanly — no
+     awkward empty gap. */
+  const wrapper = bar.parentElement || bar;
+  if (!GLOBAL_DATE_PAGES.has(currentPage)){
+    wrapper.style.display = 'none';
+    bar.innerHTML = '';
+    return;
+  }
+  wrapper.style.display = '';
   const presets=[['today','Today'],['yesterday','Yesterday'],['week','This Week'],['month','This Month'],['last_month','Last Month'],['all','All Time']];
   bar.innerHTML=`
     <span class="gdb-label">Viewing:</span>
@@ -2100,7 +2117,10 @@ const treasuryService={
         case 'sc_paid':
         case 'tip_paid':
         case 'liability_payment': {
-          /* SC/Tip settlement or liability remittance (VAT/SSS/etc) — cash leaves pool. */
+          /* SC/Tip settlement or liability remittance (VAT/SSS/etc) — cash leaves pool.
+             Defensive unpaid guard — symmetry with expense/withdrawal, kept in sync
+             with rebuildAccountBalances. See that case block for full rationale. */
+          if(t.status==='unpaid') break;
           const acct=t.account||t.sourceAccountId;
           if(opIds.has(acct)) outflows+=amt;
           break;
@@ -2442,29 +2462,56 @@ function _calcMetricsImpl(txList){
 
   // ─────────────────────────
   // CLASSIFICATION HELPERS
+  //
+  // Each filter checks BOTH tx.type AND coa.type/group. The tx.type gate
+  // prevents two real defense gaps:
+  //   1. A tx with type='unknown' (the normalizeTx fallback for txs missing
+  //      a type) but a valid coaId would otherwise silently leak into the
+  //      P&L while producing no cash effect — breaking the documented
+  //      "inert" invariant.
+  //   2. A CSV-imported / API-posted tx with a mis-matched type+coa pairing
+  //      (e.g. type='expense' tagged to coaId='r4000' Food Sales) would
+  //      otherwise show as phantom revenue. UI dropdowns prevent this for
+  //      human-entered txs, but external data paths can still introduce it.
+  //
+  // REVENUE_LIKE = types that can legitimately contribute revenue side:
+  //   sale       — main flow
+  //   deposit    — for revenue COA like 'Other Income' (PH bookkeeping convention)
+  //   dsr_adjustment — for Output VAT subtraction + contra-revenue memos
+  // EXPENSE_LIKE = types that can legitimately contribute expense side:
+  //   expense    — only path for COGS/Labor/Opex/OtherExp on the P&L
+  //                (withdrawals are cash-only moves; transfers cash-neutral;
+  //                 SC/Tip/Liability-payment are liability draws not expenses)
   // ─────────────────────────
+  const REVENUE_LIKE_TYPES = new Set(['sale','deposit','dsr_adjustment']);
+  const EXPENSE_LIKE_TYPES = new Set(['expense']);
 
   function isRevenue(tx){
+    if (!REVENUE_LIKE_TYPES.has(tx.type)) return false;
     const c = getCoa(tx);
     return c?.type === 'revenue';
   }
 
   function isContraRevenue(tx){
+    if (!REVENUE_LIKE_TYPES.has(tx.type)) return false;
     const c = getCoa(tx);
     return c?.type === 'contra_revenue';
   }
 
   function isCogsTx(tx){
+    if (!EXPENSE_LIKE_TYPES.has(tx.type)) return false;
     const c = getCoa(tx);
     return c?.type === 'cogs';
   }
 
   function isLaborTx(tx){
+    if (!EXPENSE_LIKE_TYPES.has(tx.type)) return false;
     const c = getCoa(tx);
     return c?.group === 'Labor';
   }
 
   function isOperatingExpenseTx(tx){
+    if (!EXPENSE_LIKE_TYPES.has(tx.type)) return false;
     const c = getCoa(tx);
     return c?.type === 'expense'
       && c?.group !== 'Labor'
@@ -2472,6 +2519,7 @@ function _calcMetricsImpl(txList){
   }
 
   function isOtherExpenseTx(tx){
+    if (!EXPENSE_LIKE_TYPES.has(tx.type)) return false;
     const c = getCoa(tx);
     return c?.group === 'Other Expenses';
   }
@@ -2590,8 +2638,11 @@ function _calcMetricsImpl(txList){
   // OTHER EXPENSES
   // ─────────────────────────
 
+  /* Other Income — also gated by REVENUE_LIKE_TYPES so a stray withdrawal /
+     unknown tx tagged to an Other Income COA doesn't leak into the P&L. */
   const otherIncome = paid
     .filter(t=>{
+      if (!REVENUE_LIKE_TYPES.has(t.type)) return false;
       const c = getCoa(t);
       return c?.group === 'Other Income';
     })
@@ -3999,7 +4050,11 @@ function deriveSubtype(tx){
   if(tx.type==='tip_paid')return 'tip_paid';
   if(tx.type==='liability_payment')return 'liability_payment';
   if(tx.type==='transfer')return 'transfer';
-  if(tx.type==='payroll')return 'payroll_release';
+  /* `tx.type==='payroll'` legacy line removed — modern payroll posts as
+     type:'expense' with payrollRunId tag, no current code path creates a
+     raw 'payroll' typed tx. The deriveSubtype line was dead-code support
+     for a legacy data shape that no migration ever upgrades — if old data
+     ever surfaces, classifying by coa.group='Labor' picks it up correctly. */
   return tx.type;
 }
 
@@ -4287,6 +4342,18 @@ function deleteAccount(id){
      pay routing changes unexpectedly). */
   const refs=(roster||[]).filter(r=>r&&r.payoutAccount===id);
   if(refs.length){toast(`Used as payout account for ${refs.length} employee(s) — reassign first`,'error');return}
+  /* Defensive blocks for two other reference paths the original checks missed:
+       1. cashAdvances.account — every advance records which account the cash
+          left from. Deleting the account orphans the audit trail and would
+          mis-report Employee Receivables historical context.
+       2. monthlyOpeningBalances.accountId — per-month opening balance entries
+          are keyed by accountId. Deleting strands them as orphan rows that
+          can never be re-displayed (the carry-forward UI looks them up by
+          existing account, so they become invisible dead weight in state). */
+  const advRefs=(cashAdvances||[]).filter(a=>a&&a.account===id);
+  if(advRefs.length){toast(`Used by ${advRefs.length} cash advance entr${advRefs.length===1?'y':'ies'} — void or reassign first`,'error');return}
+  const obRefs=(monthlyOpeningBalances||[]).filter(b=>b&&b.accountId===id);
+  if(obRefs.length){toast(`Account has ${obRefs.length} monthly opening-balance entr${obRefs.length===1?'y':'ies'} — clear them first`,'error');return}
   if(!confirm('Delete this account?'))return;
   const a=accounts.find(x=>x.id===id);
   accounts=accounts.filter(a=>a.id!==id);
@@ -6055,9 +6122,16 @@ ${(()=>{
          width at 10 units in a 400-unit viewBox → bars only used ~7.5% each
          × 3 = 22% of horizontal space. New: each bar 27% of the group, gaps
          2%. Bars fill ~85% of group → readable signal instead of pencil-thin
-         strokes lost in whitespace. */
+         strokes lost in whitespace.
+
+         Width fix: switched preserveAspectRatio to "none" so the SVG stretches
+         horizontally to fill its container (the wide card). Previously "meet"
+         locked the aspect ratio at 400:110 (~3.6:1) → letterboxed in a wide
+         card with lots of empty horizontal space. Vertical bars don't care
+         about aspect distortion — they just get wider. Also bumped height
+         to 140 so the chart has more vertical room to read. */
       const maxV=Math.max(...twFood,...twAlc,...twBev,1);
-      const H=110, W=400, n=curBuckets.length||1, groupW=W/n;
+      const H=140, W=600, n=curBuckets.length||1, groupW=W/n;
       const bw=groupW*0.27;
       const gap=groupW*0.02;
       const pad=(groupW - bw*3 - gap*2)/2;
@@ -6071,10 +6145,10 @@ ${(()=>{
           <rect x="${x}" y="${y-hf}" width="${bw}" height="${hf}" fill="#22c55e" rx="2"/>
           <rect x="${x+bw+gap}" y="${y-ha}" width="${bw}" height="${ha}" fill="#f59e0b" rx="2"/>
           <rect x="${x+bw*2+gap*2}" y="${y-hb}" width="${bw}" height="${hb}" fill="#3b82f6" rx="2"/>
-          <text x="${x+(bw*3+gap*2)/2}" y="${H-2}" font-size="9" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]||''}</text>
+          <text x="${x+(bw*3+gap*2)/2}" y="${H-2}" font-size="11" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]||''}</text>
         `;
       }).join('');
-      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:110px" preserveAspectRatio="xMidYMid meet">${bars}</svg>`;
+      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:140px" preserveAspectRatio="none">${bars}</svg>`;
     })()}
   </div>
 </div>
@@ -6594,6 +6668,12 @@ function rebuildAccountBalances(){
       case 'tip_paid':
       case 'liability_payment': {
         // SC/Tip settlement or liability remittance — cash leaves the paying account.
+        // Symmetry with expense/withdrawal: an unpaid version of these would be
+        // an accrual (obligation booked, cash not yet moved). All current creation
+        // paths post these as status:'paid', so the guard is defensive — keeps the
+        // case block forward-compatible if anyone ever adds an "accrue this"
+        // flow without separately remembering this branch.
+        if(t.status==='unpaid') break;
         const acct = t.account||t.sourceAccountId;
         if(acct) accounts = accounts.map(a=>a.id===acct?{...a,balance:round2(a.balance-amt)}:a);
         break;
@@ -8766,7 +8846,35 @@ function deleteRosterMember(id){
      the Balance Sheet (Employee Receivables) with no roster card to surface it. */
   const owed=employeeAdvanceBalance(id);
   if(owed>0){toast(`Employee still owes ${fmt(owed)} in cash advances — settle or delete the advance first`,'error');return}
-  if(!confirm('Remove this employee?'))return;
+  /* Block delete if any payroll adjustment exists that ISN'T already baked
+     into a finalized run. Pending/ad-hoc adjustments either:
+       - Have no payrollPeriod tag (manual adjustment from outside the payroll
+         flow) → would silently apply to any future cutoff that matches the
+         employee's id even after they're gone
+       - Have a payrollPeriod that doesn't match any finalized run → still
+         active for the next finalize attempt
+     Historical adjustments (period matches a finalized run) are safe to leave
+     as orphans because they're already baked into the run snapshot. */
+  const pendingAdjs=(payrollAdjustments||[]).filter(a=>{
+    if(!a||a.employeeId!==id) return false;
+    if(!a.payrollPeriod) return true;
+    const inFinalizedRun=(payrollRuns||[]).some(r=>r&&`${r.fromDate}-${r.toDate}`===a.payrollPeriod);
+    return !inFinalizedRun;
+  });
+  if(pendingAdjs.length){toast(`Employee has ${pendingAdjs.length} unfinalized payroll adjustment${pendingAdjs.length===1?'':'s'} — remove or finalize first`,'error');return}
+  /* Inform about historical orphans (settled cash advances, finalized-period
+     adjustments). They're harmless — frozen payroll-run snapshots embed the
+     full employee object so historical reports stay intact — but the user
+     should know the rows will persist in saved state as orphan records. */
+  const settledAdvances=(cashAdvances||[]).filter(a=>a&&a.employeeId===id);
+  const historicalAdjs=(payrollAdjustments||[]).filter(a=>a&&a.employeeId===id);
+  const orphans=[];
+  if(settledAdvances.length) orphans.push(`${settledAdvances.length} settled cash advance${settledAdvances.length===1?'':'s'}`);
+  if(historicalAdjs.length) orphans.push(`${historicalAdjs.length} historical payroll adjustment${historicalAdjs.length===1?'':'s'}`);
+  const msg = orphans.length
+    ? `Remove this employee?\n\nNote: ${orphans.join(' and ')} will remain in saved state as orphan records (harmless, but persist for historical accuracy of past payroll runs).`
+    : 'Remove this employee?';
+  if(!confirm(msg))return;
   roster=roster.filter(r=>r.id!==id);scheduleSave();render();toast('Removed');
 }
 function editRosterMember(id){openModal('editRoster',roster.find(r=>r.id===id))}
@@ -9814,7 +9922,24 @@ function submitAddPayable(){
 }
 function editPayable(id){openModal('editPayable',payables.find(p=>p.id===id))}
 function saveEditPayable(id){payables=payables.map(p=>p.id===id?{...p,name:document.getElementById('m-pay-name')?.value||p.name,type:document.getElementById('m-pay-type')?.value||p.type,supplier:document.getElementById('m-pay-supplier')?.value||p.supplier,balance:parseFloat(document.getElementById('m-pay-balance')?.value||p.balance)||p.balance,dueDate:document.getElementById('m-pay-due')?.value||p.dueDate,note:document.getElementById('m-pay-note')?.value||p.note}:p);scheduleSave();render();closeModal();toast('Updated ✓')}
-function deletePayable(id){if(!confirm('Delete this payable?'))return;payables=payables.filter(p=>p.id!==id);scheduleSave();render();toast('Deleted')}
+function deletePayable(id){
+  const p=payables.find(x=>x.id===id);
+  if(!p) return;
+  /* Block delete if any non-voided ledger tx references this payable via
+     payableId. confirmPayPayable tags payment txs with payableId so that
+     voidTransaction can restore the payable's balance when a payment is
+     reversed. Deleting the payable now would silently break that round-trip:
+     voiding a payment later would no-op the balance restoration (the .map
+     finds no matching payable), leaving the ledger and payable out of sync. */
+  const linkedTxs=(transactions||[]).filter(t=>t&&!t.voided&&t.payableId===id);
+  if(linkedTxs.length){
+    toast(`Cannot delete — ${linkedTxs.length} payment${linkedTxs.length===1?'':'s'} reference this payable. Void those payments first to release the link.`,'error');
+    return;
+  }
+  if(!confirm('Delete this payable?'))return;
+  payables=payables.filter(p=>p.id!==id);
+  scheduleSave();render();toast('Deleted');
+}
 function payPayable(id){const p=payables.find(x=>x.id===id);if(!p)return;openModal('payPayable',p)}
 function confirmPayPayable(id){
   const p=payables.find(x=>x.id===id);
