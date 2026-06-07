@@ -6119,37 +6119,36 @@ ${(()=>{
   </div>
   <div style="padding:10px 14px">
     ${(()=>{
-      /* Three bars per group (Food / Alcohol / NA Bev). Old code capped bar
-         width at 10 units in a 400-unit viewBox → bars only used ~7.5% each
-         × 3 = 22% of horizontal space. New: each bar 27% of the group, gaps
-         2%. Bars fill ~85% of group → readable signal instead of pencil-thin
-         strokes lost in whitespace.
-
-         Width fix: switched preserveAspectRatio to "none" so the SVG stretches
-         horizontally to fill its container (the wide card). Previously "meet"
-         locked the aspect ratio at 400:110 (~3.6:1) → letterboxed in a wide
-         card with lots of empty horizontal space. Vertical bars don't care
-         about aspect distortion — they just get wider. Also bumped height
-         to 140 so the chart has more vertical room to read. */
+      /* Three bars per group (Food / Alcohol / NA Bev). Bars get
+         preserveAspectRatio="none" to stretch horizontally and fill the
+         wide card. Day labels rendered as HTML in a CSS grid BELOW the
+         SVG instead of as <text> inside it — putting them in the SVG
+         would stretch them along with the bars, leaving the letterforms
+         visibly distorted (the bug the user just flagged). HTML grid
+         with `repeat(n,1fr)` aligns each label exactly under its bar
+         group at natural font weight. */
       const maxV=Math.max(...twFood,...twAlc,...twBev,1);
-      const H=140, W=600, n=curBuckets.length||1, groupW=W/n;
+      const H=120, W=600, n=curBuckets.length||1, groupW=W/n;
       const bw=groupW*0.27;
       const gap=groupW*0.02;
       const pad=(groupW - bw*3 - gap*2)/2;
-      const y=H-20;
+      const y=H; /* No label row inside SVG — bars use full height. */
       const bars=curBuckets.map((b,i)=>{
         const x=i*groupW + pad;
-        const hf=((twFood[i]||0)/maxV)*(H-20);
-        const ha=((twAlc[i]||0)/maxV)*(H-20);
-        const hb=((twBev[i]||0)/maxV)*(H-20);
+        const hf=((twFood[i]||0)/maxV)*H;
+        const ha=((twAlc[i]||0)/maxV)*H;
+        const hb=((twBev[i]||0)/maxV)*H;
         return `
           <rect x="${x}" y="${y-hf}" width="${bw}" height="${hf}" fill="#22c55e" rx="2"/>
           <rect x="${x+bw+gap}" y="${y-ha}" width="${bw}" height="${ha}" fill="#f59e0b" rx="2"/>
           <rect x="${x+bw*2+gap*2}" y="${y-hb}" width="${bw}" height="${hb}" fill="#3b82f6" rx="2"/>
-          <text x="${x+(bw*3+gap*2)/2}" y="${H-2}" font-size="11" fill="var(--muted2)" text-anchor="middle">${DOW_LABELS[i]||''}</text>
         `;
       }).join('');
-      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:140px" preserveAspectRatio="none">${bars}</svg>`;
+      const labelRow = curBuckets.map((_,i)=>
+        `<div style="text-align:center;font-size:.7rem;color:var(--muted2)">${DOW_LABELS[i]||''}</div>`
+      ).join('');
+      return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:120px;display:block" preserveAspectRatio="none">${bars}</svg>
+        <div style="display:grid;grid-template-columns:repeat(${n},1fr);margin-top:4px">${labelRow}</div>`;
     })()}
   </div>
 </div>
