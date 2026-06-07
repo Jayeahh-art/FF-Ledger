@@ -1879,16 +1879,17 @@ const GLOBAL_DATE_PAGES = new Set(['transactions','activity']);
 function renderGlobalDateBar(){
   const bar=document.getElementById('global-date-bar');
   if(!bar)return;
-  /* Hide the bar entirely on pages that don't consume it. Wrapper gets
-     display:none so the surrounding flex layout collapses cleanly — no
-     awkward empty gap. */
-  const wrapper = bar.parentElement || bar;
+  /* Hide the bar itself on pages that don't consume it. The PARENT wrapper
+     holds the <main> page content too — setting display:none on it nukes the
+     whole page (bug from the first version of this hide logic). Hiding just
+     the bar leaves an invisible 0-height row, which the flex column collapses
+     cleanly with no visual gap. */
   if (!GLOBAL_DATE_PAGES.has(currentPage)){
-    wrapper.style.display = 'none';
+    bar.style.display = 'none';
     bar.innerHTML = '';
     return;
   }
-  wrapper.style.display = '';
+  bar.style.display = '';
   const presets=[['today','Today'],['yesterday','Yesterday'],['week','This Week'],['month','This Month'],['last_month','Last Month'],['all','All Time']];
   bar.innerHTML=`
     <span class="gdb-label">Viewing:</span>
