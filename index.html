@@ -875,6 +875,11 @@ async function loadApp(){
        Previously wrapped inside ensureDailySnapshot, now called directly after
        the Mark Reviewed feature was stripped. */
     try{ persistForecastSnapshot(); }catch(e){ console.warn('persistForecastSnapshot failed',e); }
+    /* Startup diagnostics — runs assertion registry + state-shape + sync checks
+       once at boot, populates _startupDiagnostics which the System Health page
+       reads. Fails loudly to console + activity log on HIGH-severity failures
+       but never blocks boot — the user might need the app to see/fix issues. */
+    try{ runStartupDiagnostics(); }catch(e){ console.warn('runStartupDiagnostics failed',e); }
     /* Hotfix: staff role doesn't have access to dashboard. Land them on the
        first allowed page (DSR) instead of an empty/restricted dashboard view.
        Manager role keeps the dashboard default. */
@@ -2087,6 +2092,25 @@ const treasuryService={
            disagreed on transfers, SC, and tips.
      Result: Monthly Cash Model and Treasury Reconciliation now tie by
      construction, and both are internally consistent with account balances. */
+  /* ╔════════════════════════════════════════════════════════════════════╗
+     ║  ACCOUNTING CORE · _flows — DO NOT EDIT WITHOUT A PLAN             ║
+     ║                                                                     ║
+     ║  Operational cash inflow/outflow aggregator. Used by:               ║
+     ║    · getTreasuryReconciliation (expected vs actual cash)            ║
+     ║    · _calcMetricsImpl (cash-basis variants → cogsCash/laborCash/etc)║
+     ║    · runForecast (starting cash projection)                         ║
+     ║                                                                     ║
+     ║  INVARIANTS:                                                        ║
+     ║    · "Operational pool" = accounts where !excludeFromLiquidity.     ║
+     ║      Clearing accounts (Card Clearing, Sales Clearing) excluded —   ║
+     ║      cash there is in-flight, not yet operationally available.     ║
+     ║    · Mirrors rebuildAccountBalances case-by-case: any tx.type added ║
+     ║      to one MUST be added to the other (silent drift otherwise).    ║
+     ║    · Unpaid expense/withdrawal: skipped (accrual rule).             ║
+     ║    · Transfer crossing operational boundary: net inflow OR outflow. ║
+     ║      Internal shuffles (both ends operational): zero net effect.    ║
+     ║    · dsr_adjustment: zero cash effect (informational P&L memos).    ║
+     ╚════════════════════════════════════════════════════════════════════╝ */
   _flows(from, to, txList){
     const opIds=new Set(
       (accounts||[]).filter(a=>!a.excludeFromLiquidity).map(a=>a.id)
@@ -2175,6 +2199,23 @@ const treasuryService={
     return cash - obligations.total;
   },
 
+  /* ╔════════════════════════════════════════════════════════════════════╗
+     ║  ACCOUNTING CORE · _getObligations — DO NOT EDIT WITHOUT A PLAN    ║
+     ║                                                                     ║
+     ║  Single source of truth for "what does the business owe?". Used by  ║
+     ║  Dashboard Cash Position card, Cash Position page, Cash Stress      ║
+     ║  alert, runForecast starting-cash adjustment.                       ║
+     ║                                                                     ║
+     ║  INVARIANTS:                                                        ║
+     ║    · 4 disjoint buckets: payroll + accruedWages + accrued +         ║
+     ║      payablesDue. Same dollar must never be in two buckets.         ║
+     ║    · Memoized per-render via window._oblCache (cleared on render()  ║
+     ║      and scheduleSave()). Reads must NOT mutate the cache.          ║
+     ║    · accruedWages skips shift-dates already covered by a finalized  ║
+     ║      payroll run (otherwise double-count with `payroll` bucket).    ║
+     ║    · `total` is the sum: any downstream consumer treating .total    ║
+     ║      as authoritative must NOT also iterate the per-bucket values.  ║
+     ╚════════════════════════════════════════════════════════════════════╝ */
   _getObligations(){
     /* Returns the four obligation buckets that draw from operational cash:
          payroll       — finalized but unpaid wage txs (have payrollRunId)
@@ -2440,6 +2481,35 @@ function calcMetrics(txList){
   return result;
 }
 
+/* ╔══════════════════════════════════════════════════════════════════════╗
+   ║  ACCOUNTING CORE · _calcMetricsImpl — DO NOT EDIT WITHOUT A PLAN     ║
+   ║                                                                       ║
+   ║  P&L computation. Drives every metric on the Dashboard, Reports, and  ║
+   ║  Weekly Check. Memoized via _metricsCache so a render storm doesn't   ║
+   ║  recompute on every paint — cache busts on every gateway-write.       ║
+   ║                                                                       ║
+   ║  INVARIANTS:                                                          ║
+   ║    · ACCRUAL basis: revenue + expense recognized on tx.date           ║
+   ║      regardless of status. Unpaid items affect P&L; only cash views   ║
+   ║      filter by status==='paid'.                                       ║
+   ║    · Classifier filters (isRevenue/isCogsTx/etc.) gate on BOTH        ║
+   ║      tx.type AND coa.type — see the REVENUE_LIKE_TYPES /              ║
+   ║      EXPENSE_LIKE_TYPES whitelist below. Loosening either dimension   ║
+   ║      opens phantom P&L leaks from CSV/API-imported data.              ║
+   ║    · DSR-originated contra revenue (type 'dsr_adjustment' with        ║
+   ║      contra_revenue COA) is ALREADY netted out at source — surface    ║
+   ║      as a memo, never re-subtract. See "Option A" comment inline.    ║
+   ║    · Output VAT (dsr_adjustment + coaId='l2100') stripped from gross  ║
+   ║      revenue to produce VAT-exclusive net revenue.                    ║
+   ║    · primeCost = cogs + labor BY DEFINITION (don't accept user        ║
+   ║      override — Weekly Check's auto-recompute enforces this).         ║
+   ║    · ebitda = grossProfit − labor − operatingExpenses (Other          ║
+   ║      Expenses subtracted AFTER ebitda → netProfit per US GAAP).       ║
+   ║                                                                       ║
+   ║  ADDING a new metric: extend the return object, then audit every      ║
+   ║  consumer (financialService, dashboard cards, Reports tables). DO     ║
+   ║  NOT change the meaning of existing keys silently.                    ║
+   ╚══════════════════════════════════════════════════════════════════════╝ */
 function _calcMetricsImpl(txList){
 
   const active = txList.filter(t => !t.voided);
@@ -3951,6 +4021,32 @@ function createLedgerBatch(txs=[],{skipRender=false,skipSave=false}={}){
 /* Hotfix M2: deleted applyTxToAccounts no-op — Phase 1 deprecated it,
    zero callers remained. Balances are derived by rebuildAccountBalances(). */
 
+/* ╔══════════════════════════════════════════════════════════════════════╗
+   ║  ACCOUNTING CORE · normalizeTx — DO NOT EDIT WITHOUT A PLAN          ║
+   ║                                                                       ║
+   ║  Single point of truth for transaction shape. Every tx flows through  ║
+   ║  here via createLedgerTransaction. The return object is an EXPLICIT   ║
+   ║  whitelist: any field not enumerated here is STRIPPED silently —      ║
+   ║  see the eeShare/lStartCash addition history for examples of fields   ║
+   ║  that needed to be added to this list to survive save/load.           ║
+   ║                                                                       ║
+   ║  INVARIANTS this function preserves:                                  ║
+   ║    · `amount` is always Number — string concat in reduces would       ║
+   ║      otherwise corrupt every downstream sum                           ║
+   ║    · `type` defaults to 'unknown' (no silent coercion to 'expense')   ║
+   ║      so rebuildAccountBalances produces no balance effect             ║
+   ║    · `sourceAccountId` / `destinationAccountId` set ONLY for tx       ║
+   ║      types that legitimately move cash from/to that side             ║
+   ║    · backward-compat fields (account/fromAccount/toAccount/note/      ║
+   ║      handler/createdBy) stay populated for legacy readers             ║
+   ║                                                                       ║
+   ║  CHANGING the schema requires:                                        ║
+   ║    1. Adding the field both here AND in apps-script.js TX_COLUMNS     ║
+   ║    2. Bumping LEDGER_STATE_VERSION                                    ║
+   ║    3. Adding a migration clause in migrateState() if old data needs   ║
+   ║       to be backfilled to the new shape                               ║
+   ║    4. Running System Health → "Run integrity check" before & after   ║
+   ╚══════════════════════════════════════════════════════════════════════╝ */
 function normalizeTx(tx){
   /* Canonical transaction schema v2 — Phase 1 */
   const coaItem = coa.find(a=>a.name===tx.category||a.id===tx.coaId);
@@ -6633,6 +6729,34 @@ function getDSRPosted(date){
    Transactions are authoritative. Balances are derived.
    Call after ANY state change that affects transactions.
 ═══════════════════════════════════════════════ */
+/* ╔══════════════════════════════════════════════════════════════════════╗
+   ║  ACCOUNTING CORE · rebuildAccountBalances — DO NOT EDIT WITHOUT PLAN ║
+   ║                                                                       ║
+   ║  Single deterministic derivation of account balances from the         ║
+   ║  transaction ledger. Every gateway write triggers a rebuild; balance  ║
+   ║  drift would otherwise compound silently over thousands of txs.       ║
+   ║                                                                       ║
+   ║  INVARIANTS:                                                          ║
+   ║    · Every non-voided tx is replayed in chronological order           ║
+   ║    · round2 on every accumulation step keeps centavo precision        ║
+   ║      (without it, JS float drift trips assertLiquidityIntegrity       ║
+   ║       within ~thousand txs)                                           ║
+   ║    · Unpaid expense/withdrawal: P&L hit, no cash effect (accrual)     ║
+   ║    · Unpaid sc_paid/tip_paid/liability_payment: defensive — guard     ║
+   ║      added 2026 to symmetry-match expense/withdrawal                  ║
+   ║    · Transfer: balanced (−from, +to). Net zero across operational     ║
+   ║      pool (treasuryService._flows treats as neutral if both ends      ║
+   ║      operational).                                                    ║
+   ║    · dsr_adjustment: zero balance impact by definition (informational)║
+   ║    · unknown tx.type: zero balance impact (safety net for malformed   ║
+   ║      imports). _calcMetricsImpl gates classifiers on tx.type to       ║
+   ║      prevent unknown-typed txs from leaking into P&L.                 ║
+   ║                                                                       ║
+   ║  ADDING a new tx.type requires:                                       ║
+   ║    1. Adding a case here AND in treasuryService._flows                ║
+   ║    2. Deciding whether it gates on status==='unpaid'                  ║
+   ║    3. Updating the type-pipeline audit (see audit comment at top)     ║
+   ╚══════════════════════════════════════════════════════════════════════╝ */
 function rebuildAccountBalances(){
   _invalidateMetricsCache(); /* Phase 3A: invalidate memoized metrics on every rebuild */
   // Reset all balances to zero
@@ -10552,8 +10676,243 @@ function pgCash(){
 }
 
 
+/* ═══════════════════════════════════════════════
+   SYSTEM HEALTH PAGE & STARTUP DIAGNOSTICS
+═══════════════════════════════════════════════ */
+
+/* Captured at boot — surfaces on the System Health page. Helps the user
+   confirm "did everything load cleanly?" instead of silently proceeding
+   on top of a partially-broken state. */
+let _startupDiagnostics = null;
+
+function runStartupDiagnostics(){
+  const checks = [];
+  const startTs = Date.now();
+
+  /* 1. State shape — every persistent var should be the expected type. */
+  const stateShape = [
+    ['accounts',Array.isArray(accounts)],
+    ['transactions',Array.isArray(transactions)],
+    ['coa',Array.isArray(coa)],
+    ['payables',Array.isArray(payables)],
+    ['roster',Array.isArray(roster)],
+    ['shifts',Array.isArray(shifts)],
+    ['holidays',Array.isArray(holidays)],
+    ['payrollRuns',Array.isArray(payrollRuns)],
+    ['payrollAdjustments',Array.isArray(payrollAdjustments)],
+    ['dsrEntries',dsrEntries && typeof dsrEntries==='object' && !Array.isArray(dsrEntries)],
+    ['cashCounts',Array.isArray(cashCounts)],
+    ['monthlyBudget',monthlyBudget && typeof monthlyBudget==='object' && !Array.isArray(monthlyBudget)],
+    ['openingCashState',openingCashState && typeof openingCashState==='object'],
+  ];
+  stateShape.forEach(([name,ok])=>{
+    checks.push({name:'shape: '+name, ok, severity:'high'});
+  });
+
+  /* 2. Schema version match. */
+  const expectedVersion = (typeof LEDGER_STATE_VERSION!=='undefined') ? LEDGER_STATE_VERSION : null;
+  checks.push({name:'schema version', ok: expectedVersion!=null, severity:'medium', detail:String(expectedVersion||'unknown')});
+
+  /* 3. Integrity assertions — run the full registry once. */
+  try{
+    const r = runAssertions('startup');
+    checks.push({name:'integrity assertions', ok: !!r.ok && (!r.errors || r.errors.length===0), severity:'high', detail: r.errors && r.errors.length ? r.errors.length+' failure(s)' : 'all pass'});
+  }catch(e){
+    checks.push({name:'integrity assertions', ok:false, severity:'high', detail:'threw: '+e.message});
+  }
+
+  /* 4. Apps Script URL configured. */
+  const apiConfigured = typeof scriptUrl==='string' && /^https?:\/\//.test(scriptUrl);
+  checks.push({name:'apps script URL configured', ok: apiConfigured, severity:'high', detail: apiConfigured ? scriptUrl.slice(0,60)+'…' : '(missing)'});
+
+  /* 5. localStorage availability — fail-soft (incognito blocks). */
+  let storageOk = false;
+  try{ localStorage.setItem('__hc_probe__','1'); localStorage.removeItem('__hc_probe__'); storageOk = true; }catch(e){}
+  checks.push({name:'localStorage writable', ok: storageOk, severity:'medium', detail: storageOk?'yes':'BLOCKED (incognito? offline cache disabled)'});
+
+  /* 6. CSS theme tokens — sanity check that bg, text, accent are defined.
+     Caught a real bug previously where token wipes left whole pages invisible. */
+  let cssTokensOk = false;
+  try{
+    const cs = getComputedStyle(document.documentElement);
+    cssTokensOk = !!cs.getPropertyValue('--bg').trim() && !!cs.getPropertyValue('--text').trim();
+  }catch(e){}
+  checks.push({name:'css tokens defined', ok:cssTokensOk, severity:'low'});
+
+  const elapsed = Date.now() - startTs;
+  const failed = checks.filter(c=>!c.ok);
+  const highFailed = failed.filter(c=>c.severity==='high');
+
+  _startupDiagnostics = {
+    ranAt: new Date().toISOString(),
+    elapsedMs: elapsed,
+    total: checks.length,
+    passed: checks.length - failed.length,
+    failed: failed.length,
+    checks,
+    summary: highFailed.length>0
+      ? `${highFailed.length} HIGH-severity check(s) failed — see System Health page`
+      : (failed.length>0 ? `${failed.length} low-severity check(s) failed` : 'all checks passed')
+  };
+
+  /* If any HIGH-severity failed, log loudly + activity log. Don't block boot —
+     the user might still need to see and fix the broken data. */
+  if (highFailed.length){
+    console.error('STARTUP DIAGNOSTICS:', _startupDiagnostics);
+    try{
+      activityLog.unshift({
+        ts: new Date().toISOString(),
+        user: currentUser||'system',
+        msg: `⚠ Startup diagnostics: ${highFailed.length} high-severity failure(s) — see System Health`
+      });
+    }catch(e){}
+  } else {
+    console.log('Startup diagnostics: '+_startupDiagnostics.summary+' ('+elapsed+'ms)');
+  }
+
+  return _startupDiagnostics;
+}
+
+function pgSystemHealth(){
+  const diag = _startupDiagnostics || {checks:[], summary:'Not run yet — refresh the app to run diagnostics'};
+
+  /* Live counts — recomputed on every render so they reflect current state. */
+  const counts = {
+    'Transactions': (transactions||[]).length,
+    'Active accounts': (accounts||[]).filter(a=>a&&!a.excludeFromLiquidity).length,
+    'COA items': (coa||[]).length,
+    'Payables': (payables||[]).length,
+    'Open payables': (payables||[]).filter(p=>p.status!=='paid').length,
+    'Employees (active)': (roster||[]).filter(r=>r.status!=='inactive').length,
+    'Shifts logged': (shifts||[]).length,
+    'Payroll runs (finalized)': (payrollRuns||[]).length,
+    'DSR entries': Object.keys(dsrEntries||{}).length,
+    'Audit log entries': (auditLog||[]).length,
+    'Activity log entries': (activityLog||[]).length,
+  };
+
+  /* Sync state — surfaces what's persisted vs what's pending. */
+  const syncState = {
+    'Pending save': (typeof pendingSave!=='undefined' && pendingSave) ? 'YES — change in flight' : 'no',
+    'Last sync status': (()=>{
+      const badge = document.getElementById('sync-text');
+      return badge ? badge.textContent : 'unknown';
+    })(),
+    'Apps Script URL': scriptUrl || '(not configured)',
+    'Local cache last write': (()=>{
+      try{
+        const ls = localStorage.getItem('ledger_cache_v2');
+        if (!ls) return '(no cache)';
+        try{
+          const parsed = JSON.parse(ls);
+          return parsed._writtenAt ? new Date(parsed._writtenAt).toLocaleString() : '(no timestamp)';
+        }catch(e){ return '(unparseable)'; }
+      }catch(e){ return '(localStorage blocked)'; }
+    })(),
+    'Local cache size': (()=>{
+      try{
+        const ls = localStorage.getItem('ledger_cache_v2');
+        if (!ls) return '0 KB';
+        return Math.round(ls.length/1024) + ' KB';
+      }catch(e){ return 'n/a'; }
+    })()
+  };
+
+  /* Schema/version info. */
+  const versionInfo = {
+    'Ledger schema version': (typeof LEDGER_STATE_VERSION!=='undefined') ? LEDGER_STATE_VERSION : '(undefined)',
+    'User role': userRole || '(none)',
+    'Current user': currentUser || '(none)',
+    'Browser': navigator.userAgent.split(' ').slice(-2).join(' '),
+  };
+
+  const checkRow = (c) => {
+    const color = c.ok ? 'var(--green)' : (c.severity==='high' ? 'var(--red)' : c.severity==='medium' ? 'var(--amber)' : 'var(--muted2)');
+    const icon = c.ok ? '✓' : '✗';
+    return `<tr>
+      <td style="font-size:.78rem">${esc(c.name)}</td>
+      <td style="text-align:right;font-size:.78rem;color:${color};font-weight:600">${icon} ${c.ok?'pass':'fail'}</td>
+      <td style="font-size:.72rem;color:var(--muted2)">${esc(c.detail||'')}</td>
+      <td style="font-size:.7rem;color:var(--muted2)">${esc(c.severity||'')}</td>
+    </tr>`;
+  };
+
+  const kvRow = (k,v) => `<tr>
+    <td style="font-size:.78rem;color:var(--muted)">${esc(k)}</td>
+    <td style="text-align:right;font-size:.78rem;font-family:var(--fm)">${esc(String(v))}</td>
+  </tr>`;
+
+  const summaryColor = (diag.failed && diag.checks.some(c=>!c.ok && c.severity==='high'))
+    ? 'var(--red)'
+    : diag.failed ? 'var(--amber)' : 'var(--green)';
+
+  return `<div class="page-header">
+    <div class="page-hd-left">
+      <div class="page-title">System Health</div>
+      <div class="page-sub">Diagnostics, sync state, integrity</div>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button class="btn btn-ghost btn-sm" onclick="runStartupDiagnostics();render();toast('Diagnostics re-ran ✓')" title="Re-run all startup checks">↻ Re-run diagnostics</button>
+      <button class="btn btn-ghost btn-sm" onclick="(async()=>{await pushSave();render();toast('Force sync done')})()" title="Force a save to Apps Script now">⤴ Force sync</button>
+    </div>
+  </div>
+
+  <!-- ═══ DIAGNOSTICS SUMMARY ═══ -->
+  <div class="card" style="margin-bottom:14px;border-left:4px solid ${summaryColor}">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+      <div>
+        <div class="stat-label">Last diagnostics run</div>
+        <div style="font-size:1.05rem;font-weight:600;color:${summaryColor}">${esc(diag.summary)}</div>
+        <div style="font-size:.72rem;color:var(--muted2);margin-top:2px">${diag.ranAt ? new Date(diag.ranAt).toLocaleString() : '—'} · ${diag.elapsedMs||'—'}ms</div>
+      </div>
+      <div style="text-align:right">
+        <div class="stat-label">Result</div>
+        <div style="font-size:1.05rem;font-weight:600">${diag.passed||0} / ${diag.total||0} passed</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══ CHECK DETAILS ═══ -->
+  <div class="card-flush" style="margin-bottom:14px">
+    <div style="padding:9px 14px;border-bottom:1px solid var(--border)"><span class="sec-title">Startup checks</span></div>
+    <table>
+      <thead><tr><th>Check</th><th style="text-align:right">Status</th><th>Detail</th><th>Severity</th></tr></thead>
+      <tbody>${(diag.checks||[]).map(checkRow).join('')||'<tr><td colspan="4" class="empty">No checks recorded</td></tr>'}</tbody>
+    </table>
+  </div>
+
+  <!-- ═══ SYNC + STORAGE ═══ -->
+  <div class="g2" style="margin-bottom:14px">
+    <div class="card-flush">
+      <div style="padding:9px 14px;border-bottom:1px solid var(--border)"><span class="sec-title">Sync &amp; storage</span></div>
+      <table><tbody>${Object.entries(syncState).map(([k,v])=>kvRow(k,v)).join('')}</tbody></table>
+    </div>
+    <div class="card-flush">
+      <div style="padding:9px 14px;border-bottom:1px solid var(--border)"><span class="sec-title">Version &amp; environment</span></div>
+      <table><tbody>${Object.entries(versionInfo).map(([k,v])=>kvRow(k,v)).join('')}</tbody></table>
+    </div>
+  </div>
+
+  <!-- ═══ LIVE COUNTS ═══ -->
+  <div class="card-flush" style="margin-bottom:14px">
+    <div style="padding:9px 14px;border-bottom:1px solid var(--border)"><span class="sec-title">Data counts</span></div>
+    <table><tbody>${Object.entries(counts).map(([k,v])=>kvRow(k,v)).join('')}</tbody></table>
+  </div>
+
+  <!-- ═══ ACTIONS ═══ -->
+  <div class="card" style="margin-bottom:14px">
+    <div class="sec-title" style="margin-bottom:8px">Maintenance actions</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn btn-ghost btn-sm" onclick="rebuildAccountBalances();render();toast('Account balances rebuilt ✓')" title="Replay every non-voided tx to derive fresh balances">↻ Rebuild balances</button>
+      <button class="btn btn-ghost btn-sm" onclick="(()=>{const r=runAssertions('manual');render();toast(r.ok?'All assertions passed ✓':(r.errors||[]).length+' failure(s) — see console','error')})()" title="Run all integrity invariants">🔍 Run integrity check</button>
+      <button class="btn btn-ghost btn-sm" onclick="normalizeAllTransactions();render();toast('Transactions normalized ✓')" title="Re-run normalizeTx on every transaction (legacy migration)">↻ Normalize transactions</button>
+    </div>
+    <div style="font-size:.7rem;color:var(--muted2);margin-top:8px;line-height:1.45">All actions are safe to run anytime — they re-derive from existing data, never destroy it.</div>
+  </div>`;
+}
+
 function renderMain(){
-  const map={dashboard:pgDashboard,tabs:pgTabs,transactions:pgTransactions,funds:pgFunds,weekly:pgWeeklyCheck,payables:pgPayables,coa:pgCOA,dsr:pgDSR,cash:(typeof pgCash==='function'?pgCash:()=>'<div class="card">Cash module unavailable</div>'),labor:pgLabor,reports:pgReports,activity:pgActivity,forecast:pgForecast,treasury:pgCashPosition,cashposition:pgCashPosition};
+  const map={dashboard:pgDashboard,tabs:pgTabs,transactions:pgTransactions,funds:pgFunds,weekly:pgWeeklyCheck,payables:pgPayables,coa:pgCOA,dsr:pgDSR,cash:(typeof pgCash==='function'?pgCash:()=>'<div class="card">Cash module unavailable</div>'),labor:pgLabor,reports:pgReports,activity:pgActivity,forecast:pgForecast,treasury:pgCashPosition,cashposition:pgCashPosition,system:pgSystemHealth};
   document.getElementById('main').innerHTML=(map[currentPage]||pgDashboard)();
 }
 function renderNav(){
@@ -10572,6 +10931,7 @@ function renderNav(){
     {id:'coa',icon:'≡',label:'Chart of Accounts'},
     {id:'activity',icon:'⏱',label:'Activity Log'},
     {id:'forecast',icon:'◇',label:'Forecast'},
+    {id:'system',icon:'⚙',label:'System Health'},
   ];
   const visiblePages=userRole==='staff'?pages.filter(n=>STAFF_PAGES.includes(n.id)):pages;
   document.getElementById('nav').innerHTML=`<div class="nav-sec"><span>Navigation</span></div>`+visiblePages.map(n=>`<div class="nav-item ${currentPage===n.id?'active':''}" onclick="navigate('${n.id}')"><span class="nav-icon">${n.icon}</span><span>${n.label}</span></div>`).join('');
@@ -10796,15 +11156,16 @@ function render(){
      the SAME render pass, multiple consumers (dashboard card, alerts, forecast)
      hit the cache and skip the O(shifts²) recompute. */
   if (typeof window !== 'undefined') window._oblCache = null;
-  renderNav();renderMain();/* Hotfix N-H3: removed applyRecurring() call — feature was dead. */
-}
-
-// Phase 3 global date bar injection
-const __phase3_original_render=render;
-render=function(){
+  /* Global date bar visibility is page-scoped (renderGlobalDateBar checks
+     currentPage against GLOBAL_DATE_PAGES). Previously this was injected via
+     a render() monkey-patch at the bottom of the script — that pattern is
+     hard to discover for future maintainers and broke the assumption that
+     render() does exactly what the function body says. Now called inline. */
   renderGlobalDateBar();
-  return __phase3_original_render();
-};
+  renderNav();
+  renderMain();
+  /* Hotfix N-H3: removed applyRecurring() call — feature was dead. */
+}
 
 </script>
 </body>
