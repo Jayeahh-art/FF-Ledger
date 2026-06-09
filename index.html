@@ -1384,7 +1384,7 @@ let monthlyBudget={};
 let treasuryEvents=[];
 const PAYROLL_ADJUSTMENT_TYPES=['bonus','incentive','allowance','sss_ee','philhealth_ee','pagibig_ee','withholding_tax','cash_advance','meal_deduction','penalty','uniform','other'];
 let currentPage='dashboard', currentModal=null;
-let filters={type:'',search:'',dateFrom:'',dateTo:''};
+let filters={type:'',search:'',dateFrom:'',dateTo:'',supplier:''};
 /* Transactions-page pagination: derived view, no persistence. Reset to 1 on any
    filter change so the user never finds themselves on "page 7 of 2" silently. */
 let txPage=1, txPerPage=50;
@@ -1395,6 +1395,11 @@ let actPage=1, actPerPage=50;
    from unpaid expense txs). UI state, not persisted. */
 let payPage=1, payPerPage=25;
 let accrPage=1, accrPerPage=25;
+/* Payables-page filters — page-local UI state, NOT persisted. Search matches
+   name/supplier/note/category across BOTH the manual-payable list AND the
+   unpaid-expense list. Type filter is meaningful only for manual payables
+   (Loan/Supplier Credit/etc.). Supplier filter applies to both sections. */
+let payableFilters={search:'',type:'',supplier:''};
 /* Weekly Check cash ledger pagination — same pattern as the others. UI state. */
 let wkLedgerPage=1, wkLedgerPerPage=25;
 let reportPeriod='month';
@@ -3662,7 +3667,7 @@ async function clearAllData(){
     rebuildAccountBalances();
     validateLedgerIntegrity();
     currentPage='dashboard';
-    filters={type:'',search:'',dateFrom:'',dateTo:''};
+    filters={type:'',search:'',dateFrom:'',dateTo:'',supplier:''};
     render();
     toast('Reset to defaults ✓');
   }catch(e){toast('Reset failed — '+e.message,'error')}
@@ -4814,25 +4819,56 @@ function renderModal(){
     const empOpts=roster.map(e=>`<option value="${e.id}">${esc(e.name)} — ${esc(e.position)}</option>`).join('');
     if(!roster.length){body=`<div class="warn-box">No employees on roster yet. <button class="btn btn-ghost btn-sm" onclick="closeModal();openModal('addRoster')">Add an employee first</button></div>`;
     }else{
-    body=`<div class="form-row"><div class="form-group"><label>Employee</label><select id="m-shift-emp">${empOpts}</select></div><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${window._laborDate||today()}"></div></div>
+    body=`<div class="form-row"><div class="form-group"><label>Employee</label><select id="m-shift-emp" onchange="_recomputeShiftRestDayDefault()">${empOpts}</select></div><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${window._laborDate||today()}" onchange="_recomputeShiftRestDayDefault()"></div></div>
     <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="09:00"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="18:00"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="120" step="15" value="60"></div></div>
     <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="09:00"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="8"></div><div class="form-group"><label>Note</label><input id="m-shift-note" placeholder="e.g. OT, half-day…"></div></div>
+    <!-- Rest-day premium toggle (Approach A): per-shift flag, defaulted from the
+         selected employee's restDay vs the shift date. Editable so user can
+         override (e.g. employee voluntarily works on their rest day → 130%
+         premium applies). Decouples premium calc from emp.restDay so changing
+         the global schedule going forward doesn't rewrite past pay. -->
+    <div class="form-row">
+      <div class="form-group" style="padding-top:4px">
+        <label style="display:flex;align-items:center;gap:7px;cursor:pointer;text-transform:none;font-size:.82rem;font-weight:500;letter-spacing:0">
+          <input type="checkbox" id="m-shift-restday" style="width:auto"> Rest-day premium applies (+30%)
+        </label>
+        <div style="font-size:.7rem;color:var(--muted2);margin-top:3px;padding-left:24px">Auto-checked when the shift date falls on this employee's configured rest day. Uncheck to skip the premium for this specific shift.</div>
+      </div>
+    </div>
     <div class="info-box" style="margin-bottom:4px;font-size:.76rem">Tardiness is auto-detected: clock-in after Scheduled In is docked per policy (1–29m→30m · 30–59m→1h · 60m+→4h). Leaving early / a short day shows as Undertime. Set Scheduled hrs to 4 for a half-day.</div>
     <div style="display:flex;gap:14px;justify-content:flex-end;padding:6px 4px;font-size:.78rem;color:var(--muted2);margin-bottom:6px">
       <span>Hours worked: <b id="sp-hours" class="mono" style="color:var(--text)">—</b></span>
       <span>Daily rate: <b id="sp-rate" class="mono" style="color:var(--text)">—</b></span>
     </div>
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="submitAddShift()">Log Shift</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
-    setTimeout(()=>{const upd=()=>{const e=roster.find(r=>r.id===document.getElementById('m-shift-emp')?.value);const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;const hrs=calcShiftHours(ti,to,br);const el=document.getElementById('sp-hours');const re=document.getElementById('sp-rate');if(el)el.textContent=hrs.toFixed(2)+'h';if(re)re.textContent=e?fmt(e.dailyRate):'-';};['m-shift-emp','m-shift-in','m-shift-out','m-shift-break'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',upd)});upd()},80);
+    setTimeout(()=>{const upd=()=>{const e=roster.find(r=>r.id===document.getElementById('m-shift-emp')?.value);const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;const hrs=calcShiftHours(ti,to,br);const el=document.getElementById('sp-hours');const re=document.getElementById('sp-rate');if(el)el.textContent=hrs.toFixed(2)+'h';if(re)re.textContent=e?fmt(e.dailyRate):'-';};['m-shift-emp','m-shift-in','m-shift-out','m-shift-break'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',upd)});upd();_recomputeShiftRestDayDefault();},80);
     }
   }else if(type==='editShift'){
     const sid=data;const s=shifts.find(x=>x.id===sid);const emp=s?roster.find(r=>r.id===s.employeeId):null;
     if(!s){body=`<div class="warn-box">Shift not found.</div>`;
     }else{
+      /* Compute the rest-day checkbox state for the EDIT modal. Use the
+         shift's explicit isRestDay if set; otherwise lazy-fall-back to the
+         legacy compute (dayOfWeek === emp.restDay). Same precedence as
+         computeShiftPay so the modal accurately reflects what payroll uses. */
+      const _editRestDow = new Date(s.date+'T12:00:00').getDay();
+      const _REST_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+      const _editRestChecked = (typeof s.isRestDay === 'boolean')
+        ? s.isRestDay
+        : (_REST_NAMES[_editRestDow] === (emp?.restDay || 'Sunday'));
       body=`<div style="font-size:.82rem;color:var(--muted2);margin-bottom:12px">${esc(emp?.name||'Unknown')}</div>
       <div class="form-row"><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${s.date}"></div><div class="form-group"></div><div class="form-group"></div></div>
       <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="${s.timeIn}"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="${s.timeOut}"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="240" step="15" value="${s.breakMins||0}"></div></div>
       <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="${s.scheduledIn||s.timeIn||'09:00'}"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="${s.scheduledHours||8}"></div><div class="form-group"><label>Note</label><input id="m-shift-note" value="${esc(s.note||'')}"></div></div>
+      <!-- Rest-day premium toggle (Approach A): per-shift flag, mirrors addShift. -->
+      <div class="form-row">
+        <div class="form-group" style="padding-top:4px">
+          <label style="display:flex;align-items:center;gap:7px;cursor:pointer;text-transform:none;font-size:.82rem;font-weight:500;letter-spacing:0">
+            <input type="checkbox" id="m-shift-restday" ${_editRestChecked?'checked':''} style="width:auto"> Rest-day premium applies (+30%)
+          </label>
+          <div style="font-size:.7rem;color:var(--muted2);margin-top:3px;padding-left:24px">${typeof s.isRestDay==='boolean'?'Explicitly set on this shift.':'Auto-derived from the configured rest day for this employee. Save to lock in the explicit value.'}</div>
+        </div>
+      </div>
       <div class="info-box" style="margin-bottom:8px">Tardiness is auto-detected: clock-in after Scheduled In is docked per policy (1–29m→30m · 30–59m→1h · 60m+→4h). Leaving early / a short day shows as Undertime.</div>
       <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="saveEditShift('${sid}')">Save Changes</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
     }
@@ -6508,7 +6544,13 @@ function pgTransactions(){
   if(filters.type)f=f.filter(t=>t.type===filters.type);
   if(filters.dateFrom)f=f.filter(t=>t.date>=filters.dateFrom);
   if(filters.dateTo)f=f.filter(t=>t.date<=filters.dateTo);
-  if(filters.search){const q=filters.search.toLowerCase();f=f.filter(t=>(t.note||'').toLowerCase().includes(q)||(t.category||'').toLowerCase().includes(q))}
+  /* Supplier filter: exact-match on tx.supplier. Dropdown is populated from
+     unique non-empty supplier values across the visible-range transactions. */
+  if(filters.supplier)f=f.filter(t=>(t.supplier||'')===filters.supplier);
+  /* Search now matches note, category, AND supplier — so typing the supplier
+     name in the search box also narrows the list (in addition to the explicit
+     supplier dropdown). One way to find what you want, two paths to get there. */
+  if(filters.search){const q=filters.search.toLowerCase();f=f.filter(t=>(t.note||'').toLowerCase().includes(q)||(t.category||'').toLowerCase().includes(q)||(t.supplier||'').toLowerCase().includes(q))}
   /* Totals computed over the FULL filtered set (not just the visible page) so
      summary numbers reflect what the filters say, not "what fits on screen". */
   const active=f.filter(t=>!t.voided);
@@ -6546,9 +6588,19 @@ function pgTransactions(){
     </div>`:'<div style="flex:1"></div>'}
     <select onchange="txPerPage=parseInt(this.value)||0;txPage=1;renderMain()" style="font-size:.74rem;padding:2px 6px;border-radius:4px;border:1px solid var(--border2);background:var(--bg);cursor:pointer">${perPageOpts}</select>
   </div>`:'';
-  const summary=totalRows?`<div class="summary-footer"><span style="font-size:.78rem;color:var(--muted)">Total matched: <b>${totalRows}</b></span><span class="green" style="font-size:.78rem">Sales: <b>${fmt(tS)}</b></span><span class="red" style="font-size:.78rem">Expenses: <b>${fmt(tE)}</b></span><span class="${net>=0?'green':'red'}" style="font-size:.78rem">Net: <b>${net>=0?'+':''}${fmt(net)}</b></span></div>`:'';
+  /* Supplier dropdown options — pulled from all unique non-empty supplier
+     values in the visible-range transactions (txInRange is the global-date
+     filter scope). Sorted alphabetically. */
+  const supplierOpts = (()=>{
+    const set = new Set();
+    transactions.filter(txInRange).forEach(t=>{ if(t&&t.supplier) set.add(t.supplier); });
+    return [...set].sort();
+  })();
+  /* Show supplier-scoped breakdown when filter narrows to a single supplier. */
+  const filteredBySupplier = !!filters.supplier;
+  const summary=totalRows?`<div class="summary-footer"><span style="font-size:.78rem;color:var(--muted)">Total matched: <b>${totalRows}</b>${filteredBySupplier?` · <b>${esc(filters.supplier)}</b>`:''}</span><span class="green" style="font-size:.78rem">Sales: <b>${fmt(tS)}</b></span><span class="red" style="font-size:.78rem">Expenses: <b>${fmt(tE)}</b></span><span class="${net>=0?'green':'red'}" style="font-size:.78rem">Net: <b>${net>=0?'+':''}${fmt(net)}</b></span></div>`:'';
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Transactions</div><div class="page-sub">All movements — edit, void, or delete</div></div></div>
-<div class="filter-row"><input placeholder="Search…" value="${esc(filters.search)}" oninput="filters.search=this.value;txPage=1;renderMain()" style="flex:1;min-width:100px;max-width:200px"><select onchange="filters.type=this.value;txPage=1;renderMain()"><option value="" ${sel('',filters.type)}>All Types</option><option value="sale" ${sel('sale',filters.type)}>Sales</option><option value="expense" ${sel('expense',filters.type)}>Expenses</option><option value="transfer" ${sel('transfer',filters.type)}>Transfers</option><option value="deposit" ${sel('deposit',filters.type)}>Deposits</option><option value="withdrawal" ${sel('withdrawal',filters.type)}>Withdrawals</option><option value="sc_collected" ${sel('sc_collected',filters.type)}>SC Collected</option><option value="tip_collected" ${sel('tip_collected',filters.type)}>Tip Collected</option><option value="sc_paid" ${sel('sc_paid',filters.type)}>SC Paid Out</option><option value="tip_paid" ${sel('tip_paid',filters.type)}>Tip Paid Out</option><option value="liability_payment" ${sel('liability_payment',filters.type)}>Liability Remittance</option><option value="dsr_adjustment" ${sel('dsr_adjustment',filters.type)}>DSR Adjustment (VAT/Discount)</option></select><input type="date" value="${filters.dateFrom}" onchange="filters.dateFrom=this.value;txPage=1;renderMain()"><input type="date" value="${filters.dateTo}" onchange="filters.dateTo=this.value;txPage=1;renderMain()"><button class="btn btn-ghost btn-sm" onclick="filters={type:'',search:'',dateFrom:'',dateTo:''};txPage=1;renderMain()">Clear</button><div style="flex:1"></div><button class="btn btn-ghost btn-sm" onclick="exportTransactionsCSV()" title="Export current filtered transactions as CSV (round-trip-compatible with Import CSV)">↓ CSV</button></div>
+<div class="filter-row"><input placeholder="Search note / category / supplier…" value="${esc(filters.search)}" oninput="filters.search=this.value;txPage=1;renderMain()" style="flex:1;min-width:100px;max-width:220px"><select onchange="filters.type=this.value;txPage=1;renderMain()"><option value="" ${sel('',filters.type)}>All Types</option><option value="sale" ${sel('sale',filters.type)}>Sales</option><option value="expense" ${sel('expense',filters.type)}>Expenses</option><option value="transfer" ${sel('transfer',filters.type)}>Transfers</option><option value="deposit" ${sel('deposit',filters.type)}>Deposits</option><option value="withdrawal" ${sel('withdrawal',filters.type)}>Withdrawals</option><option value="sc_collected" ${sel('sc_collected',filters.type)}>SC Collected</option><option value="tip_collected" ${sel('tip_collected',filters.type)}>Tip Collected</option><option value="sc_paid" ${sel('sc_paid',filters.type)}>SC Paid Out</option><option value="tip_paid" ${sel('tip_paid',filters.type)}>Tip Paid Out</option><option value="liability_payment" ${sel('liability_payment',filters.type)}>Liability Remittance</option><option value="dsr_adjustment" ${sel('dsr_adjustment',filters.type)}>DSR Adjustment (VAT/Discount)</option></select><select onchange="filters.supplier=this.value;txPage=1;renderMain()" title="Filter by supplier — totals in the summary footer below reflect the filter"><option value="" ${sel('',filters.supplier||'')}>All Suppliers</option>${supplierOpts.map(s=>`<option value="${esc(s)}" ${sel(s,filters.supplier||'')}>${esc(s)}</option>`).join('')}</select><input type="date" value="${filters.dateFrom}" onchange="filters.dateFrom=this.value;txPage=1;renderMain()"><input type="date" value="${filters.dateTo}" onchange="filters.dateTo=this.value;txPage=1;renderMain()"><button class="btn btn-ghost btn-sm" onclick="filters={type:'',search:'',dateFrom:'',dateTo:'',supplier:''};txPage=1;renderMain()">Clear</button><div style="flex:1"></div><button class="btn btn-ghost btn-sm" onclick="exportTransactionsCSV()" title="Export current filtered transactions as CSV (round-trip-compatible with Import CSV)">↓ CSV</button></div>
 ${isStaff?`<div class="info-box" style="margin-bottom:10px;font-size:.78rem">Viewing in <b>staff (read-only)</b> mode — ad-hoc transactions, edits, voids, and deletes are manager-only.</div>`:`<div class="action-bar"><button class="btn btn-primary btn-sm" onclick="openModal('sale')">+ Sale</button><button class="btn btn-ghost btn-sm" onclick="openModal('expense')">+ Expense</button><button class="btn btn-ghost btn-sm" onclick="openModal('transfer')">↕ Transfer</button><button class="btn btn-ghost btn-sm" onclick="openModal('deposit')">↓ Deposit</button><button class="btn btn-ghost btn-sm" onclick="openModal('withdrawal')">↑ Withdraw</button><button class="btn btn-ghost btn-sm" onclick="triggerCSVImport()">↑ Import CSV</button><input type="file" id="csv-import-input" accept=".csv" style="display:none" onchange="handleCSVImport(this.files[0])"></div>`}
 <div class="card-flush"><table><thead><tr><th>Date</th><th>Type</th><th>Category / Note</th><th>Supplier</th><th>Account</th><th style="text-align:right">Amount</th><th>Handler</th><th></th></tr></thead><tbody>${rows}</tbody></table>${pager}${summary}</div>`;
 }
@@ -8257,11 +8309,23 @@ function computeShiftPay(shift,emp){
   const _toMin=t=>{const[h,m]=String(t||'0:0').split(':').map(Number);return (h||0)*60+(m||0)};
   const lateMinutes=Math.max(0,_toMin(timeIn)-_toMin(scheduledIn||timeIn));
   const hol=getHoliday(date);const dow=new Date(date+'T12:00:00').getDay();
-  /* Rest-day premium applies only when the employee works their OWN configured
-     rest day (not a hardcoded Sunday). A restaurant is open weekends, so staff
-     typically rest on a weekday and work Sundays as normal days. */
+  /* Rest-day premium — per-shift opt-in (Approach A). The shift owns its own
+     rest-day flag (shift.isRestDay), set at creation/edit time. This decouples
+     the labor calc from the employee's CURRENT restDay so changing the global
+     schedule (e.g. "Monday is now an operating day") doesn't retroactively
+     rewrite premium pay on historical shifts.
+
+     Lazy fallback for legacy shifts that don't yet have the field: compute
+     from emp.restDay the same way the old code did. Once a shift is edited
+     and saved, the explicit flag wins forever.
+
+     Effect: shift.isRestDay === true  → REST premium applies
+             shift.isRestDay === false → no premium even if it lands on emp.restDay
+             undefined → legacy fallback to dayOfWeek === emp.restDay */
   const REST_DAY_NAMES=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
-  const isRest=REST_DAY_NAMES[dow]===(emp.restDay||'Sunday');
+  const isRest = (typeof shift.isRestDay === 'boolean')
+    ? shift.isRestDay
+    : (REST_DAY_NAMES[dow] === (emp.restDay || 'Sunday'));
   const tardDeduct=hr*(applyTardinessBracket(lateMinutes)/60);
   const{ot:otHrs}=calcOTHours(hoursWorked);const ndHrs=calcNDHours(timeIn,timeOut);
   /* PH Labor Code Art. 82: managerial employees are exempt from PREMIUM pay.
@@ -9072,9 +9136,13 @@ function saveEditShift(id){
   const schedIn=document.getElementById('m-shift-schedin')?.value||ti;
   const note=document.getElementById('m-shift-note')?.value||'';
   const hrs=calcShiftHours(ti,to,br);
+  /* Capture the explicit rest-day flag on save. Saving converts the lazy
+     "derived from emp.restDay" default into a hard-stored boolean — from this
+     edit onward, the shift owns its own rest-day truth. */
+  const isRestDay = document.getElementById('m-shift-restday')?.checked === true;
   // Phase 2.7: no direct tx manipulation — shift records only.
   // Tardiness is derived in computeShiftPay from scheduledIn vs timeIn — no stored lateMinutes.
-  shifts=shifts.map(x=>x.id===id?{...x,date,timeIn:ti,timeOut:to,breakMins:br,scheduledHours:sched,scheduledIn:schedIn,note,hoursWorked:hrs}:x);
+  shifts=shifts.map(x=>x.id===id?{...x,date,timeIn:ti,timeOut:to,breakMins:br,scheduledHours:sched,scheduledIn:schedIn,note,hoursWorked:hrs,isRestDay}:x);
   scheduleSave();render();closeModal();toast('Shift updated ✓');
 }
 function submitAddRoster(){
@@ -9103,7 +9171,45 @@ function submitAddRoster(){
     status:'active'
   });
 }
-function submitAddShift(){const empId=document.getElementById('m-shift-emp')?.value;if(!empId){toast('Select an employee','error');return}const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;if(!ti||!to){toast('Enter shift times','error');return}addShift({employeeId:empId,date:document.getElementById('m-shift-date')?.value||today(),timeIn:ti,timeOut:to,breakMins:parseInt(document.getElementById('m-shift-break')?.value||0)||0,scheduledHours:parseFloat(document.getElementById('m-shift-sched')?.value)||8,scheduledIn:document.getElementById('m-shift-schedin')?.value||ti,note:document.getElementById('m-shift-note')?.value||''})}
+/* Rest-day default recalculator for the addShift modal — fires when the user
+   changes the selected employee OR the shift date. Sets the checkbox to the
+   "legacy" default (dayOfWeek === emp.restDay) so common case is one click,
+   but the user can always override before saving. */
+function _recomputeShiftRestDayDefault(){
+  const empSel = document.getElementById('m-shift-emp');
+  const dateInp = document.getElementById('m-shift-date');
+  const cb = document.getElementById('m-shift-restday');
+  if (!empSel || !dateInp || !cb) return;
+  const emp = (roster||[]).find(r=>r && r.id===empSel.value);
+  const date = dateInp.value;
+  if (!emp || !date){ cb.checked = false; return; }
+  const REST_NAMES = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const dow = new Date(date+'T12:00:00').getDay();
+  cb.checked = REST_NAMES[dow] === (emp.restDay || 'Sunday');
+}
+
+function submitAddShift(){
+  const empId=document.getElementById('m-shift-emp')?.value;
+  if(!empId){toast('Select an employee','error');return}
+  const ti=document.getElementById('m-shift-in')?.value;
+  const to=document.getElementById('m-shift-out')?.value;
+  if(!ti||!to){toast('Enter shift times','error');return}
+  /* Persist the explicit rest-day flag — computeShiftPay reads this first,
+     only falling back to (dow === emp.restDay) when the field is undefined.
+     Captured at create time so future changes to emp.restDay don't rewrite
+     past pay. */
+  const isRestDay = document.getElementById('m-shift-restday')?.checked === true;
+  addShift({
+    employeeId:empId,
+    date:document.getElementById('m-shift-date')?.value||today(),
+    timeIn:ti, timeOut:to,
+    breakMins:parseInt(document.getElementById('m-shift-break')?.value||0)||0,
+    scheduledHours:parseFloat(document.getElementById('m-shift-sched')?.value)||8,
+    scheduledIn:document.getElementById('m-shift-schedin')?.value||ti,
+    note:document.getElementById('m-shift-note')?.value||'',
+    isRestDay
+  });
+}
 function submitAddHoliday(){const date=document.getElementById('m-hol-date')?.value;const name=(document.getElementById('m-hol-name')?.value||'').trim();const type=document.getElementById('m-hol-type')?.value||'special';if(!date||!name){toast('Date and name required','error');return}if(holidays.some(h=>h.date===date)){toast('Holiday already exists','error');return}holidays=[...holidays,{date,name,type}].sort((a,b)=>a.date.localeCompare(b.date));scheduleSave();renderMain();closeModal();toast('Holiday added ✓')}
 function deleteHoliday(date){
   /* Finalized-period guard — holiday flag drove premium pay in a finalized run;
@@ -9955,11 +10061,55 @@ ${(()=>{
    PAYABLES PAGE
 ═══════════════════════════════════════════════ */
 function pgPayables(){
-  const accrualPayables=transactions.filter(t=>t.type==='expense'&&t.status==='unpaid'&&!t.voided);
+  /* Unfiltered baseline — for the "Total Outstanding" Option C card so the
+     user always sees the full picture even when narrowing the list below. */
+  const accrualPayablesAll=transactions.filter(t=>t.type==='expense'&&t.status==='unpaid'&&!t.voided);
+  const totalAccrualAll=accrualPayablesAll.reduce((s,t)=>s+t.amount,0);
+  const openPayablesAll=payables.filter(p=>p.status!=='paid');
+  const totalManualAll=openPayablesAll.reduce((s,p)=>s+p.balance,0);
+  const totalOwedAll=totalAccrualAll+totalManualAll;
+
+  /* Apply filters. Search matches name/supplier/note/category. Type only
+     filters manual payables (unpaid expenses don't have a payable-type field).
+     Supplier matches exactly against tx.supplier / payable.supplier. */
+  const fq=(payableFilters.search||'').toLowerCase();
+  const matchPayable = p => {
+    if (payableFilters.type && p.type !== payableFilters.type) return false;
+    if (payableFilters.supplier && (p.supplier||'') !== payableFilters.supplier) return false;
+    if (fq){
+      const hay = (p.name||'')+' '+(p.supplier||'')+' '+(p.note||'')+' '+(p.type||'');
+      if (!hay.toLowerCase().includes(fq)) return false;
+    }
+    return true;
+  };
+  const matchAccrual = t => {
+    /* Type filter intentionally only narrows manual payables — unpaid
+       expenses pass through (a category-typed filter on them would be a
+       different concept and is left as future work if needed). */
+    if (payableFilters.type) return false;
+    if (payableFilters.supplier && (t.supplier||'') !== payableFilters.supplier) return false;
+    if (fq){
+      const hay = (t.category||'')+' '+(t.supplier||'')+' '+(t.note||'');
+      if (!hay.toLowerCase().includes(fq)) return false;
+    }
+    return true;
+  };
+  const openPayables = openPayablesAll.filter(matchPayable);
+  const accrualPayables = accrualPayablesAll.filter(matchAccrual);
   const totalAccrual=accrualPayables.reduce((s,t)=>s+t.amount,0);
-  const totalManual=payables.filter(p=>p.status!=='paid').reduce((s,p)=>s+p.balance,0);
+  const totalManual=openPayables.reduce((s,p)=>s+p.balance,0);
   const totalOwed=totalAccrual+totalManual;
-  const openPayables=payables.filter(p=>p.status!=='paid');
+  const filterActive = !!(payableFilters.search||payableFilters.type||payableFilters.supplier);
+
+  /* Supplier-options pool — union of payable.supplier and unpaid-expense
+     .supplier values across the unfiltered baseline. */
+  const supplierOpts = (()=>{
+    const set = new Set();
+    openPayablesAll.forEach(p=>{ if(p&&p.supplier) set.add(p.supplier); });
+    accrualPayablesAll.forEach(t=>{ if(t&&t.supplier) set.add(t.supplier); });
+    return [...set].sort();
+  })();
+  const PAYABLE_TYPES = ['Loan','Supplier Credit','Credit Card','Owner Loan','Other'];
 
   /* Pagination helper — same shape as the Transactions / Activity Log pagers.
      Returns the visible slice + a pager-control HTML string. */
@@ -9996,16 +10146,79 @@ function pgPayables(){
   const accrPaged  = _paginate(accrualPayables, accrPage, accrPerPage, 'accrPage');
 
   const payableRows = payPaged.slice.length
-    ? payPaged.slice.map(p=>{const overdue=p.dueDate&&p.dueDate<today();return`<tr style="${overdue?'background:var(--red-bg)':''}"><td style="font-size:.82rem;font-weight:500">${esc(p.name)}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(p.type||'')}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(p.supplier||'')}</td><td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(p.balance)}</td><td style="font-size:.76rem;color:${overdue?'var(--red)':'var(--muted2)'}">${p.dueDate?fmtDate(p.dueDate)+(overdue?' ⚠':''):'—'}</td><td><div class="row-actions"><button class="btn btn-primary btn-xs" onclick="payPayable('${p.id}')">Pay</button><button class="btn btn-ghost btn-xs" onclick="editPayable('${p.id}')">Edit</button><button class="row-btn del" onclick="deletePayable('${p.id}')">✕</button></div></td></tr>`}).join('')
-    : `<tr><td colspan="6" class="empty">No open payables</td></tr>`;
+    ? payPaged.slice.map(p=>{
+        const overdue=p.dueDate&&p.dueDate<today();
+        const noteLine = p.note ? `<div style="font-size:.7rem;color:var(--muted2);margin-top:2px">${esc(p.note)}</div>` : '';
+        return `<tr style="${overdue?'background:var(--red-bg)':''}">
+          <td style="font-size:.82rem"><div style="font-weight:500">${esc(p.name)}</div>${noteLine}</td>
+          <td style="font-size:.78rem;color:var(--muted2)">${esc(p.type||'')}</td>
+          <td style="font-size:.78rem;color:var(--muted2)">${esc(p.supplier||'')}</td>
+          <td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(p.balance)}</td>
+          <td style="font-size:.76rem;color:${overdue?'var(--red)':'var(--muted2)'}">${p.dueDate?fmtDate(p.dueDate)+(overdue?' ⚠':''):'—'}</td>
+          <td><div class="row-actions"><button class="btn btn-primary btn-xs" onclick="payPayable('${p.id}')">Pay</button><button class="btn btn-ghost btn-xs" onclick="editPayable('${p.id}')">Edit</button><button class="row-btn del" onclick="deletePayable('${p.id}')">✕</button></div></td>
+        </tr>`;
+      }).join('')
+    : `<tr><td colspan="6" class="empty">${filterActive?'No loans/debts match the filter':'No open payables'}</td></tr>`;
   const accrualRows = accrPaged.slice.length
-    ? accrPaged.slice.map(t=>`<tr><td style="font-size:.82rem">${esc(t.category)}</td><td style="font-size:.78rem;color:var(--muted2)">${esc(t.supplier||'—')}</td><td style="font-size:.76rem;color:var(--muted2)">${fmtDate(t.date)}</td><td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(t.amount)}</td><td style="font-size:.76rem;color:${t.dueDate&&t.dueDate<today()?'var(--red)':'var(--muted2)'}">${t.dueDate?fmtDate(t.dueDate):fmtDate(t.date)}</td><td><button class="btn btn-primary btn-xs" onclick="markExpensePaid('${t.id}')">Pay Now</button></td></tr>`).join('')
-    : `<tr><td colspan="6" class="empty">No unpaid expenses</td></tr>`;
+    ? accrPaged.slice.map(t=>{
+        const noteLine = t.note ? `<div style="font-size:.7rem;color:var(--muted2);margin-top:2px">${esc(t.note)}</div>` : '';
+        return `<tr>
+          <td style="font-size:.82rem"><div>${esc(t.category)}</div>${noteLine}</td>
+          <td style="font-size:.78rem;color:var(--muted2)">${esc(t.supplier||'—')}</td>
+          <td style="font-size:.76rem;color:var(--muted2)">${fmtDate(t.date)}</td>
+          <td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(t.amount)}</td>
+          <td style="font-size:.76rem;color:${t.dueDate&&t.dueDate<today()?'var(--red)':'var(--muted2)'}">${t.dueDate?fmtDate(t.dueDate):fmtDate(t.date)}</td>
+          <td><button class="btn btn-primary btn-xs" onclick="markExpensePaid('${t.id}')">Pay Now</button></td>
+        </tr>`;
+      }).join('')
+    : `<tr><td colspan="6" class="empty">${filterActive?'No unpaid expenses match the filter':'No unpaid expenses'}</td></tr>`;
+
+  /* Option C card — always shows total outstanding (full picture). When a
+     filter is active, adds a "Filtered: ₱X (N of M items)" line below so the
+     user sees what they're looking at + the unfiltered context together. */
+  const sel = (v,c) => v===c ? 'selected' : '';
+  const filteredItemsCount = openPayables.length + accrualPayables.length;
+  const totalItemsCount = openPayablesAll.length + accrualPayablesAll.length;
+  const filterSub = filterActive
+    ? `<div class="stat-sub" style="color:var(--muted2);font-size:.72rem;margin-top:3px"><b style="color:var(--text)">Filtered: ${fmt(totalOwed)}</b> · ${filteredItemsCount} of ${totalItemsCount} items</div>`
+    : '';
 
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Payables</div><div class="page-sub">Loans · Supplier credit · Accrued expenses</div></div><button class="btn btn-primary btn-sm" onclick="openModal('addPayable')">+ Add Payable</button></div>
-<div class="g3" style="margin-bottom:14px"><div class="card" style="border-left:3px solid var(--red)"><div class="stat-label">Total Outstanding</div><div class="stat-value red">${fmt(totalOwed)}</div><div class="stat-sub">${openPayables.length} loans/debts + ${accrualPayables.length} unpaid expenses</div></div><div class="card"><div class="stat-label">Loans & Debts</div><div class="stat-value red">${fmt(totalManual)}</div><div class="stat-sub">${openPayables.length} open</div></div><div class="card"><div class="stat-label">Unpaid Expenses</div><div class="stat-value red">${fmt(totalAccrual)}</div><div class="stat-sub">${accrualPayables.length} on credit</div></div></div>
-<div class="card-flush" style="margin-bottom:12px"><div style="padding:9px 13px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span class="sec-title">Loans & Debts</span><button class="btn btn-ghost btn-xs" onclick="openModal('addPayable')">+ Add</button></div><table><thead><tr><th>Name</th><th>Type</th><th>Creditor</th><th style="text-align:right">Balance</th><th>Due</th><th></th></tr></thead><tbody>${payableRows}</tbody></table>${payPaged.pager}</div>
-<div class="card-flush"><div style="padding:9px 13px;border-bottom:1px solid var(--border)"><span class="sec-title">Unpaid Expenses (On Credit)</span><span style="font-size:.74rem;color:var(--muted2);margin-left:8px">Click Pay Now when settled</span></div><table><thead><tr><th>Category</th><th>Supplier</th><th>Date</th><th style="text-align:right">Amount</th><th>Due</th><th></th></tr></thead><tbody>${accrualRows}</tbody></table>${accrPaged.pager}</div>`;
+
+<div class="g3" style="margin-bottom:14px">
+  <div class="card" style="border-left:3px solid var(--red)">
+    <div class="stat-label">Total Outstanding</div>
+    <div class="stat-value red">${fmt(totalOwedAll)}</div>
+    <div class="stat-sub">${openPayablesAll.length} loans/debts + ${accrualPayablesAll.length} unpaid expenses</div>
+    ${filterSub}
+  </div>
+  <div class="card">
+    <div class="stat-label">Loans & Debts</div>
+    <div class="stat-value red">${fmt(totalManualAll)}</div>
+    <div class="stat-sub">${openPayablesAll.length} open${filterActive?` · ${openPayables.length} match filter (${fmt(totalManual)})`:''}</div>
+  </div>
+  <div class="card">
+    <div class="stat-label">Unpaid Expenses</div>
+    <div class="stat-value red">${fmt(totalAccrualAll)}</div>
+    <div class="stat-sub">${accrualPayablesAll.length} on credit${filterActive?` · ${accrualPayables.length} match filter (${fmt(totalAccrual)})`:''}</div>
+  </div>
+</div>
+
+<div class="filter-row" style="margin-bottom:12px">
+  <input placeholder="Search name / supplier / note…" value="${esc(payableFilters.search)}" oninput="payableFilters.search=this.value;payPage=1;accrPage=1;renderMain()" style="flex:1;min-width:140px;max-width:240px">
+  <select onchange="payableFilters.type=this.value;payPage=1;accrPage=1;renderMain()" title="Type filter — only narrows the Loans & Debts list">
+    <option value="" ${sel('',payableFilters.type)}>All Types</option>
+    ${PAYABLE_TYPES.map(t=>`<option value="${t}" ${sel(t,payableFilters.type)}>${t}</option>`).join('')}
+  </select>
+  <select onchange="payableFilters.supplier=this.value;payPage=1;accrPage=1;renderMain()" title="Supplier / creditor filter — narrows both sections">
+    <option value="" ${sel('',payableFilters.supplier)}>All Suppliers</option>
+    ${supplierOpts.map(s=>`<option value="${esc(s)}" ${sel(s,payableFilters.supplier)}>${esc(s)}</option>`).join('')}
+  </select>
+  <button class="btn btn-ghost btn-sm" onclick="payableFilters={search:'',type:'',supplier:''};payPage=1;accrPage=1;renderMain()">Clear</button>
+</div>
+
+<div class="card-flush" style="margin-bottom:12px"><div style="padding:9px 13px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center"><span class="sec-title">Loans &amp; Debts${payableFilters.type?` · <span style="font-weight:500;color:var(--muted2);text-transform:none;letter-spacing:0">${esc(payableFilters.type)}</span>`:''}</span><button class="btn btn-ghost btn-xs" onclick="openModal('addPayable')">+ Add</button></div><table><thead><tr><th>Name</th><th>Type</th><th>Creditor</th><th style="text-align:right">Balance</th><th>Due</th><th></th></tr></thead><tbody>${payableRows}</tbody></table>${payPaged.pager}</div>
+<div class="card-flush"><div style="padding:9px 13px;border-bottom:1px solid var(--border)"><span class="sec-title">Unpaid Expenses (On Credit)</span><span style="font-size:.74rem;color:var(--muted2);margin-left:8px">${payableFilters.type?'(type filter only narrows loans/debts above)':'Click Pay Now when settled'}</span></div><table><thead><tr><th>Category</th><th>Supplier</th><th>Date</th><th style="text-align:right">Amount</th><th>Due</th><th></th></tr></thead><tbody>${accrualRows}</tbody></table>${accrPaged.pager}</div>`;
 }
 function addPayable(p, depositToAccount){
   payables=[...payables,{id:uid(),...p,status:'open'}];
