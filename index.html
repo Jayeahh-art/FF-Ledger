@@ -117,8 +117,12 @@ tr:hover .row-actions{opacity:1}
 .badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:20px;font-size:.66rem;font-weight:600;letter-spacing:.03em;white-space:nowrap}
 
 /* FORMS */
-.form-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:10px;margin-bottom:10px}
-.form-group{display:flex;flex-direction:column;gap:4px}
+/* Tightened form spacing — original had .form-row margin-bottom:10px + form-group
+   gap:4px which left ~14px of whitespace between every label/input. Reduced to
+   ~9px total for visibly denser modals (Edit Employee/Edit Shift especially).
+   Also reduced modal padding (see .modal rule below). */
+.form-row{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:8px;margin-bottom:6px}
+.form-group{display:flex;flex-direction:column;gap:3px}
 label{font-size:.67rem;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
 input,select,textarea{background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:7px 10px;color:var(--text);font-family:var(--fb);font-size:.84rem;outline:none;transition:border .1s,box-shadow .1s;width:100%}
 input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(41,37,36,.07)}
@@ -156,11 +160,11 @@ textarea{resize:vertical;min-height:64px}
 
 /* MODAL */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.32);z-index:300;display:flex;align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(3px)}
-.modal{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:22px;width:100%;max-width:500px;max-height:92vh;overflow-y:auto;box-shadow:var(--sh-md)}
+.modal{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:18px 20px;width:100%;max-width:500px;max-height:92vh;overflow-y:auto;box-shadow:var(--sh-md)}
 .modal.modal-wide{max-width:760px}
 .modal-lg{max-width:680px}
 .modal-title{font-family:var(--fh);font-size:1.08rem;font-weight:600;margin-bottom:16px}
-.modal-footer{display:flex;gap:7px;margin-top:16px}
+.modal-footer{display:flex;gap:7px;margin-top:12px}
 
 /* TABS */
 .tab-bar{display:flex;gap:2px;background:var(--bg3);padding:3px;border-radius:7px;border:1px solid var(--border)}
@@ -445,7 +449,11 @@ function collectState(){
    quota first fills up. The console log fires every time for debug visibility. */
 let _localCacheFailedOnce=false;
 function writeLocalCache(){
-  try{ localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify({savedAt:Date.now(),synced:false,state:collectState()})); }
+  /* Phase 2: persist pending tombstones/full-replace alongside the state so
+     "unpost DSR → save fails → tab closes" doesn't lose the row-deletion
+     intent. recoverUnsyncedCache restores them into the session and the
+     re-push carries them to the server. */
+  try{ localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify({savedAt:Date.now(),synced:false,state:collectState(),removedTxIds:(typeof _removedTxIds!=='undefined'&&_removedTxIds.length)?_removedTxIds:undefined,txFullReplace:(typeof _txFullReplaceOnce!=='undefined'&&_txFullReplaceOnce)||undefined})); }
   catch(e){
     /* quota exceeded — remote sync remains the safety net, but surface the
        failure so a power user / developer can see that the cache safety net
@@ -685,8 +693,29 @@ function scheduleSave(){
   clearTimeout(syncTimer);
   syncTimer=setTimeout(pushSave,1400);
 }
+/* ── PHASE 2 TOMBSTONES ──────────────────────────────────────────────────
+   The server's row-based Transactions tab is upsert-only (so a stale tab
+   can't wipe newer rows). But ONE flow legitimately hard-removes txs:
+   unpostDSR (via ledgerRemoveTransactions). Without telling the server,
+   merge-on-load would resurrect the unposted batch from the rows tab and
+   double-count sales after a repost. So:
+     - ledgerRemoveTransactions records the removed ids here
+     - pushSave sends them as removedTxIds on the same save that drops them
+       from the blob; the server deletes those rows inside its lock
+     - on confirmed save, the sent ids are cleared (ids queued DURING the
+       await are kept for the next save)
+   _txFullReplaceOnce: set by the backup-restore flow — tells the server to
+   rewrite the rows tab wholesale (restored sets may omit rows that would
+   otherwise resurrect). One-shot; cleared after a confirmed save. */
+let _removedTxIds = [];
+let _txFullReplaceOnce = false;
+
 async function pushSave(){
   pendingSave=false;
+  /* Snapshot the tombstones being sent so ids queued during the await
+     survive for the next save instead of being lost. */
+  const _sendingRemovals = _removedTxIds.slice();
+  const _sendingFullReplace = _txFullReplaceOnce;
   try{
     /* Apps Script returns application-level errors as HTTP 200 with body
        {ok:false, error:'...'} (e.g., PIN hash mismatch after a server-side
@@ -695,10 +724,16 @@ async function pushSave(){
        green "synced" indicator for data that never actually landed. The
        throw routes to the catch block, surfacing the error and leaving
        pendingSave+cache in their unsynced state so recovery can save us. */
-    const resp=await api({action:'save',...collectState()});
+    const body={action:'save',...collectState()};
+    if(_sendingRemovals.length) body.removedTxIds=_sendingRemovals;
+    if(_sendingFullReplace) body.txFullReplace=true;
+    const resp=await api(body);
     if(resp && resp.ok===false){
       throw new Error(resp.error||'Server rejected save');
     }
+    /* Confirmed — clear exactly what was sent. */
+    if(_sendingRemovals.length) _removedTxIds=_removedTxIds.filter(id=>!_sendingRemovals.includes(id));
+    if(_sendingFullReplace) _txFullReplaceOnce=false;
     setSyncStatus('ok');
     if(!pendingSave)markCacheSynced();   // skip if a new change queued during the await
   }
@@ -722,9 +757,15 @@ function flushSaveBeacon(){
   }
   if(!pendingSave||!scriptUrl)return;
   try{
-    const body=JSON.stringify({action:'save',pinHash,...collectState()});
+    /* Phase 2: ride the tombstones + full-replace flag on the beacon too —
+       otherwise "unpost DSR then close the tab" would remove the txs from
+       the blob but leave the rows behind, resurrecting them on next load. */
+    const payload={action:'save',pinHash,...collectState()};
+    if(_removedTxIds.length) payload.removedTxIds=_removedTxIds.slice();
+    if(_txFullReplaceOnce) payload.txFullReplace=true;
+    const body=JSON.stringify(payload);
     const blob=new Blob([body],{type:'text/plain;charset=utf-8'});
-    if(navigator.sendBeacon(scriptUrl,blob)){pendingSave=false;markCacheSynced();}
+    if(navigator.sendBeacon(scriptUrl,blob)){pendingSave=false;markCacheSynced();_removedTxIds=[];_txFullReplaceOnce=false;}
   }catch(e){}
 }
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')flushSaveBeacon();});
@@ -758,6 +799,10 @@ function recoverUnsyncedCache(){
   if(Array.isArray(s.monthlyMetrics))  monthlyMetrics=s.monthlyMetrics;
   if(Array.isArray(s.forecastSnapshots)) forecastSnapshots=s.forecastSnapshots;
   if(s.forecastTargets&&typeof s.forecastTargets==='object') forecastTargets={...forecastTargets,...s.forecastTargets};
+  /* Phase 2: restore pending tombstones/full-replace recorded with the cache
+     so the re-push below also deletes the matching rows on the server. */
+  if(Array.isArray(cache.removedTxIds)&&cache.removedTxIds.length) _removedTxIds=[..._removedTxIds,...cache.removedTxIds];
+  if(cache.txFullReplace===true) _txFullReplaceOnce=true;
   rebuildAccountBalances();
   scheduleSave();                // re-push the recovered state to the server
   toast('Unsynced changes restored ✓','success');
@@ -808,6 +853,15 @@ async function loadApp(){
   try{
     const rawData=await api({action:'load'});
     if(!rawData.ok)throw new Error(rawData.error);
+    /* Phase 2 (data safety): the server now serves transactions as blob ∪
+       row-tab and reports what the merge did. Stash for System Health. If
+       anything was recovered from rows, tell the user — that's the safety
+       net actually firing. */
+    window._txMergeSummary = rawData._txMerge || null;
+    if (rawData._txMerge && rawData._txMerge.recoveredFromRows > 0){
+      console.warn('Phase 2 recovery: '+rawData._txMerge.recoveredFromRows+' transaction(s) recovered from the row tab', rawData._txMerge);
+      setTimeout(()=>{ try{ toast(`⚠ ${rawData._txMerge.recoveredFromRows} transaction(s) recovered from the safety-net tab — see System Health`, 'error'); }catch(e){} }, 1500);
+    }
     /* Phase 2A: run state migration before anything else */
     const data=migrateState(rawData);
     accounts=migrateAccounts(data.accounts||getDefaultAccounts());
@@ -3526,6 +3580,10 @@ function handleImport(file){
          ledgerReplaceTransactions above (called with reason 'restore_import') already
          did both internally as part of the transaction replacement. */
       logActivity(`Restored from backup (v${d.version||'?'}, ${txCount} transactions)`);
+      /* Phase 2: a restore REPLACES the transaction set — txs present in the
+         row tab but absent from the backup must not resurrect on next load.
+         The one-shot flag makes this save rewrite the rows tab wholesale. */
+      _txFullReplaceOnce = true;
       await pushSave();
       render();
       toast(`Backup restored — ${txCount} transactions ✓`,'success');
@@ -3934,6 +3992,11 @@ function ledgerRemoveTransactions(predicate,reason='remove',opts={}){
   }
 
   const before=transactions.length;
+  /* Phase 2 tombstones: record the ids being hard-removed so pushSave can
+     tell the server to delete the matching rows from the Transactions tab.
+     Without this, merge-on-load resurrects them (e.g. an unposted DSR batch
+     coming back after repost = double-counted sales). */
+  transactions.forEach(t=>{ if(t&&t.id&&predicate(t)) _removedTxIds.push(t.id); });
   transactions=transactions.filter(t=>!predicate(t));
 
   rebuildAccountBalances();
@@ -6600,7 +6663,7 @@ function pgTransactions(){
   const filteredBySupplier = !!filters.supplier;
   const summary=totalRows?`<div class="summary-footer"><span style="font-size:.78rem;color:var(--muted)">Total matched: <b>${totalRows}</b>${filteredBySupplier?` · <b>${esc(filters.supplier)}</b>`:''}</span><span class="green" style="font-size:.78rem">Sales: <b>${fmt(tS)}</b></span><span class="red" style="font-size:.78rem">Expenses: <b>${fmt(tE)}</b></span><span class="${net>=0?'green':'red'}" style="font-size:.78rem">Net: <b>${net>=0?'+':''}${fmt(net)}</b></span></div>`:'';
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Transactions</div><div class="page-sub">All movements — edit, void, or delete</div></div></div>
-<div class="filter-row"><input placeholder="Search note / category / supplier…" value="${esc(filters.search)}" oninput="filters.search=this.value;txPage=1;renderMain()" style="flex:1;min-width:100px;max-width:220px"><select onchange="filters.type=this.value;txPage=1;renderMain()"><option value="" ${sel('',filters.type)}>All Types</option><option value="sale" ${sel('sale',filters.type)}>Sales</option><option value="expense" ${sel('expense',filters.type)}>Expenses</option><option value="transfer" ${sel('transfer',filters.type)}>Transfers</option><option value="deposit" ${sel('deposit',filters.type)}>Deposits</option><option value="withdrawal" ${sel('withdrawal',filters.type)}>Withdrawals</option><option value="sc_collected" ${sel('sc_collected',filters.type)}>SC Collected</option><option value="tip_collected" ${sel('tip_collected',filters.type)}>Tip Collected</option><option value="sc_paid" ${sel('sc_paid',filters.type)}>SC Paid Out</option><option value="tip_paid" ${sel('tip_paid',filters.type)}>Tip Paid Out</option><option value="liability_payment" ${sel('liability_payment',filters.type)}>Liability Remittance</option><option value="dsr_adjustment" ${sel('dsr_adjustment',filters.type)}>DSR Adjustment (VAT/Discount)</option></select><select onchange="filters.supplier=this.value;txPage=1;renderMain()" title="Filter by supplier — totals in the summary footer below reflect the filter"><option value="" ${sel('',filters.supplier||'')}>All Suppliers</option>${supplierOpts.map(s=>`<option value="${esc(s)}" ${sel(s,filters.supplier||'')}>${esc(s)}</option>`).join('')}</select><input type="date" value="${filters.dateFrom}" onchange="filters.dateFrom=this.value;txPage=1;renderMain()"><input type="date" value="${filters.dateTo}" onchange="filters.dateTo=this.value;txPage=1;renderMain()"><button class="btn btn-ghost btn-sm" onclick="filters={type:'',search:'',dateFrom:'',dateTo:'',supplier:''};txPage=1;renderMain()">Clear</button><div style="flex:1"></div><button class="btn btn-ghost btn-sm" onclick="exportTransactionsCSV()" title="Export current filtered transactions as CSV (round-trip-compatible with Import CSV)">↓ CSV</button></div>
+<div class="filter-row"><input id="tx-search-input" placeholder="Search note / category / supplier…" value="${esc(filters.search)}" oninput="filters.search=this.value;txPage=1;renderMainPreserveFocus()" style="flex:1;min-width:100px;max-width:220px"><select onchange="filters.type=this.value;txPage=1;renderMain()"><option value="" ${sel('',filters.type)}>All Types</option><option value="sale" ${sel('sale',filters.type)}>Sales</option><option value="expense" ${sel('expense',filters.type)}>Expenses</option><option value="transfer" ${sel('transfer',filters.type)}>Transfers</option><option value="deposit" ${sel('deposit',filters.type)}>Deposits</option><option value="withdrawal" ${sel('withdrawal',filters.type)}>Withdrawals</option><option value="sc_collected" ${sel('sc_collected',filters.type)}>SC Collected</option><option value="tip_collected" ${sel('tip_collected',filters.type)}>Tip Collected</option><option value="sc_paid" ${sel('sc_paid',filters.type)}>SC Paid Out</option><option value="tip_paid" ${sel('tip_paid',filters.type)}>Tip Paid Out</option><option value="liability_payment" ${sel('liability_payment',filters.type)}>Liability Remittance</option><option value="dsr_adjustment" ${sel('dsr_adjustment',filters.type)}>DSR Adjustment (VAT/Discount)</option></select><select onchange="filters.supplier=this.value;txPage=1;renderMain()" title="Filter by supplier — totals in the summary footer below reflect the filter"><option value="" ${sel('',filters.supplier||'')}>All Suppliers</option>${supplierOpts.map(s=>`<option value="${esc(s)}" ${sel(s,filters.supplier||'')}>${esc(s)}</option>`).join('')}</select><input type="date" value="${filters.dateFrom}" onchange="filters.dateFrom=this.value;txPage=1;renderMain()"><input type="date" value="${filters.dateTo}" onchange="filters.dateTo=this.value;txPage=1;renderMain()"><button class="btn btn-ghost btn-sm" onclick="filters={type:'',search:'',dateFrom:'',dateTo:'',supplier:''};txPage=1;renderMain()">Clear</button><div style="flex:1"></div><button class="btn btn-ghost btn-sm" onclick="exportTransactionsCSV()" title="Export current filtered transactions as CSV (round-trip-compatible with Import CSV)">↓ CSV</button></div>
 ${isStaff?`<div class="info-box" style="margin-bottom:10px;font-size:.78rem">Viewing in <b>staff (read-only)</b> mode — ad-hoc transactions, edits, voids, and deletes are manager-only.</div>`:`<div class="action-bar"><button class="btn btn-primary btn-sm" onclick="openModal('sale')">+ Sale</button><button class="btn btn-ghost btn-sm" onclick="openModal('expense')">+ Expense</button><button class="btn btn-ghost btn-sm" onclick="openModal('transfer')">↕ Transfer</button><button class="btn btn-ghost btn-sm" onclick="openModal('deposit')">↓ Deposit</button><button class="btn btn-ghost btn-sm" onclick="openModal('withdrawal')">↑ Withdraw</button><button class="btn btn-ghost btn-sm" onclick="triggerCSVImport()">↑ Import CSV</button><input type="file" id="csv-import-input" accept=".csv" style="display:none" onchange="handleCSVImport(this.files[0])"></div>`}
 <div class="card-flush"><table><thead><tr><th>Date</th><th>Type</th><th>Category / Note</th><th>Supplier</th><th>Account</th><th style="text-align:right">Amount</th><th>Handler</th><th></th></tr></thead><tbody>${rows}</tbody></table>${pager}${summary}</div>`;
 }
@@ -10179,8 +10242,10 @@ function pgPayables(){
   const sel = (v,c) => v===c ? 'selected' : '';
   const filteredItemsCount = openPayables.length + accrualPayables.length;
   const totalItemsCount = openPayablesAll.length + accrualPayablesAll.length;
+  /* "Filtered" sub-line gets a more readable font size — the previous .72rem
+     was too small to make it the actionable number when filtering. */
   const filterSub = filterActive
-    ? `<div class="stat-sub" style="color:var(--muted2);font-size:.72rem;margin-top:3px"><b style="color:var(--text)">Filtered: ${fmt(totalOwed)}</b> · ${filteredItemsCount} of ${totalItemsCount} items</div>`
+    ? `<div style="color:var(--muted2);font-size:.85rem;margin-top:6px;display:flex;align-items:baseline;gap:6px"><span>Filtered:</span><b style="color:var(--red);font-family:var(--fm);font-size:.95rem">${fmt(totalOwed)}</b><span style="font-size:.7rem;color:var(--muted2)">· ${filteredItemsCount} of ${totalItemsCount} items</span></div>`
     : '';
 
   return`<div class="page-header"><div class="page-hd-left"><div class="page-title">Payables</div><div class="page-sub">Loans · Supplier credit · Accrued expenses</div></div><button class="btn btn-primary btn-sm" onclick="openModal('addPayable')">+ Add Payable</button></div>
@@ -10205,7 +10270,7 @@ function pgPayables(){
 </div>
 
 <div class="filter-row" style="margin-bottom:12px">
-  <input placeholder="Search name / supplier / note…" value="${esc(payableFilters.search)}" oninput="payableFilters.search=this.value;payPage=1;accrPage=1;renderMain()" style="flex:1;min-width:140px;max-width:240px">
+  <input id="pay-search-input" placeholder="Search name / supplier / note…" value="${esc(payableFilters.search)}" oninput="payableFilters.search=this.value;payPage=1;accrPage=1;renderMainPreserveFocus()" style="flex:1;min-width:140px;max-width:240px">
   <select onchange="payableFilters.type=this.value;payPage=1;accrPage=1;renderMain()" title="Type filter — only narrows the Loans & Debts list">
     <option value="" ${sel('',payableFilters.type)}>All Types</option>
     ${PAYABLE_TYPES.map(t=>`<option value="${t}" ${sel(t,payableFilters.type)}>${t}</option>`).join('')}
@@ -11028,6 +11093,19 @@ function pgSystemHealth(){
         if (!ls) return '0 KB';
         return Math.round(ls.length/1024) + ' KB';
       }catch(e){ return 'n/a'; }
+    })(),
+    /* Phase 2 safety net — what the blob∪rows merge did on the last load.
+       "recovered" > 0 means the rows tab resurrected txs a stale-tab save
+       had wiped from the blob (the May 2026 data-loss mode, now self-healing). */
+    'Safety net (last load)': (()=>{
+      const s = window._txMergeSummary;
+      if (!s) return 'no merge data (server on Phase 1?)';
+      if (s.rowReadFailed) return '⚠ row tab unreadable — blob only';
+      const bits = [`blob ${s.blobCount}`, `rows ${s.rowCount}`];
+      if (s.recoveredFromRows) bits.push(`⚠ recovered ${s.recoveredFromRows}`);
+      if (s.conflictsRowWon) bits.push(`row-won conflicts ${s.conflictsRowWon}`);
+      if (s.healedToRows) bits.push(`healed ${s.healedToRows}`);
+      return bits.join(' · ');
     })()
   };
 
@@ -11127,6 +11205,32 @@ function pgSystemHealth(){
 function renderMain(){
   const map={dashboard:pgDashboard,tabs:pgTabs,transactions:pgTransactions,funds:pgFunds,weekly:pgWeeklyCheck,payables:pgPayables,coa:pgCOA,dsr:pgDSR,cash:(typeof pgCash==='function'?pgCash:()=>'<div class="card">Cash module unavailable</div>'),labor:pgLabor,reports:pgReports,activity:pgActivity,forecast:pgForecast,treasury:pgCashPosition,cashposition:pgCashPosition,system:pgSystemHealth};
   document.getElementById('main').innerHTML=(map[currentPage]||pgDashboard)();
+}
+
+/* Re-render that preserves focus + cursor position on the currently-focused
+   input. Used by live-filter handlers (Transactions search, Payables search)
+   where every keystroke triggers renderMain — which would otherwise destroy
+   the input element and lose focus. The user could only type one letter
+   before having to click the box again. Real bug, fixed app-wide via this
+   helper instead of per-input setTimeout hacks. */
+function renderMainPreserveFocus(){
+  const el = document.activeElement;
+  const id = el && el.id;
+  const cursor = (el && typeof el.selectionStart === 'number') ? el.selectionStart : null;
+  renderMain();
+  if (id){
+    /* Defer to next tick so the new DOM is fully painted before we look up
+       the replacement element by id. */
+    setTimeout(()=>{
+      const newEl = document.getElementById(id);
+      if (newEl){
+        newEl.focus();
+        if (cursor !== null && typeof newEl.setSelectionRange === 'function'){
+          try{ newEl.setSelectionRange(cursor, cursor); }catch(e){}
+        }
+      }
+    }, 0);
+  }
 }
 function renderNav(){
   const pages=[
