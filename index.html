@@ -4869,7 +4869,11 @@ function renderModal(){
       </div>
     </div>
     <div class="form-row">
-      <div class="form-group" style="padding-top:4px">
+      <!-- grid-column:1/-1 — checkbox blocks span the FULL modal width.
+           Without it the form-row's auto-fill grid pins the label + helper
+           text into the left column, wrapping awkwardly with dead space on
+           the right (user-flagged UI issue, June 2026). -->
+      <div class="form-group" style="padding-top:4px;grid-column:1/-1">
         <label style="display:flex;align-items:center;gap:7px;cursor:pointer;text-transform:none;font-size:.82rem;font-weight:500;letter-spacing:0">
           <input type="checkbox" id="m-emp-exempt" ${(d.exemptFromPremiumPay===true||(!isEdit&&currentDept==='MGT'))?'checked':''} style="width:auto"> Exempt from premium pay (OT / ND / Holiday / Rest Day)
         </label>
@@ -4891,7 +4895,8 @@ function renderModal(){
          premium applies). Decouples premium calc from emp.restDay so changing
          the global schedule going forward doesn't rewrite past pay. -->
     <div class="form-row">
-      <div class="form-group" style="padding-top:4px">
+      <!-- grid-column:1/-1 — full-width checkbox block (see Edit Employee note). -->
+      <div class="form-group" style="padding-top:4px;grid-column:1/-1">
         <label style="display:flex;align-items:center;gap:7px;cursor:pointer;text-transform:none;font-size:.82rem;font-weight:500;letter-spacing:0">
           <input type="checkbox" id="m-shift-restday" style="width:auto"> Rest-day premium applies (+30%)
         </label>
@@ -4923,9 +4928,10 @@ function renderModal(){
       <div class="form-row"><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${s.date}"></div><div class="form-group"></div><div class="form-group"></div></div>
       <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="${s.timeIn}"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="${s.timeOut}"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="240" step="15" value="${s.breakMins||0}"></div></div>
       <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="${s.scheduledIn||s.timeIn||'09:00'}"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="${s.scheduledHours||8}"></div><div class="form-group"><label>Note</label><input id="m-shift-note" value="${esc(s.note||'')}"></div></div>
-      <!-- Rest-day premium toggle (Approach A): per-shift flag, mirrors addShift. -->
+      <!-- Rest-day premium toggle (Approach A): per-shift flag, mirrors addShift.
+           grid-column:1/-1 — full-width checkbox block (see Edit Employee note). -->
       <div class="form-row">
-        <div class="form-group" style="padding-top:4px">
+        <div class="form-group" style="padding-top:4px;grid-column:1/-1">
           <label style="display:flex;align-items:center;gap:7px;cursor:pointer;text-transform:none;font-size:.82rem;font-weight:500;letter-spacing:0">
             <input type="checkbox" id="m-shift-restday" ${_editRestChecked?'checked':''} style="width:auto"> Rest-day premium applies (+30%)
           </label>
@@ -8814,7 +8820,29 @@ function unfinalizePayroll(payrollId){
   if(isPeriodLocked(run.toDate)){toast('Accounting period locked — unlock before unfinalizing','error');return}
   const affectedTx=(transactions||[]).filter(t=>t&&t.payrollRunId===payrollId&&!t.voided);
   const affectedPayables=(staffPayables||[]).filter(p=>p&&p.paidByPayrollRunId===payrollId);
-  if(!confirm(`Undo payroll finalize for ${fmtDate(run.fromDate)} – ${fmtDate(run.toDate)}?\n\n`+
+  /* RECOMPUTE-DRIFT WARNING — unfinalize→refinalize RECOMPUTES pay from
+     CURRENT shifts + CURRENT employee settings, it does not replay the
+     frozen run. If inputs changed since the original finalize (employee
+     Rest Day edits, payroll-settings multiplier changes, rest-day toggles
+     locked onto shifts), the refinalize will produce DIFFERENT pay. That
+     silent drift caused a June 2026 incident: schedule changed Monday from
+     rest day to operating day → refinalize dropped the Monday premiums →
+     totals no longer matched and the user restored from backup. Surface the
+     delta UP FRONT so the decision is informed, not a surprise. */
+  let driftWarning='';
+  try{
+    const recomputed=(roster||[]).filter(r=>r&&r.status!=='inactive')
+      .map(e=>computePayroll(e.id,run.fromDate,run.toDate)).filter(Boolean);
+    const recomputedNet=round2(recomputed.reduce((s,p)=>s+(Number(p.netPay)||Number(p.grossPay)||0),0));
+    const frozenNet=round2(Number(run.totalPayroll)||0);
+    const drift=round2(recomputedNet-frozenNet);
+    if(Math.abs(drift)>=0.01){
+      driftWarning=`\n⚠ RECOMPUTE MISMATCH: refinalizing this period with CURRENT data gives ${fmt(recomputedNet)} vs the original ${fmt(frozenNet)} (${drift>0?'+':''}${fmt(drift)}).\n`+
+        `Inputs changed since the original finalize — likely a Rest Day setting, an edited shift, a payroll-settings multiplier, or an adjustment. `+
+        `If you proceed and refinalize, pay WILL change by this amount.\n`;
+    }
+  }catch(e){ /* preview failure is non-fatal — proceed with the standard confirm */ }
+  if(!confirm(`Undo payroll finalize for ${fmtDate(run.fromDate)} – ${fmtDate(run.toDate)}?\n${driftWarning}\n`+
     `• ${affectedTx.length} ledger tx${affectedTx.length===1?'':'s'} will be voided\n`+
     `• ${affectedPayables.length} staffPayable${affectedPayables.length===1?'':'s'} will revert to unpaid\n`+
     ((run.advanceRepayments||[]).length?`• ${fmt((run.advanceRepayments||[]).reduce((s,r)=>s+(Number(r.amount)||0),0))} cash-advance repayment will be restored (re-owed)\n`:'')+
@@ -11051,6 +11079,114 @@ function runStartupDiagnostics(){
   return _startupDiagnostics;
 }
 
+/* ── POSTING INTEGRITY CHECKER ──────────────────────────────────────────
+   Detects the double-post / partial-post signatures that unpost+repost
+   flows can leave behind. Read-only — never mutates. Six checks:
+     1. Overlapping payroll runs — two finalized runs whose date windows
+        overlap = wages posted twice for the shared days
+     2. Orphaned wage txs — live (non-voided) txs tagged with a payrollRunId
+        that no longer exists. THE smoking gun for "unpost removed the run
+        but the void didn't land" — a refinalize then double-posts.
+     3. Ghost runs — a run in history with zero live txs (partial finalize,
+        or someone manually voided the postings without unfinalizing)
+     4. Run-total drift — per run, live wage/SC/tip tx sums vs the frozen
+        run totals (catches single manually-voided wage entries)
+     5. Duplicate DSR batches — same date posting the same [DSR] category
+        more than once = unpost didn't clean up before repost
+     6. Duplicate SC/Tip pool entries — same date+type appearing twice in
+        staffPayables = double SC/tip distribution on payday */
+function checkPostingIntegrity(){
+  const issues = [];
+  const liveTx = (transactions||[]).filter(t=>t && !t.voided);
+
+  /* 1. Overlapping payroll runs */
+  const runs = (payrollRuns||[]).filter(r=>r&&r.fromDate&&r.toDate);
+  for (let i=0;i<runs.length;i++){
+    for (let j=i+1;j<runs.length;j++){
+      const a=runs[i], b=runs[j];
+      if (a.fromDate<=b.toDate && b.fromDate<=a.toDate){
+        issues.push({level:'bad', check:'Overlapping payroll runs',
+          detail:`${fmtDate(a.fromDate)}–${fmtDate(a.toDate)} overlaps ${fmtDate(b.fromDate)}–${fmtDate(b.toDate)} — wages double-posted for the shared days`});
+      }
+    }
+  }
+
+  /* 2. Orphaned wage txs (runId points nowhere) */
+  const runIds = new Set(runs.map(r=>r.id));
+  const orphans = liveTx.filter(t=>t.payrollRunId && !runIds.has(t.payrollRunId));
+  if (orphans.length){
+    const total = orphans.reduce((s,t)=>s+(Number(t.amount)||0),0);
+    issues.push({level:'bad', check:'Orphaned payroll transactions',
+      detail:`${orphans.length} live tx(s) totalling ${fmt(total)} reference a payroll run that no longer exists — an unfinalize removed the run but the postings survived. Refinalizing that period would DOUBLE-POST. Void these txs manually (Transactions page) before refinalizing.`});
+  }
+
+  /* 3 + 4. Per-run: ghost runs and total drift */
+  const TOL = 0.05;
+  runs.forEach(r=>{
+    const rTx = liveTx.filter(t=>t.payrollRunId===r.id);
+    if (!rTx.length){
+      issues.push({level:'warn', check:'Ghost payroll run',
+        detail:`Run ${fmtDate(r.fromDate)}–${fmtDate(r.toDate)} has no live ledger txs — postings were voided without unfinalizing. History shows pay that the ledger doesn't carry.`});
+      return;
+    }
+    const sums = { expense:0, sc_paid:0, tip_paid:0 };
+    rTx.forEach(t=>{ if (sums[t.type]!==undefined) sums[t.type]+=Number(t.amount)||0; });
+    const drift = [
+      ['wages', sums.expense, Number(r.totalWageGross)||0],
+      ['SC',    sums.sc_paid, Number(r.totalSC)||0],
+      ['tips',  sums.tip_paid, Number(r.totalTip)||0]
+    ].filter(([,live,frozen])=>Math.abs(live-frozen)>TOL);
+    drift.forEach(([label,live,frozen])=>{
+      issues.push({level:'bad', check:'Run total drift',
+        detail:`Run ${fmtDate(r.fromDate)}–${fmtDate(r.toDate)}: live ${label} txs sum to ${fmt(live)} but the frozen run says ${fmt(frozen)} (Δ ${fmt(live-frozen)}) — a posting was voided or altered outside the unfinalize flow.`});
+    });
+  });
+
+  /* 5. Duplicate DSR batches — same date, same category, >1 live [DSR] sale */
+  const dsrKey = {};
+  liveTx.forEach(t=>{
+    if (t.type!=='sale' || !t.note || !t.note.startsWith(DSR_TAG)) return;
+    const k = t.date+'|'+(t.category||'');
+    (dsrKey[k] = dsrKey[k]||[]).push(t);
+  });
+  Object.entries(dsrKey).forEach(([k,list])=>{
+    if (list.length>1){
+      const [date,cat] = k.split('|');
+      const total = list.reduce((s,t)=>s+(Number(t.amount)||0),0);
+      issues.push({level:'bad', check:'Duplicate DSR posting',
+        detail:`${fmtDate(date)} has ${list.length} live "${cat}" DSR postings totalling ${fmt(total)} — sales double-counted. Unpost that date and repost once.`});
+    }
+  });
+
+  /* 6. Duplicate SC/Tip pool entries in staffPayables */
+  const spKey = {};
+  (staffPayables||[]).forEach(p=>{
+    if (!p || !p.date || !p.type) return;
+    const k = p.date+'|'+p.type;
+    (spKey[k] = spKey[k]||[]).push(p);
+  });
+  Object.entries(spKey).forEach(([k,list])=>{
+    if (list.length>1){
+      const [date,type] = k.split('|');
+      issues.push({level:'warn', check:'Duplicate SC/Tip pool entry',
+        detail:`${fmtDate(date)} has ${list.length} ${type.toUpperCase()} pool entries in staffPayables — the payday distribution would pay the pool twice for that day.`});
+    }
+  });
+
+  return {
+    ranAt: new Date().toISOString(),
+    issues,
+    counts: { liveTx: liveTx.length, runs: runs.length, dsrDates: Object.keys(dsrKey).length }
+  };
+}
+
+function runPostingAudit(){
+  window._postingAudit = checkPostingIntegrity();
+  render();
+  const n = window._postingAudit.issues.length;
+  toast(n ? `⚠ ${n} posting issue${n===1?'':'s'} found — see System Health` : 'Postings clean — no doubles, no orphans ✓', n?'error':'success');
+}
+
 function pgSystemHealth(){
   const diag = _startupDiagnostics || {checks:[], summary:'Not run yet — refresh the app to run diagnostics'};
 
@@ -11190,12 +11326,33 @@ function pgSystemHealth(){
     <table><tbody>${Object.entries(counts).map(([k,v])=>kvRow(k,v)).join('')}</tbody></table>
   </div>
 
+  <!-- ═══ POSTING AUDIT RESULTS — shown after "Check postings" runs ═══ -->
+  ${(()=>{
+    const a = window._postingAudit;
+    if (!a) return '';
+    const color = a.issues.some(i=>i.level==='bad') ? 'var(--red)' : a.issues.length ? 'var(--amber)' : 'var(--green)';
+    const rows = a.issues.length
+      ? a.issues.map(i=>`<tr>
+          <td style="font-size:.76rem;font-weight:600;color:${i.level==='bad'?'var(--red)':'var(--amber)'};white-space:nowrap">${esc(i.check)}</td>
+          <td style="font-size:.76rem;line-height:1.45">${esc(i.detail)}</td>
+        </tr>`).join('')
+      : `<tr><td colspan="2" class="empty" style="color:var(--green)">No doubles, no orphans, no drift — postings are clean ✓</td></tr>`;
+    return `<div class="card-flush" style="margin-bottom:14px;border-left:4px solid ${color}">
+      <div style="padding:9px 14px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+        <span class="sec-title">Posting audit</span>
+        <span style="font-size:.71rem;color:var(--muted2)">${new Date(a.ranAt).toLocaleString()} · scanned ${a.counts.liveTx} live txs, ${a.counts.runs} payroll runs, ${a.counts.dsrDates} DSR-posted date-categories</span>
+      </div>
+      <table><tbody>${rows}</tbody></table>
+    </div>`;
+  })()}
+
   <!-- ═══ ACTIONS ═══ -->
   <div class="card" style="margin-bottom:14px">
     <div class="sec-title" style="margin-bottom:8px">Maintenance actions</div>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <button class="btn btn-ghost btn-sm" onclick="rebuildAccountBalances();render();toast('Account balances rebuilt ✓')" title="Replay every non-voided tx to derive fresh balances">↻ Rebuild balances</button>
       <button class="btn btn-ghost btn-sm" onclick="(()=>{const r=runAssertions('manual');render();toast(r.ok?'All assertions passed ✓':(r.errors||[]).length+' failure(s) — see console','error')})()" title="Run all integrity invariants">🔍 Run integrity check</button>
+      <button class="btn btn-ghost btn-sm" onclick="runPostingAudit()" title="Scan for double-posts and partial unposts: duplicate DSR batches, orphaned payroll txs, overlapping runs, run-total drift, duplicate SC/Tip pool entries">🔎 Check postings</button>
       <button class="btn btn-ghost btn-sm" onclick="normalizeAllTransactions();render();toast('Transactions normalized ✓')" title="Re-run normalizeTx on every transaction (legacy migration)">↻ Normalize transactions</button>
     </div>
     <div style="font-size:.7rem;color:var(--muted2);margin-top:8px;line-height:1.45">All actions are safe to run anytime — they re-derive from existing data, never destroy it.</div>
