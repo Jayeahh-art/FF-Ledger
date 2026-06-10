@@ -7176,8 +7176,15 @@ function unpostDSR(date){
   if(settledHere && !confirm(`⚠ The SC/Tips for ${fmtDate(date)} were already distributed by a finalized payroll run.\n\nUnposting the DSR now will leave those settlements without their matching liability. Recommended: unfinalize that payroll first.\n\nContinue anyway?`))return;
   if(!confirm(`Remove ${existing.length} DSR transaction(s) for ${fmtDate(date)}?\n\nAccount balances will be reversed.`))return;
   ledgerRemoveTransactions(t=>(t.date===date&&t.note&&t.note.startsWith(DSR_TAG)),'remove_dsr_batch');
-  // Remove DSR-generated staffPayables
-  staffPayables=staffPayables.filter(p=>!(p.date===date&&p.description&&p.description.includes('DSR')));
+  /* Remove DSR-generated staffPayables — filter by TYPE, not description.
+     Bug fix (same one already applied to the no-live-txs recovery path above):
+     descriptions are "SC — May 15, 2026" / "Tips — …", they never contain
+     'DSR', so the old description filter matched nothing. Every unpost+repost
+     cycle silently doubled the SC/Tip pool for that date → payroll would
+     over-distribute. DSR posting is the only writer of type 'sc'/'tip'
+     staffPayables, so the type filter is exact — and it also sweeps out any
+     duplicates accumulated from earlier cycles under the broken filter. */
+  staffPayables=staffPayables.filter(p=>!(p&&p.date===date&&(p.type==='sc'||p.type==='tip')));
   // Mark as unposted
   dsrEntries[date]={...dsrEntries[date],posted:false,postedAt:null};
   /* Refresh metric snapshots for this date now that its txs are gone. */
