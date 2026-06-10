@@ -8885,6 +8885,124 @@ function unfinalizePayroll(payrollId){
   toast(`Payroll unfinalized — ${affectedTx.length} entr${affectedTx.length===1?'y':'ies'} voided ✓`);
 }
 
+/* ── GHOST-RUN REPAIR: REPOST FROM SNAPSHOT ─────────────────────────────
+   For a run whose history exists but whose ledger entries are gone (voided
+   without unfinalizing, or lost in a backup restore). Replays the EXACT
+   entries from the frozen run snapshot — same amounts, same dept×account
+   grouping, same dates. NO recompute.
+
+   This is the safe alternative to unfinalize+refinalize when the pay was
+   already handed out in reality:
+     · refinalize RECOMPUTES with current inputs → rest-day drift, inflated
+       SC/Tip pools (duplicate staffPayables), changed advance state — the
+       numbers would NOT match what was actually paid
+     · this replay touches ONLY the ledger: staffPayables stay as-is (no
+       redistribution), advance balances stay as-is (already settled at the
+       original finalize)
+   Entries are tagged with the original payrollRunId so the run stops being
+   a ghost and unfinalize/audit flows reattach correctly. */
+function repostGhostRun(payrollId){
+  const run=(payrollRuns||[]).find(r=>r&&r.id===payrollId);
+  if(!run){toast('Payroll run not found','error');return}
+  if(isPeriodLocked(run.toDate)){toast('Accounting period locked — unlock before reposting','error');return}
+  const liveTx=(transactions||[]).filter(t=>t&&t.payrollRunId===payrollId&&!t.voided);
+  if(liveTx.length){toast(`This run already has ${liveTx.length} live ledger entr${liveTx.length===1?'y':'ies'} — repost is only for ghost runs (zero live entries). Reposting now would double-post.`,'error');return}
+  const rows=run.rows||[];
+  if(!rows.length){toast('Run has no frozen snapshot rows to replay — cannot repost','error');return}
+
+  /* Rebuild groupings from the FROZEN rows — mirrors finalizePayroll's
+     grouping exactly, but sourced from the snapshot instead of computePayroll. */
+  const deptCoa={FOH:{id:'x6000',name:'FOH Regular Wages',type:'variable'},
+                 BOH:{id:'x6040',name:'BOH Regular Wages',type:'variable'},
+                 MGT:{id:'x6200',name:'Management Salaries',type:'fixed'}};
+  const fallbackAcct=accounts.find(a=>a.id==='register'||(a.type==='cash'&&a.type!=='clearing'))?.id||accounts.find(a=>a.type!=='clearing')?.id||accounts[0]?.id||'';
+  const acctName=id=>accounts.find(a=>a.id===id)?.name||id||'(unset)';
+  const wageGroups={}, scByAcct={}, tipByAcct={}, empAcct={};
+  rows.forEach(r=>{
+    const dept=r.emp?.department||defaultDepartmentForPosition(r.emp?.position||'');
+    const acct=r.payoutAccount||fallbackAcct;
+    if(r.emp?.id) empAcct[r.emp.id]=acct;
+    if(!acct) return;
+    const key=`${dept}|${acct}`;
+    if(!wageGroups[key]) wageGroups[key]={dept,account:acct,total:0,count:0};
+    wageGroups[key].total+=Number(r.grossPay||0);
+    wageGroups[key].count++;
+    if(r.scShare>0) scByAcct[acct]=(scByAcct[acct]||0)+Number(r.scShare);
+    if(r.tipShare>0) tipByAcct[acct]=(tipByAcct[acct]||0)+Number(r.tipShare);
+  });
+  /* Advance-repayment deposits come from the run's frozen repayment records —
+     balances were already adjusted at the original finalize, so we ONLY post
+     the ledger entry, never touch cashAdvances. */
+  const advByAcct={};
+  (run.advanceRepayments||[]).forEach(rep=>{
+    const amt=round2(Number(rep.amount)||0); if(amt<=0) return;
+    const acct=empAcct[rep.employeeId]||fallbackAcct; if(!acct) return;
+    advByAcct[acct]=round2((advByAcct[acct]||0)+amt);
+  });
+  const totalAdv=(run.advanceRepayments||[]).reduce((s,r2)=>s+(Number(r2.amount)||0),0);
+
+  const alreadyPaid=confirm(
+    `Repost ledger entries for ${fmtDate(run.fromDate)} – ${fmtDate(run.toDate)} from the frozen snapshot?\n\n`+
+    `EXACT original amounts — no recompute, no redistribution:\n`+
+    `• Wages ${fmt(run.totalWageGross||0)} · SC ${fmt(run.totalSC||0)} · Tips ${fmt(run.totalTip||0)}${totalAdv>0?` · Advance repay ${fmt(totalAdv)}`:''}\n`+
+    `• staffPayables and advance balances are NOT touched\n\n`+
+    `Were the wages ALREADY PAID OUT in reality?\n`+
+    `OK = yes — post wages as PAID (cash outflow reflected now)\n`+
+    `Cancel = choose unpaid / abort on the next prompt`
+  );
+  let wageStatus='paid';
+  if(!alreadyPaid){
+    if(!confirm('Post wages as UNPAID instead (you mark them paid on payday via Unpaid Expenses)?\n\nOK = post unpaid · Cancel = abort entirely')) return;
+    wageStatus='unpaid';
+  }
+  const stamp=new Date().toISOString();
+
+  const entries=[];
+  Object.values(wageGroups).forEach(g=>{
+    if(g.total<=0) return;
+    const c=deptCoa[g.dept]||deptCoa.FOH;
+    entries.push({
+      date:run.toDate, type:'expense', coaId:c.id,
+      category:getCOAName(c.id,c.name),
+      account:g.account, amount:round2(g.total),
+      note:`Payroll ${g.dept} ${run.fromDate} – ${run.toDate} · ${g.count} employee${g.count===1?'':'s'} via ${acctName(g.account)} [reposted from snapshot]`,
+      status:wageStatus, ...(wageStatus==='paid'?{paidAt:stamp}:{}),
+      expenseType:c.type, handler:currentUser,
+      payrollRunId:payrollId
+    });
+  });
+  Object.entries(scByAcct).forEach(([acct,amt])=>{
+    if(amt<=0) return;
+    entries.push({date:run.toDate, type:'sc_paid', coaId:'l2210',
+      category:getCOAName('l2210','Service Charge Payable'),
+      account:acct, amount:round2(amt),
+      note:`SC distribution ${run.fromDate} – ${run.toDate} via ${acctName(acct)} [reposted from snapshot]`,
+      status:'paid', handler:currentUser, payrollRunId:payrollId});
+  });
+  Object.entries(tipByAcct).forEach(([acct,amt])=>{
+    if(amt<=0) return;
+    entries.push({date:run.toDate, type:'tip_paid', coaId:'l2220',
+      category:getCOAName('l2220','Tips Payable'),
+      account:acct, amount:round2(amt),
+      note:`Tips distribution ${run.fromDate} – ${run.toDate} via ${acctName(acct)} [reposted from snapshot]`,
+      status:'paid', handler:currentUser, payrollRunId:payrollId});
+  });
+  Object.entries(advByAcct).forEach(([acct,amt])=>{
+    if(amt<=0) return;
+    entries.push({date:run.toDate, type:'deposit', coaId:'a1060',
+      category:getCOAName('a1060','Employee Receivables'),
+      account:acct, amount:round2(amt),
+      note:`Cash-advance repayment ${run.fromDate} – ${run.toDate} via ${acctName(acct)} [reposted from snapshot]`,
+      status:'paid', handler:currentUser, payrollRunId:payrollId});
+  });
+
+  if(!entries.length){toast('Nothing to repost — snapshot rows have zero amounts','error');return}
+  createLedgerBatch(entries,{skipRender:true});
+  logActivity(`Ghost run reposted from snapshot: ${fmtDate(run.fromDate)}–${fmtDate(run.toDate)} · ${entries.length} entr${entries.length===1?'y':'ies'} · wages ${wageStatus}`);
+  scheduleSave();renderMain();
+  toast(`Reposted ${entries.length} entr${entries.length===1?'y':'ies'} from snapshot ✓ — run is no longer a ghost`,'success');
+}
+
 /* ─── PAYROLL SETTINGS SAVE ─── */
 function savePayrollSettings(){
   payrollSettings={
@@ -9767,6 +9885,10 @@ function renderPayrollHistoryTab(){
        both shapes; show extra breakdown only when SC/Tip exist. */
     const hasPoolData=(run.totalSC>0||run.totalTip>0);
     const wageGross=run.totalWageGross!==undefined?run.totalWageGross:run.totalPayroll;
+    /* Ghost detection: run history exists but zero live ledger txs reference
+       it (voided without unfinalizing, or lost in a backup restore). Shows a
+       red badge + the snapshot-repost repair instead of pretending all is well. */
+    const isGhost=!(transactions||[]).some(t=>t&&t.payrollRunId===run.id&&!t.voided);
     const rowHtml=rows.map(p=>`<tr>
       <td style="font-size:.8rem;font-weight:500">${esc(p.emp?.name||p.employeeName||'—')}</td>
       <td style="font-size:.75rem;color:var(--muted2)">${p.daysWorked} days · ${(p.totalHours||0).toFixed(1)}h</td>
@@ -9786,7 +9908,10 @@ function renderPayrollHistoryTab(){
         </div>
         <div style="display:flex;align-items:center;gap:12px">
           <div style="text-align:right"><div class="stat-label">Total Net Pay</div><div class="mono" style="font-size:1rem;font-weight:700;color:var(--red)">${fmt(run.totalPayroll)}</div></div>
-          <span style="font-size:.72rem;background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd);border-radius:20px;padding:2px 8px;font-weight:600">Posted</span>
+          ${isGhost
+            ?`<span style="font-size:.72rem;background:var(--red-bg);color:var(--red);border:1px solid var(--red-bd);border-radius:20px;padding:2px 8px;font-weight:600" title="No live ledger entries reference this run — the postings were voided or lost. The pay shown here is NOT in your books.">⚠ Ghost</span>
+          <button class="btn btn-ghost btn-xs" style="color:var(--green)" onclick="repostGhostRun('${run.id}')" title="Replay the EXACT frozen amounts into the ledger — no recompute, no SC/Tip redistribution, no advance changes. The safe fix when the pay was already handed out.">🔧 Repost from snapshot</button>`
+            :`<span style="font-size:.72rem;background:var(--green-bg);color:var(--green);border:1px solid var(--green-bd);border-radius:20px;padding:2px 8px;font-weight:600">Posted</span>`}
           <button class="btn btn-ghost btn-xs" style="color:var(--red)" onclick="unfinalizePayroll('${run.id}')" title="Void the posted txs and remove this run">↩ Undo</button>
         </div>
       </div>
