@@ -4889,6 +4889,15 @@ function renderModal(){
     body=`<div class="form-row"><div class="form-group"><label>Employee</label><select id="m-shift-emp" onchange="_recomputeShiftRestDayDefault()">${empOpts}</select></div><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${window._laborDate||today()}" onchange="_recomputeShiftRestDayDefault()"></div></div>
     <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="09:00"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="18:00"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="120" step="15" value="60"></div></div>
     <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="09:00"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="8"></div><div class="form-group"><label>Note</label><input id="m-shift-note" placeholder="e.g. OT, half-day…"></div></div>
+    <!-- Per-shift daily-rate override: blank = use the employee's current roster
+         rate (normal). Fill in to log a PAST shift at its HISTORICAL rate so
+         weekly labor KPIs stay correct after a raise. Frozen on the shift. -->
+    <div class="form-row">
+      <div class="form-group" style="grid-column:1/-1">
+        <label>Daily rate override (₱) <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· blank = use current rate · set for historical shifts at the old rate</span></label>
+        <input id="m-shift-rate" type="number" min="0" step="1" placeholder="(uses employee's current rate)">
+      </div>
+    </div>
     <!-- Rest-day premium toggle (Approach A): per-shift flag, defaulted from the
          selected employee's restDay vs the shift date. Editable so user can
          override (e.g. employee voluntarily works on their rest day → 130%
@@ -4909,7 +4918,7 @@ function renderModal(){
       <span>Daily rate: <b id="sp-rate" class="mono" style="color:var(--text)">—</b></span>
     </div>
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="submitAddShift()">Log Shift</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
-    setTimeout(()=>{const upd=()=>{const e=roster.find(r=>r.id===document.getElementById('m-shift-emp')?.value);const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;const hrs=calcShiftHours(ti,to,br);const el=document.getElementById('sp-hours');const re=document.getElementById('sp-rate');if(el)el.textContent=hrs.toFixed(2)+'h';if(re)re.textContent=e?fmt(e.dailyRate):'-';};['m-shift-emp','m-shift-in','m-shift-out','m-shift-break'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('change',upd)});upd();_recomputeShiftRestDayDefault();},80);
+    setTimeout(()=>{const upd=()=>{const e=roster.find(r=>r.id===document.getElementById('m-shift-emp')?.value);const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;const hrs=calcShiftHours(ti,to,br);const el=document.getElementById('sp-hours');const re=document.getElementById('sp-rate');const rateEl=document.getElementById('m-shift-rate');const ovr=Number(rateEl?.value)||0;if(el)el.textContent=hrs.toFixed(2)+'h';if(re)re.textContent=ovr>0?fmt(ovr)+' (override)':(e?fmt(e.dailyRate):'-');if(rateEl&&e&&!rateEl.value)rateEl.placeholder=`(current: ${fmt(e.dailyRate)})`;};['m-shift-emp','m-shift-in','m-shift-out','m-shift-break','m-shift-rate'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('input',upd)});upd();_recomputeShiftRestDayDefault();},80);
     }
   }else if(type==='editShift'){
     const sid=data;const s=shifts.find(x=>x.id===sid);const emp=s?roster.find(r=>r.id===s.employeeId):null;
@@ -4928,6 +4937,14 @@ function renderModal(){
       <div class="form-row"><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${s.date}"></div><div class="form-group"></div><div class="form-group"></div></div>
       <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="${s.timeIn}"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="${s.timeOut}"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="240" step="15" value="${s.breakMins||0}"></div></div>
       <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="${s.scheduledIn||s.timeIn||'09:00'}"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="${s.scheduledHours||8}"></div><div class="form-group"><label>Note</label><input id="m-shift-note" value="${esc(s.note||'')}"></div></div>
+      <!-- Per-shift daily-rate override (mirrors addShift). Pre-filled from the
+           shift's stored rateOverride; blank = uses the employee's current rate. -->
+      <div class="form-row">
+        <div class="form-group" style="grid-column:1/-1">
+          <label>Daily rate override (₱) <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· blank = current rate (${fmt(emp?.dailyRate||0)})</span></label>
+          <input id="m-shift-rate" type="number" min="0" step="1" value="${Number(s.rateOverride)>0?s.rateOverride:''}" placeholder="(uses ${fmt(emp?.dailyRate||0)})">
+        </div>
+      </div>
       <!-- Rest-day premium toggle (Approach A): per-shift flag, mirrors addShift.
            grid-column:1/-1 — full-width checkbox block (see Edit Employee note). -->
       <div class="form-row">
@@ -8378,7 +8395,14 @@ function calcOTHours(h){return{regular:Math.min(h,8),ot:Math.max(0,h-8)}}
    from hourly-rate math (e.g. dailyRate/8) propagating into payslips and the ledger. */
 function round2(n){return Math.round((Number(n)||0)*100)/100}
 function computeShiftPay(shift,emp){
-  if(!emp)return null;const dr=emp.dailyRate||0,hr=dr/8;
+  if(!emp)return null;
+  /* Per-shift rate override (mirrors isRestDay Approach A): if the shift carries
+     an explicit rateOverride, use it instead of the employee's CURRENT roster
+     rate. Lets you log PAST shifts at the historical daily rate so weekly labor
+     KPIs stay accurate even after the employee got a raise. Frozen on the shift,
+     so a later rate change never rewrites this shift's pay. Falsy/absent → use
+     emp.dailyRate (normal live behavior). */
+  const dr=(Number(shift.rateOverride)>0)?Number(shift.rateOverride):(emp.dailyRate||0),hr=dr/8;
   const{hoursWorked=0,breakMins=0,timeIn,timeOut,date,scheduledIn}=shift;
   /* Tardiness auto-detected from the clock: minutes late = actual clock-in −
      scheduled start. Legacy shifts with no scheduledIn fall back to timeIn (= on time). */
@@ -9356,9 +9380,13 @@ function saveEditShift(id){
      "derived from emp.restDay" default into a hard-stored boolean — from this
      edit onward, the shift owns its own rest-day truth. */
   const isRestDay = document.getElementById('m-shift-restday')?.checked === true;
+  /* Per-shift rate override: positive → store the historical rate; blank/0 →
+     store null so computeShiftPay falls back to the employee's current rate. */
+  const _rateRaw = Number(document.getElementById('m-shift-rate')?.value)||0;
+  const rateOverride = _rateRaw>0 ? round2(_rateRaw) : null;
   // Phase 2.7: no direct tx manipulation — shift records only.
   // Tardiness is derived in computeShiftPay from scheduledIn vs timeIn — no stored lateMinutes.
-  shifts=shifts.map(x=>x.id===id?{...x,date,timeIn:ti,timeOut:to,breakMins:br,scheduledHours:sched,scheduledIn:schedIn,note,hoursWorked:hrs,isRestDay}:x);
+  shifts=shifts.map(x=>x.id===id?{...x,date,timeIn:ti,timeOut:to,breakMins:br,scheduledHours:sched,scheduledIn:schedIn,note,hoursWorked:hrs,isRestDay,rateOverride}:x);
   scheduleSave();render();closeModal();toast('Shift updated ✓');
 }
 function submitAddRoster(){
@@ -9415,6 +9443,10 @@ function submitAddShift(){
      Captured at create time so future changes to emp.restDay don't rewrite
      past pay. */
   const isRestDay = document.getElementById('m-shift-restday')?.checked === true;
+  /* Per-shift rate override: positive → historical rate frozen on the shift;
+     blank/0 → null so computeShiftPay uses the employee's current rate. */
+  const _rateRaw = Number(document.getElementById('m-shift-rate')?.value)||0;
+  const rateOverride = _rateRaw>0 ? round2(_rateRaw) : null;
   addShift({
     employeeId:empId,
     date:document.getElementById('m-shift-date')?.value||today(),
@@ -9423,7 +9455,8 @@ function submitAddShift(){
     scheduledHours:parseFloat(document.getElementById('m-shift-sched')?.value)||8,
     scheduledIn:document.getElementById('m-shift-schedin')?.value||ti,
     note:document.getElementById('m-shift-note')?.value||'',
-    isRestDay
+    isRestDay,
+    rateOverride
   });
 }
 function submitAddHoliday(){const date=document.getElementById('m-hol-date')?.value;const name=(document.getElementById('m-hol-name')?.value||'').trim();const type=document.getElementById('m-hol-type')?.value||'special';if(!date||!name){toast('Date and name required','error');return}if(holidays.some(h=>h.date===date)){toast('Holiday already exists','error');return}holidays=[...holidays,{date,name,type}].sort((a,b)=>a.date.localeCompare(b.date));scheduleSave();renderMain();closeModal();toast('Holiday added ✓')}
