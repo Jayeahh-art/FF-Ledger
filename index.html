@@ -1096,6 +1096,11 @@ return [
 {id:'x6090',code:'6090',name:'Staff Meals',group:'Labor',type:'expense',isDefault:true},
 {id:'x6100',code:'6100',name:'Uniforms & Staff Welfare',group:'Labor',type:'expense',isDefault:true},
 {id:'x6110',code:'6110',name:'Training & Recruitment',group:'Labor',type:'expense',isDefault:true},
+/* 13th Month Pay — PH statutory annual benefit (PD 851). Labor group so it
+   counts as labor cost. NOT a wage account (x6000-x6070), so the dashboard
+   treats it as "non-shift labor" — accrue monthly (1/12) to avoid a single-
+   month Labor% spike, or lump-sum in December if you accept the spike. */
+{id:'x6120',code:'6120',name:'13th Month Pay',group:'Labor',type:'expense',isDefault:true},
 
 /* ═══════════════════════════════════════════════
    OPERATING EXPENSES
