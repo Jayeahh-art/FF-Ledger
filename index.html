@@ -5362,7 +5362,9 @@ function renderModal(){
 }
 
 function submitTx(type){
-  if(userRole==='staff'){toast('Posting ad-hoc transactions is manager-only — use DSR for sales','error');return;}
+  /* Staff may log EXPENSES only — sales go through DSR, and transfers/deposits/
+     withdrawals stay manager-only (they move cash between accounts). */
+  if(userRole==='staff' && type!=='expense'){toast('Staff can only log expenses — sales go through the DSR','error');return;}
   const amt=parseFloat(document.getElementById('m-amt')?.value||0);
   if(!amt||amt<=0){toast('Enter a valid amount','error');return}
   const note=document.getElementById('m-note')?.value||'';
@@ -5483,6 +5485,9 @@ function editTab(id){
 }
 
 function settleTab(id){
+  /* Settling moves money — manager-only. Defense in depth: the button is also
+     hidden from staff in pgTabs, but guard here so it can't be triggered. */
+  if(userRole==='staff'){toast('Settling a tab is manager-only','error');return;}
   // Opens the settlement modal so user can choose method
   const tab=tabs.find(t=>t.id===id);
   if(!tab)return;
@@ -6657,10 +6662,30 @@ ${(()=>{
    PAGE: TRANSACTIONS
 ═══════════════════════════════════════════════ */
 function pgTransactions(){
-  /* Staff role is read-only on this page — they can see all transactions but
-     can't edit/void/delete or post ad-hoc txs. Only the manager corrects past
-     entries. Page-level access is still allowed (set in STAFF_PAGES). */
   const isStaff=userRole==='staff';
+  /* STAFF VIEW — expenses only. Staff can LOG expenses and see ONLY the
+     expenses they personally logged (createdBy/handler === them). They cannot
+     see sales, transfers, payroll, or anyone else's entries — the full ledger
+     is manager-only. Early-return so none of the full-ledger code below runs
+     for staff. */
+  if(isStaff){
+    const myExpenses=[...transactions]
+      .filter(t=>t && !t.voided && t.type==='expense' && (t.createdBy===currentUser || t.handler===currentUser))
+      .sort((a,b)=>b.date.localeCompare(a.date))
+      .slice(0,60);
+    const sRows=myExpenses.length
+      ? myExpenses.map(t=>`<tr>
+          <td style="font-size:.76rem;white-space:nowrap;color:var(--muted)">${fmtDate(t.date)}</td>
+          <td><div style="font-weight:500">${esc(t.category)||'—'}</div>${t.note?`<div style="font-size:.72rem;color:var(--muted2)">${esc(t.note)}</div>`:''}</td>
+          <td style="font-size:.76rem;color:var(--muted2);max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(t.supplier||'')}">${esc(t.supplier||'')||'—'}</td>
+          <td style="text-align:right">${amountCell(t)}</td>
+          <td style="font-size:.72rem;color:${t.status==='unpaid'?'var(--amber)':'var(--muted2)'}">${t.status==='unpaid'?'On credit':'Paid'}</td>
+        </tr>`).join('')
+      : `<tr><td colspan="5" class="empty">No expenses logged yet. Tap "+ Log Expense" to add one.</td></tr>`;
+    return `<div class="page-header"><div class="page-hd-left"><div class="page-title">Log Expense</div><div class="page-sub">Record an expense — your entries appear below</div></div><button class="btn btn-primary btn-sm" onclick="openModal('expense')">+ Log Expense</button></div>
+    <div class="info-box" style="margin-bottom:10px;font-size:.78rem">Log expenses here. Sales go through the <b>DSR</b>. The full ledger and other transaction types are manager-only.</div>
+    <div class="card-flush"><div style="padding:9px 14px;border-bottom:1px solid var(--border)"><span class="sec-title">Your expense entries</span><span style="font-size:.71rem;color:var(--muted2);margin-left:8px">last ${myExpenses.length}</span></div><table><thead><tr><th>Date</th><th>Category / Note</th><th>Supplier</th><th style="text-align:right">Amount</th><th>Status</th></tr></thead><tbody>${sRows}</tbody></table></div>`;
+  }
   let f=[...transactions].filter(txInRange).sort((a,b)=>b.date.localeCompare(a.date));
   if(filters.type)f=f.filter(t=>t.type===filters.type);
   if(filters.dateFrom)f=f.filter(t=>t.date>=filters.dateFrom);
@@ -7554,7 +7579,15 @@ function pgDSR(){
   </tr>`).join('');
 
 
-  const isPosted=!!(dsrEntries[dsrDate]?.posted);
+  /* "Posted" = the flag OR the presence of live DSR ledger entries. The flag
+     lives in dsrEntries (blob); the postings live in transactions. A stale-tab
+     save can reset the flag to false while Phase 2 keeps/recovers the actual
+     postings — leaving the old code showing "Not posted" yet the post guard
+     (which checks live entries) refusing to re-post with "already posted".
+     Trusting the live entries fixes that desync: if the sales are in the
+     ledger, it IS posted — show Unpost so the user can cleanly reverse + repost. */
+  const _livePostings=getDSRPosted(dsrDate);
+  const isPosted=!!(dsrEntries[dsrDate]?.posted) || _livePostings.length>0;
   const postBtn=isPosted
     ?`<button class="btn btn-danger btn-sm" onclick="unpostDSR('${dsrDate}')">↩ Unpost</button>`
     :`<button class="btn btn-primary btn-sm" onclick="postDSRToLedger('${dsrDate}')">✓ Post to Ledger</button>`;
@@ -10954,6 +10987,7 @@ function navigate(page){
 ═══════════════════════════════════════════════ */
 
 function pgTabs(){
+  const isStaff=userRole==='staff'; // staff can view/edit tabs but not settle (moves money)
 
   const openTabs = tabs.filter(t =>
     !t.closed &&
@@ -10977,11 +11011,11 @@ function pgTabs(){
             onclick="editTab('${t.id}')">
             Edit
           </button>
-
+${isStaff?'':`
           <button class="btn btn-primary btn-sm"
             onclick="settleTab('${t.id}')">
             Settle
-          </button>
+          </button>`}
         </td>
       </tr>
     `).join('')
