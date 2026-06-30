@@ -399,26 +399,52 @@ async function api(payload){
   if(!scriptUrl)throw new Error('No URL');
   const data={...payload,pinHash};
   const action=payload.action||'';
+  const isGet=(action==='auth'||action==='load');
 
-  // For auth and load: GET with base64 param (small payload, safe)
-  if(action==='auth'||action==='load'){
-    const encoded=btoa(unescape(encodeURIComponent(JSON.stringify(data))));
-    const url=scriptUrl+(scriptUrl.includes('?')?'&':'?')+'d='+encodeURIComponent(encoded);
-    const res=await fetch(url,{redirect:'follow'});
-    if(!res.ok)throw new Error('HTTP '+res.status);
-    return res.json();
+  /* One attempt at the actual request.
+     - auth/load: GET with base64 param (small payload, no CORS preflight)
+     - save/reset: POST with text/plain body (no preflight, handles large payloads;
+       Apps Script reads it via e.postData.contents) */
+  const doFetch=()=>{
+    if(isGet){
+      const encoded=btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+      const url=scriptUrl+(scriptUrl.includes('?')?'&':'?')+'d='+encodeURIComponent(encoded);
+      return fetch(url,{redirect:'follow'});
+    }
+    return fetch(scriptUrl,{
+      method:'POST',
+      redirect:'follow',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body:JSON.stringify(data),
+    });
+  };
+
+  /* Retry with backoff. Apps Script does not return the result directly — it
+     302-redirects to a temporary script.googleusercontent.com/macros/echo URL
+     where the response is staged. When the script runs slowly that URL isn't
+     ready in time and the redirect 404s (or the network just blips). Every
+     action here is IDEMPOTENT — auth/load are reads; save is a full-state
+     overwrite + id-keyed row upsert + id-keyed tombstones; reset is a fixed
+     overwrite — so re-sending can never double-apply. Retry the transient
+     failures a few times before surfacing the error to the caller's catch.
+     Application-level errors (HTTP 200 with {ok:false}, e.g. Unauthorized) are
+     returned as-is and NOT retried — re-sending wouldn't change the outcome. */
+  const DELAYS=[600,1500,3500];   // 4 attempts total: try, then wait 600/1500/3500ms
+  let lastErr;
+  for(let attempt=0; attempt<=DELAYS.length; attempt++){
+    try{
+      const res=await doFetch();
+      if(!res.ok)throw new Error('HTTP '+res.status);
+      return await res.json();
+    }catch(e){
+      lastErr=e;
+      if(attempt<DELAYS.length){
+        await new Promise(r=>setTimeout(r,DELAYS[attempt]));
+        continue;
+      }
+    }
   }
-
-  // For save/reset: POST with text/plain body (no CORS preflight, handles large payloads)
-  // Apps Script reads the body as a POST parameter via e.postData.contents
-  const res=await fetch(scriptUrl,{
-    method:'POST',
-    redirect:'follow',
-    headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body:JSON.stringify(data),
-  });
-  if(!res.ok)throw new Error('HTTP '+res.status);
-  return res.json();
+  throw lastErr;
 }
 
 /* ═══════════════════════════════════════════════
