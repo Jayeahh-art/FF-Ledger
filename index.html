@@ -4160,13 +4160,17 @@ function normalizeTx(tx){
     toAccount:     tx.toAccount||null,                     // backward compat
     /* COA linkage */
     coaId:         tx.coaId||coaItem?.id||resolveLegacyCategory(tx.category)||null,
-    category:      tx.category||coaItem?.name||'',
+    category:      String(tx.category||coaItem?.name||''),  /* String-coerced — see note field below (numeric category from Sheets row-tab) */
     /* Payment */
     paymentMethod: tx.paymentMethod||null,
     /* Reference */
     reference:     tx.reference||null,
-    notes:         tx.notes||tx.note||'',
-    note:          tx.note||tx.notes||'',                  // backward compat
+    /* String()-coerced: a purely-numeric note ("12345") round-trips through
+       the Phase 2 Sheets row-tab as a NUMBER cell, coming back as a number.
+       Downstream code calls t.note.startsWith(DSR_TAG) — which throws on a
+       number. Coerce here so every loaded/created tx has a string note. */
+    notes:         String(tx.notes||tx.note||''),
+    note:          String(tx.note||tx.notes||''),          // backward compat
     /* People */
     createdBy:     tx.createdBy||tx.handler||currentUser||'system',
     handler:       tx.handler||tx.createdBy||currentUser,  // backward compat
@@ -4182,7 +4186,7 @@ function normalizeTx(tx){
     voidedBy:      tx.voidedBy||'',
     voidReason:    tx.voidReason||'',
     /* Enrichment */
-    supplier:      tx.supplier||'',
+    supplier:      String(tx.supplier||''),  /* String-coerced (numeric supplier from Sheets row-tab → would crash .toLowerCase in filters) */
     dueDate:       tx.dueDate||'',
     expenseType:   tx.expenseType||coaItem?.fixed_variable||'',
     department:    tx.department||coaItem?.department||'',
@@ -6888,7 +6892,7 @@ const DSR_TAG='[DSR]';   /* tag to identify DSR-generated transactions */
 const STAFF_PAGES=['dsr','tabs','transactions','cash'];
 
 function getDSRPosted(date){
-  return transactions.filter(t=>t.date===date&&t.note&&t.note.startsWith(DSR_TAG)&&!t.voided);
+  return transactions.filter(t=>t.date===date&&String(t.note||'').startsWith(DSR_TAG)&&!t.voided);
 }
 
 
@@ -7223,7 +7227,7 @@ function unpostDSR(date){
   const settledHere=(staffPayables||[]).some(p=>p&&p.date===date&&(p.type==='sc'||p.type==='tip')&&p.paidByPayrollRunId);
   if(settledHere && !confirm(`⚠ The SC/Tips for ${fmtDate(date)} were already distributed by a finalized payroll run.\n\nUnposting the DSR now will leave those settlements without their matching liability. Recommended: unfinalize that payroll first.\n\nContinue anyway?`))return;
   if(!confirm(`Remove ${existing.length} DSR transaction(s) for ${fmtDate(date)}?\n\nAccount balances will be reversed.`))return;
-  ledgerRemoveTransactions(t=>(t.date===date&&t.note&&t.note.startsWith(DSR_TAG)),'remove_dsr_batch');
+  ledgerRemoveTransactions(t=>(t.date===date&&String(t.note||'').startsWith(DSR_TAG)),'remove_dsr_batch');
   /* Remove DSR-generated staffPayables — filter by TYPE, not description.
      Bug fix (same one already applied to the no-live-txs recovery path above):
      descriptions are "SC — May 15, 2026" / "Tips — …", they never contain
@@ -7450,7 +7454,7 @@ function pgDSR(){
   const openTabsForDate=tabs.filter(t=>t.date===dsrDate&&t.status==='open');
   const foodTabAutoAmt=openTabsForDate.reduce((s,t)=>s+(t.amount||0),0);
   // Day expenses: from manually posted transactions (for reference)
-  const dayExpTx=transactions.filter(t=>t.date===dsrDate&&t.type==='expense'&&!t.voided&&!(t.note&&t.note.startsWith(DSR_TAG)));
+  const dayExpTx=transactions.filter(t=>t.date===dsrDate&&t.type==='expense'&&!t.voided&&!String(t.note||'').startsWith(DSR_TAG));
   const dayExpTotal=dayExpTx.reduce((s,t)=>s+t.amount,0);
   // Labor cost: full computed pay from shifts logged for this date (incl OT/ND/holiday)
   const dayShiftCost=dayLaborCostFromShifts(dsrDate);
@@ -11449,7 +11453,7 @@ function checkPostingIntegrity(){
   /* 5. Duplicate DSR batches — same date, same category, >1 live [DSR] sale */
   const dsrKey = {};
   liveTx.forEach(t=>{
-    if (t.type!=='sale' || !t.note || !t.note.startsWith(DSR_TAG)) return;
+    if (t.type!=='sale' || !String(t.note||'').startsWith(DSR_TAG)) return;
     const k = t.date+'|'+(t.category||'');
     (dsrKey[k] = dsrKey[k]||[]).push(t);
   });
