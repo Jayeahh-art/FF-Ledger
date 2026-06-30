@@ -4700,6 +4700,7 @@ const MT={
   /* forecastTargets:'Set Targets', — removed: targets now edited on Weekly Check */
   addPayrollAdj:'Add Payroll Adjustment',
   giveAdvance:'Give Cash Advance',
+  editAdvance:'Edit Cash Advance',
   backfillMonth:'Backfill Historical Month',
   payrollSettings:'Payroll Settings',
   finalizePayroll:'Finalize Payroll',
@@ -5068,12 +5069,37 @@ function renderModal(){
       <div class="form-group"><label>Cash From</label><select id="m-adv-acct">${acctOpts}</select></div>
       <div class="form-group"><label>Date</label><input id="m-adv-date" type="date" value="${today()}"></div>
     </div>
+    <div class="form-row">
+      <div class="form-group" style="grid-column:1/-1"><label>Repayment starts on/after <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0">· default = next payday · set later to skip this cutoff</span></label><input id="m-adv-start" type="date" value="${today()}"></div>
+    </div>
     <div class="form-group" style="margin-bottom:6px"><label>Note</label><input id="m-adv-note" placeholder="e.g. medical, emergency"></div>
-    <div class="info-box" style="margin-bottom:4px;font-size:.76rem">This is a loan, not an expense: cash leaves now and books to Employee Receivables. The "repay per payday" amount is auto-deducted from net pay each payroll until repaid. Leave blank to repay the full amount on the next payday.</div>
+    <div class="info-box" style="margin-bottom:4px;font-size:.76rem">This is a loan, not an expense: cash leaves now and books to Employee Receivables. The "repay per payday" amount is auto-deducted from net pay each payroll until repaid. To begin deductions a payday LATER, set "Repayment starts on/after" to a date past the current cutoff.</div>
     <div class="modal-footer">
       <button class="btn btn-primary" style="flex:1" onclick="submitGiveAdvance()">Give Advance</button>
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
     </div>`;
+
+  }else if(type==='editAdvance'){
+    const adv=(cashAdvances||[]).find(a=>a&&a.id===(data?.id||data));
+    if(!adv){ body=`<div class="warn-box">Advance not found — it may have been deleted or fully repaid.</div>`; }
+    else{
+      const emp=roster.find(r=>r.id===adv.employeeId);
+      const repaid=round2((adv.amount||0)-(adv.balance||0));
+      const pristine=repaid<=0.005;
+      body=`<div style="font-size:.82rem;color:var(--muted2);margin-bottom:10px">${esc(emp?.name||'Employee')} · advance of <b>${fmt(adv.amount)}</b> given ${fmtDate(adv.date)} · <b style="color:var(--amber)">${fmt(adv.balance)}</b> still owed</div>
+    ${!pristine?`<div class="info-box" style="margin-bottom:10px;font-size:.76rem">⚠ ${fmt(repaid)} already repaid. You can adjust the installment and start date here, but to change the advance AMOUNT, delete it and re-create (only possible before any repayment) — or unfinalize the payroll that deducted it.</div>`:''}
+    <div class="form-row">
+      <div class="form-group"><label>Repay per payday (₱)</label><input id="m-eadv-inst" type="number" step="0.01" min="0" value="${adv.installment||''}" placeholder="blank = full balance"></div>
+      <div class="form-group"><label>Repayment starts on/after</label><input id="m-eadv-start" type="date" value="${adv.repaymentStartDate||adv.date||''}"></div>
+    </div>
+    <div class="form-group" style="margin-bottom:6px"><label>Note</label><input id="m-eadv-note" value="${esc(adv.note||'')}"></div>
+    <div class="info-box" style="margin-bottom:4px;font-size:.74rem">Set "Repayment starts on/after" to a date AFTER the current cutoff to skip deducting this advance until the next payday.</div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" style="flex:1" onclick="saveEditAdvance('${adv.id}')">Save Changes</button>
+      ${pristine?`<button class="btn btn-danger" onclick="deleteCashAdvance('${adv.id}');closeModal()" title="Void the cash-out and remove this advance">Delete</button>`:''}
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+    </div>`;
+    }
 
   }else if(type==='backfillMonth'){
     /* One-shot aggregate backfill — posts one transaction per non-zero P&L line,
@@ -7976,64 +8002,81 @@ textarea{border:none;background:transparent;font-size:9.5px;width:100%;resize:no
    PAGE: CASH COUNT
 ═══════════════════════════════════════════════ */
 // pgCash defined below
+/* Helper — read the Expected-cash inputs. Expected = Float + Cash Sales +
+   Cash In − Cash Out. Cash Sales is a read-only field pre-filled from the
+   date's DSR; the others are editable. */
+function _readCashCountInputs(){
+  const num=id=>parseFloat(document.getElementById(id)?.value||0)||0;
+  const float   = num('cc-float');
+  const sales   = num('cc-sales');
+  const cashIn  = num('cc-cashin');
+  const cashOut = num('cc-cashout');
+  const expected = round2(float + sales + cashIn - cashOut);
+  return {float, sales, cashIn, cashOut, expected};
+}
+
 function updateCashTotal(){
   const denoms=[1000,500,200,100,50,20,10,5,1];
-  let total=0;
+  let counted=0;
   denoms.forEach(d=>{
     const qty=parseInt(document.getElementById('denom-'+d)?.value||0)||0;
     const sub=qty*d;
-    total+=sub;
+    counted+=sub;
     const el=document.getElementById('denom-sub-'+d);
     if(el)el.textContent=fmt(sub);
   });
-  document.getElementById('cash-total').textContent=fmt(total);
-  document.getElementById('counted-display').textContent=fmt(total);
-  const regBal=accounts.find(a=>a.id==='register')?.balance||0;
-  const diff=total-regBal;
+  const cd=document.getElementById('counted-display'); if(cd)cd.textContent=fmt(counted);
+  const {expected}=_readCashCountInputs();
+  const expEl=document.getElementById('cc-expected'); if(expEl)expEl.textContent=fmt(expected);
+  const diff=round2(counted-expected);
   const el=document.getElementById('overshort');
-  if(el){el.textContent=(diff===0?'Balanced':diff>0?'+'+fmt(diff)+' over':fmt(diff)+' short');el.style.color=diff===0?'var(--green)':diff>0?'var(--blue)':'var(--red)'}
+  if(el){
+    el.textContent=(Math.abs(diff)<0.005?'Balanced':diff>0?'+'+fmt(diff)+' over':fmt(diff)+' short');
+    el.style.color=Math.abs(diff)<0.005?'var(--green)':diff>0?'var(--blue)':'var(--red)';
+  }
 }
 
 function saveCashCount(){
-  /* Hotfix M5: actually persist the count to cashCounts[] so the existing
-     readers (getTreasuryReconciliation, ensureDailySnapshot, Cash page recent
-     table) can use it. Previously only logged to activity — readers always
-     saw an empty array, so the variance row was permanently zero. */
   const denoms=[1000,500,200,100,50,20,10,5,1];
-  let total=0;
+  let counted=0;
   const denominations={};
   denoms.forEach(d=>{
     const qty=parseInt(document.getElementById('denom-'+d)?.value||0)||0;
     denominations[d]=qty;
-    total+=qty*d;
+    counted+=qty*d;
   });
-  const regBal=accounts.find(a=>a.id==='register')?.balance||0;
-  const diff=total-regBal;
+  const {float,sales,cashIn,cashOut,expected}=_readCashCountInputs();
+  const diff=round2(counted-expected);
   const note=document.getElementById('cash-note')?.value||'';
-  const status=diff===0?'Balanced':diff>0?`Over by ${fmt(diff)}`:`Short by ${fmt(Math.abs(diff))}`;
-  const date=today();
+  const status=Math.abs(diff)<0.005?'Balanced':diff>0?`Over by ${fmt(diff)}`:`Short by ${fmt(Math.abs(diff))}`;
+  const date=document.getElementById('cc-date')?.value||window._cashCountDate||today();
+  if(isPeriodLocked(date)){toast('Accounting period locked for '+fmtDate(date),'error');return;}
   const record={
     id:uid(),
     date,
-    declared:regBal,       /* system register at count time */
-    counted:total,         /* physical count */
-    total,                 /* alias: getTreasuryReconciliation reads c.total */
-    diff,                  /* counted - declared */
+    /* Expected breakdown — the formula inputs, stored so re-opening the page
+       restores them and the recent table can show what each count was against. */
+    float, cashSales:sales, cashIn, cashOut,
+    expected,
+    declared:expected,     /* back-compat: old readers/table used 'declared' as the comparison base */
+    counted,               /* physical count */
+    total:counted,         /* getTreasuryReconciliation reads c.total = physical count — KEEP */
+    diff,                  /* counted − expected */
     note,
     status,
     denominations,
     countedBy:currentUser,
     countedAt:new Date().toISOString()
   };
-  /* Idempotent per-day: replace today's entry if one exists, else prepend. */
+  /* Idempotent per-day: replace that date's entry if one exists, else prepend. */
   const existingIdx=(cashCounts||[]).findIndex(c=>c&&c.date===date);
   if(existingIdx>=0){
     cashCounts[existingIdx]=record;
   }else{
     cashCounts=[record,...(cashCounts||[])];
   }
-  logActivity(`Cash count: Counted ${fmt(total)} · System ${fmt(regBal)} · ${status}${note?' · '+note:''}`);
-  scheduleSave();
+  logActivity(`Cash count ${fmtDate(date)}: Counted ${fmt(counted)} vs Expected ${fmt(expected)} (float ${fmt(float)} + sales ${fmt(sales)} + in ${fmt(cashIn)} − out ${fmt(cashOut)}) · ${status}${note?' · '+note:''}`);
+  scheduleSave();render();
   toast(`Reconciliation saved — ${status}`);
 }
 
@@ -8623,7 +8666,10 @@ function computePayroll(empId,from,to){
      It reduces net pay (cash handed out) and clears the receivable — gross/labor is
      untouched above. */
   const advanceBalance=employeeAdvanceBalance(empId);
-  const advanceRepayment=Math.min(employeeAdvanceInstallment(empId), advanceBalance);
+  /* Pass the cutoff end date so a deferred advance (repaymentStartDate after
+     this cutoff) contributes 0 to the scheduled installment — no deduction
+     until its start payday. */
+  const advanceRepayment=Math.min(employeeAdvanceInstallment(empId, to), advanceBalance);
   const netPay=round2(grossPay+scShare+tipShare-advanceRepayment);
   /* Resolve which account this employee's net pay comes out of for this period. */
   const payoutAccount=getEmployeePayoutAccount(empId,from,to);
@@ -8803,7 +8849,9 @@ function finalizePayroll({fromDate,toDate}){
     const rep=round2(r.advanceRepayment||0);
     if(rep<=0||!r.emp) return;
     const acct=r.payoutAccount||fallbackAcct;
-    const applied=applyAdvanceRepayment(r.emp.id, rep);
+    /* Pass toDate so the applied repayment hits the SAME eligible advances that
+       computePayroll scheduled — a deferred advance stays untouched. */
+    const applied=applyAdvanceRepayment(r.emp.id, rep, toDate);
     applied.forEach(x=>runObj.advanceRepayments.push({...x, employeeId:r.emp.id}));
     const actual=round2(applied.reduce((s,x)=>s+x.amount,0));
     if(actual>0 && acct) advByAcct[acct]=round2((advByAcct[acct]||0)+actual);
@@ -9074,13 +9122,24 @@ function submitPayrollAdj(){
 function employeeAdvanceBalance(empId){
   return round2((cashAdvances||[]).filter(a=>a&&a.employeeId===empId&&a.status!=='settled').reduce((s,a)=>s+(Number(a.balance)||0),0));
 }
-function employeeAdvanceInstallment(empId){
-  /* Amount scheduled to be deducted this payday = each open advance's installment,
-     capped at its remaining balance. */
-  return round2((cashAdvances||[]).filter(a=>a&&a.employeeId===empId&&a.status!=='settled'&&Number(a.balance)>0)
+/* Repayment-timing gate: an advance is eligible to be deducted in a cutoff only
+   once the cutoff's end date reaches its repaymentStartDate. Lets you defer an
+   advance to a LATER payday ("deduct next payroll, not this one"). Backward-
+   compatible: advances with no repaymentStartDate (everything created before
+   this feature) are always eligible — unchanged behavior. When cutoffToDate is
+   omitted (e.g. roster-card display), no gating is applied. */
+function _advanceEligible(a, cutoffToDate){
+  if(!cutoffToDate) return true;
+  if(!a || !a.repaymentStartDate) return true;
+  return a.repaymentStartDate <= cutoffToDate;
+}
+function employeeAdvanceInstallment(empId, cutoffToDate){
+  /* Amount scheduled to be deducted this payday = each ELIGIBLE open advance's
+     installment, capped at its remaining balance. */
+  return round2((cashAdvances||[]).filter(a=>a&&a.employeeId===empId&&a.status!=='settled'&&Number(a.balance)>0&&_advanceEligible(a,cutoffToDate))
     .reduce((s,a)=>s+Math.min(Number(a.installment)||Number(a.balance)||0, Number(a.balance)||0),0));
 }
-function giveAdvance({employeeId,amount,installment,account,date,note}){
+function giveAdvance({employeeId,amount,installment,account,date,note,repaymentStartDate}){
   const emp=roster.find(r=>r.id===employeeId);
   if(!emp){toast('Select an employee','error');return}
   const amt=round2(parseFloat(amount)||0);
@@ -9089,7 +9148,11 @@ function giveAdvance({employeeId,amount,installment,account,date,note}){
   const d=date||today();
   if(isPeriodLocked(d)){toast('Accounting period locked for '+fmtDate(d),'error');return}
   let inst=round2(parseFloat(installment)||0); if(inst<=0||inst>amt) inst=amt; // default/clamp: full repayment next payday
-  const adv={id:uid(),employeeId,date:d,amount:amt,balance:amt,installment:inst,account,note:note||'',status:'open',createdAt:new Date().toISOString(),createdBy:currentUser};
+  /* repaymentStartDate gates WHEN deductions begin. Default = the advance date,
+     i.e. eligible from the next payday (unchanged behavior). Set it later to
+     skip a cutoff. */
+  const startDate=repaymentStartDate||d;
+  const adv={id:uid(),employeeId,date:d,amount:amt,balance:amt,installment:inst,account,note:note||'',repaymentStartDate:startDate,status:'open',createdAt:new Date().toISOString(),createdBy:currentUser};
   cashAdvances=[adv,...cashAdvances];
   /* Cash leaves now, recorded as a withdrawal tagged to Employee Receivables (a1060,
      an asset) — debits cash but is NOT a labor/P&L expense. createLedgerTransaction
@@ -9105,7 +9168,8 @@ function submitGiveAdvance(){
     installment:document.getElementById('m-adv-inst')?.value,
     account:document.getElementById('m-adv-acct')?.value,
     date:document.getElementById('m-adv-date')?.value,
-    note:document.getElementById('m-adv-note')?.value
+    note:document.getElementById('m-adv-note')?.value,
+    repaymentStartDate:document.getElementById('m-adv-start')?.value
   });
 }
 /* ─── HISTORICAL AGGREGATE BACKFILL ───
@@ -9198,16 +9262,58 @@ function submitBackfillMonth(){
   closeModal();
   toast(`Backfilled ${monthKey} — ${txs.length} entries posted ✓`,'success');
 }
-/* deleteCashAdvance removed — UI was never wired. Advances get voided via
-   the cash-advance row's void button + unfinalize-payroll flow instead. */
+/* Delete a cash advance. Voids the cash-out withdrawal (returns the cash) and
+   removes the advance record. Guard: only allowed while PRISTINE (no repayments
+   applied yet, balance === original amount). If a payroll already deducted an
+   installment, unfinalize that run first — otherwise the books would desync.
+   Uses ledgerReplaceTransactions to void (the normal voidTransaction path is
+   intentionally blocked for advance-tagged txs; this is the sanctioned route). */
+function deleteCashAdvance(id){
+  const adv=(cashAdvances||[]).find(a=>a&&a.id===id);
+  if(!adv){toast('Advance not found','error');return}
+  if(round2(adv.balance)!==round2(adv.amount)){
+    toast(`This advance already has ${fmt(round2((adv.amount||0)-(adv.balance||0)))} in repayments — unfinalize the payroll that deducted it first, then delete`,'error');
+    return;
+  }
+  const emp=roster.find(r=>r.id===adv.employeeId);
+  const acctName=accounts.find(a=>a.id===adv.account)?.name||'the account';
+  if(!confirm(`Delete the ${fmt(adv.amount)} advance${emp?` to ${emp.name}`:''}?\n\nThis voids the cash-out entry and returns the cash to ${acctName}.`))return;
+  ledgerReplaceTransactions(
+    transactions.map(t=>(t&&t.advanceId===id&&!t.voided)
+      ? {...t,voided:true,voidedAt:new Date().toISOString(),voidedBy:currentUser,voidReason:'Cash advance deleted',modifiedAt:new Date().toISOString(),modifiedBy:currentUser}
+      : t),
+    'delete_advance'
+  );
+  cashAdvances=cashAdvances.filter(a=>a.id!==id);
+  logActivity(`Cash advance deleted: ${fmt(adv.amount)}${emp?' to '+emp.name:''} — cash returned to ${acctName}`);
+  scheduleSave();render();
+  toast('Advance deleted — cash returned ✓','success');
+}
+/* Edit a cash advance's installment, repayment-start date, and note. Amount and
+   account are NOT editable here (they're tied to the posted withdrawal tx) — to
+   change those, delete the advance and re-create it. */
+function saveEditAdvance(id){
+  const adv=(cashAdvances||[]).find(a=>a&&a.id===id);
+  if(!adv){toast('Advance not found','error');return}
+  const instRaw=round2(parseFloat(document.getElementById('m-eadv-inst')?.value||0)||0);
+  const inst=instRaw>0?instRaw:round2(adv.balance||adv.amount||0); // blank/0 = full balance next eligible payday
+  const start=document.getElementById('m-eadv-start')?.value||adv.repaymentStartDate||adv.date||'';
+  const note=document.getElementById('m-eadv-note')?.value||'';
+  cashAdvances=cashAdvances.map(a=>a.id===id?{...a,installment:inst,repaymentStartDate:start,note}:a);
+  const emp=roster.find(r=>r.id===adv.employeeId);
+  logActivity(`Cash advance edited${emp?' ('+emp.name+')':''}: installment ${fmt(inst)}/payday · starts ${start?fmtDate(start):'next payday'}`);
+  scheduleSave();render();closeModal();
+  toast('Advance updated ✓');
+}
 /* Apply an employee's scheduled installment against their open advances (oldest
    first). Returns the list of {advanceId, amount} actually applied. Mutates balances. */
-function applyAdvanceRepayment(empId,totalRepay){
+function applyAdvanceRepayment(empId,totalRepay,cutoffToDate){
   let remaining=round2(totalRepay);
   const applied=[];
   if(remaining<=0) return applied;
-  /* oldest first */
-  const open=(cashAdvances||[]).filter(a=>a&&a.employeeId===empId&&a.status!=='settled'&&Number(a.balance)>0)
+  /* oldest first — and only ELIGIBLE advances (repaymentStartDate reached). A
+     deferred advance is skipped so the deduction lands on the intended payday. */
+  const open=(cashAdvances||[]).filter(a=>a&&a.employeeId===empId&&a.status!=='settled'&&Number(a.balance)>0&&_advanceEligible(a,cutoffToDate))
     .sort((a,b)=>(a.date||'').localeCompare(b.date||''));
   for(const a of open){
     if(remaining<=0) break;
@@ -9997,7 +10103,20 @@ function renderRosterTab(){
         <div style="font-weight:600;font-size:.87rem;display:flex;align-items:center;gap:6px;flex-wrap:wrap">${esc(e.name)}${e.employeeNo?` <span style="font-size:.68rem;color:var(--muted2);font-weight:400">#${esc(e.employeeNo)}</span>`:''} ${deptBadge(dept)}</div>
         <div style="font-size:.7rem;color:var(--muted2)">${esc(e.position||'—')}${e.station?' · '+esc(e.station):''} · <span style="color:${etc}">${(e.employmentType||'regular').replace(/_/g,' ')}</span></div>
         <div style="font-size:.68rem;color:var(--muted2)">Rest: ${e.restDay||'Sun'} · ${e.scEligible===false?'No SC':'SC ✓'} · ${e.tipsEligible===false?'No tips':'tips ✓'} · ${shifts.filter(s=>s.employeeId===e.id).length} shifts</div>
-        ${employeeAdvanceBalance(e.id)>0?`<div style="font-size:.68rem;color:var(--amber);font-weight:600;margin-top:2px">Advance owed: ${fmt(employeeAdvanceBalance(e.id))} · ${fmt(employeeAdvanceInstallment(e.id))}/payday</div>`:''}
+        ${(()=>{
+          /* Per-advance rows (an employee can hold more than one). Each shows
+             balance, installment, deferred-start (if any), + edit/delete. */
+          const advs=(cashAdvances||[]).filter(a=>a&&a.employeeId===e.id&&a.status!=='settled'&&Number(a.balance)>0);
+          if(!advs.length) return '';
+          return advs.map(a=>{
+            const deferred = a.repaymentStartDate && a.repaymentStartDate>today();
+            return `<div style="font-size:.68rem;color:var(--amber);font-weight:600;margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
+              <span>Advance: ${fmt(a.balance)} owed · ${fmt(a.installment||a.balance)}/payday${deferred?` · <span style="color:var(--muted2)">starts ${fmtDate(a.repaymentStartDate)}</span>`:''}</span>
+              <button class="btn btn-ghost btn-xs" style="padding:0 5px;font-size:.62rem;line-height:1.6" onclick="openModal('editAdvance',{id:'${a.id}'})" title="Edit installment / start date">✎</button>
+              <button class="row-btn del" style="font-size:.72rem" onclick="deleteCashAdvance('${a.id}')" title="Delete advance (returns the cash)">✕</button>
+            </div>`;
+          }).join('');
+        })()}
       </div>
       <div style="text-align:right">
         <div class="mono" style="font-size:.88rem;font-weight:500;color:var(--green)">${fmt(e.dailyRate)}/day</div>
@@ -10984,47 +11103,57 @@ function pgTabs(){
 ═══════════════════════════════════════════════ */
 function pgCash(){
 
-  const regBal=accounts.find(a=>a.id==='register')?.balance||0;
+  /* Date being reconciled — defaults to today, user can pick a past day.
+     The opening float and cash sales are pulled from THAT date's DSR. */
+  const ccDate = window._cashCountDate || today();
+  const e = (dsrEntries||{})[ccDate] || {};
 
-  /* dsrEntries is keyed by date string (e.g., dsrEntries['2025-05-15']={...}),
-     and the entry VALUES don't carry a .date field — saveDSRField stores fields
-     only. The old code sorted entry values by undefined .date, returning an
-     unstable "latest" that defaulted to whichever was enumerated first. Pick the
-     latest by sorting the KEYS instead. */
-  const latestKey=Object.keys(dsrEntries||{}).sort().reverse()[0];
-  const latestDSR=latestKey?dsrEntries[latestKey]:null;
+  /* Expected Cash on Hand = Opening Float + Cash Sales + Cash In − Cash Out.
+       · Float    = that day's DSR Starting Cash (the change fund the drawer
+                    opened with). Editable in case the DSR float wasn't set.
+       · Sales    = that day's DSR cash collections (Neutron + Loyverse cash).
+       · Cash In  = non-sales cash received that day (owner top-up, returns).
+       · Cash Out = cash paid out / banked mid-day.
+     Over/Short = Physical Count − Expected. */
+  const dsrFloat = (parseFloat(e.nStartCash||0)||0) + (parseFloat(e.lStartCash||0)||0);
+  const dsrCashSales = (parseFloat(e.nCash||0)||0) + (parseFloat(e.lCash||0)||0);
 
-  /* Compute "DSR Declared Cash" as the total cash collections (Neutron + Lunch
-     shift cash) from the latest posted DSR, not a never-set `cashReading`
-     field. The previous fallback chain always resolved to regBal because
-     latestDSR.cashReading and latestDSR.cash were both undefined — making this
-     card display the same number as Register Balance always. */
-  const dsrCashFromShifts = latestDSR
-    ? (parseFloat(latestDSR.nCash||0)||0) + (parseFloat(latestDSR.lCash||0)||0)
-    : 0;
-  const declaredCash = dsrCashFromShifts || regBal || 0;
+  /* Pre-fill from an existing saved count for this date (so re-opening the page
+     restores what you entered), else default float from DSR, in/out = 0. */
+  const existing = (cashCounts||[]).find(c=>c&&c.date===ccDate);
+  const floatVal   = existing ? (Number(existing.float)||0)   : dsrFloat;
+  const cashInVal  = existing ? (Number(existing.cashIn)||0)  : 0;
+  const cashOutVal = existing ? (Number(existing.cashOut)||0) : 0;
 
   const recent=(cashCounts||[]).slice(0,8);
 
   const recentRows=recent.length
-    ? recent.map(c=>`
+    ? recent.map(c=>{
+        /* Old records used .declared as the base; new ones use .expected. */
+        const exp = (c.expected!=null) ? c.expected : (c.declared||0);
+        return `
       <tr>
         <td>${fmtDate(c.date)}</td>
-        <td style="text-align:right">${fmt(c.declared)}</td>
+        <td style="text-align:right">${fmt(exp)}</td>
         <td style="text-align:right">${fmt(c.counted)}</td>
-        <td style="text-align:right;color:${c.diff===0?'var(--green)':c.diff>0?'var(--blue)':'var(--red)'}">
+        <td style="text-align:right;color:${Math.abs(c.diff||0)<0.005?'var(--green)':c.diff>0?'var(--blue)':'var(--red)'}">
           ${c.diff>0?'+':''}${fmt(c.diff)}
         </td>
         <td>${esc(c.note||'-')}</td>
-      </tr>
-    `).join('')
+      </tr>`;
+      }).join('')
     : `<tr><td colspan="5" class="muted">No cash counts recorded</td></tr>`;
 
   return `
     <div class="page-header">
       <div class="page-hd-left">
         <div class="page-title">Cash Count</div>
-        <div class="page-sub">Daily reconciliation against DSR cash declaration</div>
+        <div class="page-sub">Float + Cash Sales + Cash In − Cash Out = Expected · then count the drawer</div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <span style="font-size:.72rem;color:var(--muted2)">Date:</span>
+        <input id="cc-date" type="date" value="${ccDate}" onchange="window._cashCountDate=this.value;renderMain()" style="font-size:.8rem;padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg)">
+        ${ccDate!==today()?`<button class="btn btn-ghost btn-xs" onclick="window._cashCountDate=null;renderMain()">↺ Today</button>`:''}
       </div>
     </div>
 
@@ -11036,19 +11165,35 @@ function pgCash(){
           <span class="sec-title">Cash Reconciliation</span>
         </div>
 
-        <div class="g2" style="margin-bottom:14px">
-
-          <div>
-            <div class="stat-label">DSR Declared Cash</div>
-            <div class="stat-value">${fmt(declaredCash)}</div>
+        <!-- Expected-cash builder. Each field feeds updateCashTotal() which
+             live-recomputes Expected and Over/Short as you type. Cash Sales is
+             read-only (pulled from the date's DSR); the rest are editable. -->
+        <div style="background:var(--bg3);border-radius:8px;padding:12px 14px;margin-bottom:14px">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 18px">
+            <div class="form-group">
+              <label>Opening Cash Fund (Float)</label>
+              <input id="cc-float" type="number" step="0.01" value="${floatVal}" oninput="updateCashTotal()" style="font-family:var(--fm)">
+            </div>
+            <div class="form-group">
+              <label>Cash Sales <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0">· from DSR ${fmtDate(ccDate)}</span></label>
+              <input id="cc-sales" type="number" value="${round2(dsrCashSales)}" readonly style="font-family:var(--fm);background:var(--bg2);color:var(--muted)">
+            </div>
+            <div class="form-group">
+              <label>+ Cash In <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0">· non-sales receipts</span></label>
+              <input id="cc-cashin" type="number" step="0.01" value="${cashInVal}" oninput="updateCashTotal()" style="font-family:var(--fm)">
+            </div>
+            <div class="form-group">
+              <label>− Cash Out <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0">· payouts / banked</span></label>
+              <input id="cc-cashout" type="number" step="0.01" value="${cashOutVal}" oninput="updateCashTotal()" style="font-family:var(--fm)">
+            </div>
           </div>
-
-          <div>
-            <div class="stat-label">Register Balance</div>
-            <div class="stat-value">${fmt(regBal)}</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+            <span style="font-size:.82rem;font-weight:600;color:var(--muted)">= Expected Cash on Hand</span>
+            <span class="mono" id="cc-expected" style="font-size:1.15rem;font-weight:700;color:var(--blue)">${fmt(round2(floatVal+dsrCashSales+cashInVal-cashOutVal))}</span>
           </div>
-
         </div>
+
+        <div style="font-size:.74rem;color:var(--muted2);margin-bottom:8px">Now count the physical drawer:</div>
 
         <div style="overflow-x:auto">
           <table>
@@ -11081,27 +11226,16 @@ function pgCash(){
           </table>
         </div>
 
-        <div class="g3" style="margin-top:14px">
+        <div class="g2" style="margin-top:14px">
 
           <div class="card">
-            <div class="stat-label">Counted Cash</div>
+            <div class="stat-label">Counted Cash (physical)</div>
             <div class="stat-value" id="counted-display">${fmt(0)}</div>
           </div>
 
           <div class="card">
-            <div class="stat-label">Over / Short</div>
+            <div class="stat-label">Over / Short <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0">· Counted − Expected</span></div>
             <div class="stat-value" id="overshort">Balanced</div>
-          </div>
-
-          <div class="card">
-            <div class="stat-label">Declared Reference</div>
-            <input
-              id="declared-cash"
-              type="number"
-              value="${declaredCash}"
-              oninput="updateCashTotal()"
-              style="margin-top:10px"
-            >
           </div>
 
         </div>
@@ -11133,7 +11267,7 @@ function pgCash(){
           <thead>
             <tr>
               <th>Date</th>
-              <th style="text-align:right">Declared</th>
+              <th style="text-align:right">Expected</th>
               <th style="text-align:right">Counted</th>
               <th style="text-align:right">Variance</th>
               <th>Notes</th>
