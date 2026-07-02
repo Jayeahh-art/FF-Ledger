@@ -474,28 +474,62 @@ function collectState(){
    session, so we don't spam the user with toasts on every change after the
    quota first fills up. The console log fires every time for debug visibility. */
 let _localCacheFailedOnce=false;
+/* Sticky trim level — once a slimmer level was needed, start there next time
+   instead of re-paying a failed full-size JSON.stringify+setItem on every
+   change (each attempt is ~50-200ms at this data size). Resets only on reload;
+   if quota frees up (e.g. old data cleared), a reload restores full caching. */
+let _cacheTrimSticky=0;
 function writeLocalCache(){
   /* Phase 2: persist pending tombstones/full-replace alongside the state so
      "unpost DSR → save fails → tab closes" doesn't lose the row-deletion
      intent. recoverUnsyncedCache restores them into the session and the
      re-push carries them to the server. */
-  try{ localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify({savedAt:Date.now(),synced:false,state:collectState(),removedTxIds:(typeof _removedTxIds!=='undefined'&&_removedTxIds.length)?_removedTxIds:undefined,txFullReplace:(typeof _txFullReplaceOnce!=='undefined'&&_txFullReplaceOnce)||undefined})); }
-  catch(e){
-    /* quota exceeded — remote sync remains the safety net, but surface the
-       failure so a power user / developer can see that the cache safety net
-       isn't catching changes. One toast per session to avoid spam. */
-    console.warn('writeLocalCache failed (likely localStorage quota) — remote sync is still active:',e?.message||e);
-    if(!_localCacheFailedOnce){
-      _localCacheFailedOnce=true;
-      try{ toast('Local backup cache full — server sync still works but offline recovery is degraded','error'); }catch(_){}
-    }
+  const meta={savedAt:Date.now(),synced:false,removedTxIds:(typeof _removedTxIds!=='undefined'&&_removedTxIds.length)?_removedTxIds:undefined,txFullReplace:(typeof _txFullReplaceOnce!=='undefined'&&_txFullReplaceOnce)||undefined};
+  /* Progressive trim when the ~5MB localStorage quota bites. Each level DELETES
+     keys from the cached copy only (never from live state or the server save):
+       1: drop recomputable metrics + forecast snapshots (rebuilt from txs /
+          re-persisted by DSR posting; server copy survives regardless)
+       2: also drop activity/audit logs (append-heavy; server copy survives)
+     A dropped key is simply ABSENT from cache.state — recoverUnsyncedCache
+     only assigns keys that are present, so a trimmed recovery keeps the
+     server-loaded copy of whatever was dropped. Losing metrics/log lines from
+     the crash window is acceptable; losing transactions is not — they're in
+     every level. */
+  const trims=[
+    s=>s,
+    s=>{delete s.dailyMetrics;delete s.weeklyMetrics;delete s.monthlyMetrics;delete s.forecastSnapshots;return s;},
+    s=>{delete s.dailyMetrics;delete s.weeklyMetrics;delete s.monthlyMetrics;delete s.forecastSnapshots;delete s.activityLog;delete s.auditLog;return s;}
+  ];
+  for(let i=_cacheTrimSticky;i<trims.length;i++){
+    try{
+      localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify({...meta,trimmed:i>0?i:undefined,state:trims[i](collectState())}));
+      _cacheTrimSticky=i;
+      return;
+    }catch(e){ /* quota — fall through to the next slimmer level */ }
+  }
+  _cacheTrimSticky=trims.length-1;   // all failed — retry only the slimmest next change
+  /* Even the slimmest write failed. REMOVE the old cache rather than leave it:
+     a stale local backup is worse than none — it predates the changes that
+     couldn't be written, so the next load would offer to "restore" old data
+     over newer server state (and push it). Remote sync remains the safety net. */
+  try{ localStorage.removeItem(LEDGER_CACHE_KEY); }catch(e){}
+  console.warn('writeLocalCache failed at every trim level (localStorage quota) — stale cache removed, remote sync still active');
+  if(!_localCacheFailedOnce){
+    _localCacheFailedOnce=true;
+    try{ toast('Local backup cache full — server sync still works but offline recovery is degraded','error'); }catch(_){}
   }
 }
 function markCacheSynced(){
   try{
     const raw=localStorage.getItem(LEDGER_CACHE_KEY);
     if(raw){const c=JSON.parse(raw);c.synced=true;localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify(c));}
-  }catch(e){}
+  }catch(e){
+    /* Couldn't flag it synced (quota edge / corrupt JSON). The server just
+       confirmed this save, so the cache is redundant — remove it rather than
+       leave a copy that still LOOKS unsynced and would trigger a bogus
+       "restore unsynced changes?" prompt on the next load. */
+    try{ localStorage.removeItem(LEDGER_CACHE_KEY); }catch(_){}
+  }
 }
 /* ── EXPENSE MODAL VAT-MODE HELPERS ──
    For bulk receipt entry where vendors hand you a gross total without breaking
@@ -803,12 +837,23 @@ function recoverUnsyncedCache(){
   try{cache=JSON.parse(localStorage.getItem(LEDGER_CACHE_KEY)||'null');}catch(e){return}
   if(!cache||cache.synced||!cache.state)return;
   const when=new Date(cache.savedAt).toLocaleString();
-  if(!confirm(`Unsynced changes from your last session (${when}) were found.\n\nOK = restore your local changes\nCancel = discard them and keep the server copy`)){
+  /* Age warning — an old unsynced cache usually means it's STALE (quota kept
+     newer writes out, or the tab sat closed for days), not that days of work
+     are waiting in it. Restoring an old one overwrites everything entered
+     since (transactions merge-protect on the server; other data does not). */
+  const _ageMs=Date.now()-(cache.savedAt||0);
+  const _ageWarn=_ageMs>36e5
+    ? `\n\n⚠ CAREFUL — this backup is ${_ageMs>864e5?Math.round(_ageMs/864e5)+' day(s)':Math.round(_ageMs/36e5)+' hour(s)'} old. Restoring will overwrite anything entered since then. If you're not sure, choose Cancel (keep the server copy).`
+    : '';
+  if(!confirm(`Unsynced changes from your last session (${when}) were found.${_ageWarn}\n\nOK = restore your local changes\nCancel = discard them and keep the server copy`)){
     markCacheSynced();           // user discarded — don't ask again
     return;
   }
   const s=cache.state;
-  accounts=s.accounts; transactions=s.transactions; coa=s.coa; activityLog=s.activityLog;
+  /* activityLog/auditLog may be ABSENT from a quota-trimmed cache (see
+     writeLocalCache trim levels) — keep the server-loaded copies then. */
+  accounts=s.accounts; transactions=s.transactions; coa=s.coa;
+  if(Array.isArray(s.activityLog)) activityLog=s.activityLog;
   tabs=s.tabs; staffPayables=s.staffPayables; dsrEntries=s.dsrEntries; roster=s.roster;
   shifts=s.shifts; holidays=s.holidays; payables=s.payables;
   if(s.kpiTargets)kpiTargets=s.kpiTargets;
@@ -817,7 +862,8 @@ function recoverUnsyncedCache(){
   if(s.monthlyBudget)monthlyBudget=s.monthlyBudget;
   payrollAdjustments=s.payrollAdjustments; payrollRuns=s.payrollRuns; payrollPools=s.payrollPools;
   if(Array.isArray(s.cashAdvances)) cashAdvances=s.cashAdvances;
-  auditLog=s.auditLog; periodLocks=s.periodLocks; openingCashState=s.openingCashState;
+  if(Array.isArray(s.auditLog)) auditLog=s.auditLog;
+  periodLocks=s.periodLocks; openingCashState=s.openingCashState;
   cashVarianceHistory=s.cashVarianceHistory; monthlyOpeningBalances=s.monthlyOpeningBalances;
   treasuryEvents=s.treasuryEvents; positions=s.positions; cashCounts=s.cashCounts;
   if(Array.isArray(s.dailyMetrics))    dailyMetrics=s.dailyMetrics;
@@ -11590,21 +11636,27 @@ function pgSystemHealth(){
       return badge ? badge.textContent : 'unknown';
     })(),
     'Apps Script URL': scriptUrl || '(not configured)',
+    /* Bug fix: these two used to read 'ledger_cache_v2' / '_writtenAt' — a key
+       and field that never existed (cache lives under LEDGER_CACHE_KEY with
+       'savedAt'). They reported "(no cache)" / 0 KB forever, which masked the
+       localStorage-quota failure until the user hit the toast. */
     'Local cache last write': (()=>{
       try{
-        const ls = localStorage.getItem('ledger_cache_v2');
+        const ls = localStorage.getItem(LEDGER_CACHE_KEY);
         if (!ls) return '(no cache)';
         try{
           const parsed = JSON.parse(ls);
-          return parsed._writtenAt ? new Date(parsed._writtenAt).toLocaleString() : '(no timestamp)';
+          const when = parsed.savedAt ? new Date(parsed.savedAt).toLocaleString() : '(no timestamp)';
+          const flags = (parsed.synced?' · synced':' · UNSYNCED')+(parsed.trimmed?(' · trimmed L'+parsed.trimmed):'');
+          return when+flags;
         }catch(e){ return '(unparseable)'; }
       }catch(e){ return '(localStorage blocked)'; }
     })(),
     'Local cache size': (()=>{
       try{
-        const ls = localStorage.getItem('ledger_cache_v2');
-        if (!ls) return '0 KB';
-        return Math.round(ls.length/1024) + ' KB';
+        const ls = localStorage.getItem(LEDGER_CACHE_KEY);
+        if (!ls) return '0 KB (no cache — quota full or never written)';
+        return Math.round(ls.length/1024) + ' KB (browser limit ≈ 5,120 KB)';
       }catch(e){ return 'n/a'; }
     })(),
     /* Phase 2 safety net — what the blob∪rows merge did on the last load.
