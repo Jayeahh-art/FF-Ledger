@@ -11188,6 +11188,12 @@ function pgCash(){
   const floatVal   = existing ? (Number(existing.float)||0)   : dsrFloat;
   const cashInVal  = existing ? (Number(existing.cashIn)||0)  : 0;
   const cashOutVal = existing ? (Number(existing.cashOut)||0) : 0;
+  /* Restore the physical count too, so re-opening a saved date shows exactly
+     what was counted (denomination breakdown + note) instead of a blank drawer.
+     updateCashTotal() is called after render to recompute subtotals/over-short
+     from these pre-filled inputs. */
+  const savedDenoms = (existing && existing.denominations) ? existing.denominations : null;
+  const savedNote   = existing ? (existing.note||'') : '';
 
   const recent=(cashCounts||[]).slice(0,8);
 
@@ -11195,9 +11201,10 @@ function pgCash(){
     ? recent.map(c=>{
         /* Old records used .declared as the base; new ones use .expected. */
         const exp = (c.expected!=null) ? c.expected : (c.declared||0);
+        const isViewing = c.date===ccDate;
         return `
-      <tr>
-        <td>${fmtDate(c.date)}</td>
+      <tr onclick="window._cashCountDate='${c.date}';renderMain()" style="cursor:pointer;${isViewing?'background:var(--bg3)':''}" title="Open this count">
+        <td>${fmtDate(c.date)}${isViewing?' <span style="color:var(--blue);font-size:.7rem">● viewing</span>':''}</td>
         <td style="text-align:right">${fmt(exp)}</td>
         <td style="text-align:right">${fmt(c.counted)}</td>
         <td style="text-align:right;color:${Math.abs(c.diff||0)<0.005?'var(--green)':c.diff>0?'var(--blue)':'var(--red)'}">
@@ -11211,8 +11218,8 @@ function pgCash(){
   return `
     <div class="page-header">
       <div class="page-hd-left">
-        <div class="page-title">Cash Count</div>
-        <div class="page-sub">Float + Cash Sales + Cash In − Cash Out = Expected · then count the drawer</div>
+        <div class="page-title">Cash Count${existing?` <span style="font-size:.68rem;font-weight:600;color:var(--blue);background:var(--bg3);padding:2px 8px;border-radius:10px;vertical-align:middle">✓ saved ${existing.countedBy?('· '+esc(existing.countedBy)):''}</span>`:''}</div>
+        <div class="page-sub">Float + Cash Sales + Cash In − Cash Out = Expected · then count the drawer${existing?' · showing a saved count — edit & re-save to update it':''}</div>
       </div>
       <div style="display:flex;gap:6px;align-items:center">
         <span style="font-size:.72rem;color:var(--muted2)">Date:</span>
@@ -11270,7 +11277,9 @@ function pgCash(){
             </thead>
 
             <tbody>
-              ${[1000,500,200,100,50,20,10,5,1].map(d=>`
+              ${[1000,500,200,100,50,20,10,5,1].map(d=>{
+                const q=savedDenoms?(Number(savedDenoms[d])||0):0;
+                return `
                 <tr>
                   <td>${d}</td>
                   <td style="text-align:right">
@@ -11278,14 +11287,14 @@ function pgCash(){
                       id="denom-${d}"
                       type="number"
                       min="0"
-                      value="0"
+                      value="${q}"
                       oninput="updateCashTotal()"
                       style="width:90px;text-align:right"
                     >
                   </td>
-                  <td id="denom-sub-${d}" style="text-align:right">${fmt(0)}</td>
+                  <td id="denom-sub-${d}" style="text-align:right">${fmt(q*d)}</td>
                 </tr>
-              `).join('')}
+              `;}).join('')}
             </tbody>
           </table>
         </div>
@@ -11310,7 +11319,7 @@ function pgCash(){
             id="cash-note"
             placeholder="Explain overage, shortage, missing receipts, change fund adjustments, etc."
             style="width:100%;min-height:70px;margin-top:6px"
-          ></textarea>
+          >${esc(savedNote)}</textarea>
         </div>
 
         <div style="margin-top:14px">
@@ -11730,6 +11739,10 @@ function pgSystemHealth(){
 function renderMain(){
   const map={dashboard:pgDashboard,tabs:pgTabs,transactions:pgTransactions,funds:pgFunds,weekly:pgWeeklyCheck,payables:pgPayables,coa:pgCOA,dsr:pgDSR,cash:(typeof pgCash==='function'?pgCash:()=>'<div class="card">Cash module unavailable</div>'),labor:pgLabor,reports:pgReports,activity:pgActivity,forecast:pgForecast,treasury:pgCashPosition,cashposition:pgCashPosition,system:pgSystemHealth};
   document.getElementById('main').innerHTML=(map[currentPage]||pgDashboard)();
+  /* Cash Count pre-fills the drawer from a saved count via input values; run the
+     recompute once so subtotals, Counted and Over/Short reflect them on load
+     (they're otherwise only recomputed on the next keystroke). */
+  if(currentPage==='cash' && typeof updateCashTotal==='function'){ try{ updateCashTotal(); }catch(e){} }
 }
 
 /* Re-render that preserves focus + cursor position on the currently-focused
