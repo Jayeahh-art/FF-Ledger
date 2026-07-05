@@ -11643,10 +11643,36 @@ function checkPostingIntegrity(){
     }
   });
 
+  /* 7. Linked Input VAT pair sync — every live VAT half must have a live
+     parent expense with the SAME paid/unpaid status. Pay/void flows flip the
+     pair together, so a mismatch means old/backfilled data or a manual edit.
+     Why it matters: an unpaid VAT half whose parent is already paid silently
+     inflates the Cash Position "accrued" obligations (which count unpaid
+     withdrawals) — and the reverse understates them. */
+  let vatPairsChecked = 0;
+  const stOf = x => x.status==='unpaid' ? 'unpaid' : 'paid';
+  liveTx.forEach(t=>{
+    if (t.type!=='withdrawal' || !t.linkedTxId) return;
+    if (!(t.coaId==='a1080' || t.category==='Input VAT')) return;
+    vatPairsChecked++;
+    const parent = (transactions||[]).find(x=>x && x.id===t.linkedTxId);
+    const label = `${fmtDate(t.date)} · ${fmt(Number(t.amount)||0)} VAT (${(t.note||'').replace(/^Input VAT — /,'')||'no note'})`;
+    if (!parent){
+      issues.push({level:'bad', check:'Orphaned Input VAT half',
+        detail:`${label} — its parent expense no longer exists. The VAT is on the books with no bill behind it. Void this VAT tx (Transactions page) if the expense was legitimately removed.`});
+    } else if (parent.voided){
+      issues.push({level:'bad', check:'Orphaned Input VAT half',
+        detail:`${label} — its parent expense is VOIDED but the VAT half is still live. Voiding normally takes both; void this VAT tx to match.`});
+    } else if (stOf(parent)!==stOf(t)){
+      issues.push({level:'warn', check:'VAT pair status mismatch',
+        detail:`${label} — VAT half is ${stOf(t).toUpperCase()} but its parent expense (${parent.category||'expense'}, ${fmt(Number(parent.amount)||0)}) is ${stOf(parent).toUpperCase()}. ${stOf(t)==='unpaid'?'This inflates Cash Position accrued obligations by the VAT amount.':'This understates accrued obligations by the VAT amount.'} Fix: mark both to the same status.`});
+    }
+  });
+
   return {
     ranAt: new Date().toISOString(),
     issues,
-    counts: { liveTx: liveTx.length, runs: runs.length, dsrDates: Object.keys(dsrKey).length }
+    counts: { liveTx: liveTx.length, runs: runs.length, dsrDates: Object.keys(dsrKey).length, vatPairs: vatPairsChecked }
   };
 }
 
