@@ -500,9 +500,12 @@ function writeLocalCache(){
     s=>{delete s.dailyMetrics;delete s.weeklyMetrics;delete s.monthlyMetrics;delete s.forecastSnapshots;return s;},
     s=>{delete s.dailyMetrics;delete s.weeklyMetrics;delete s.monthlyMetrics;delete s.forecastSnapshots;delete s.activityLog;delete s.auditLog;return s;}
   ];
+  let _lastTriedKB=0;   // size of the last (slimmest) attempt, for the failure report
   for(let i=_cacheTrimSticky;i<trims.length;i++){
     try{
-      localStorage.setItem(LEDGER_CACHE_KEY,JSON.stringify({...meta,trimmed:i>0?i:undefined,state:trims[i](collectState())}));
+      const body=JSON.stringify({...meta,trimmed:i>0?i:undefined,state:trims[i](collectState())});
+      _lastTriedKB=Math.round(body.length*2/1024);   // ×2: browsers count localStorage in UTF-16 bytes
+      localStorage.setItem(LEDGER_CACHE_KEY,body);
       _cacheTrimSticky=i;
       return;
     }catch(e){ /* quota — fall through to the next slimmer level */ }
@@ -513,10 +516,13 @@ function writeLocalCache(){
      couldn't be written, so the next load would offer to "restore" old data
      over newer server state (and push it). Remote sync remains the safety net. */
   try{ localStorage.removeItem(LEDGER_CACHE_KEY); }catch(e){}
-  console.warn('writeLocalCache failed at every trim level (localStorage quota) — stale cache removed, remote sync still active');
+  console.warn('writeLocalCache: even slimmest level failed ('+_lastTriedKB+' KB vs ~5,120 KB quota) — stale cache removed, remote sync still active');
   if(!_localCacheFailedOnce){
     _localCacheFailedOnce=true;
-    try{ toast('Local backup cache full — server sync still works but offline recovery is degraded','error'); }catch(_){}
+    /* Size in the message distinguishes this new trimmed path from the legacy
+       warning and says HOW far over budget we are (see System Health for the
+       per-key breakdown). */
+    try{ toast('Local backup still too large even after trimming ('+_lastTriedKB+' KB vs ~5,120 KB browser limit) — server sync unaffected','error'); }catch(_){}
   }
 }
 function markCacheSynced(){
@@ -604,6 +610,24 @@ function onVatModeChange(){
   /* checkVatSanity sets the hint text appropriately for the chosen mode AND
      surfaces the over-cap warning if Manual mode has a typo. */
   checkVatSanity();
+}
+
+/* Map of expense-tx-id → linked Input VAT amount (the non-voided withdrawal
+   half created by the VAT split in submitTx). Used by the "amounts you
+   actually pay" views — Payables page, dashboard Upcoming Obligations,
+   overdue alert, forecast dated-overlay — to show GROSS = net + linked VAT,
+   matching the bill the supplier actually hands over.
+   NOT for P&L / expense metrics: Input VAT is a claimable asset, not an
+   expense — those stay net on purpose. Status needs no filter here because
+   the VAT half always mirrors its parent (created together, paid together). */
+function linkedVatByExpense(){
+  const m={};
+  (transactions||[]).forEach(t=>{
+    if(t&&!t.voided&&t.type==='withdrawal'&&t.linkedTxId&&(t.coaId==='a1080'||t.category==='Input VAT')){
+      m[t.linkedTxId]=(m[t.linkedTxId]||0)+(Number(t.amount)||0);
+    }
+  });
+  return m;
 }
 
 /* Show/hide the EE Portion field based on whether the selected category is
@@ -3263,7 +3287,10 @@ const leanOpsService={
         .filter(t=>t && !t.voided && t.type==='expense' && t.status==='unpaid' && t.dueDate && t.dueDate < td);
       const overduePay = (payables||[])
         .filter(p=>p && p.status!=='paid' && p.dueDate && p.dueDate < td && !_LONG.has(p.type||''));
-      const totalOverdue = overdueTx.reduce((s,t)=>s+(Number(t.amount)||0),0)
+      /* GROSS: fold in each bill's linked Input VAT half — the alert should
+         name the amount the vendor is actually waiting for. */
+      const _vatMap = linkedVatByExpense();
+      const totalOverdue = overdueTx.reduce((s,t)=>s+(Number(t.amount)||0)+(_vatMap[t.id]||0),0)
                          + overduePay.reduce((s,p)=>s+(Number(p.balance)||0),0);
       const count = overdueTx.length + overduePay.length;
       if (count > 0) {
@@ -6650,6 +6677,10 @@ ${(()=>{
   const todayIso = today();
   const horizonIso = addDays(todayIso, 14);
   const _LONG_TERM = new Set(['Loan','Owner Loan']);
+  /* GROSS amounts — fold each bill's linked Input VAT half back in so the
+     card shows what actually leaves the drawer on the due date. */
+  const _vatMap = linkedVatByExpense();
+  const _grossOf = t => round2((Number(t.amount)||0)+(_vatMap[t.id]||0));
   const upcomingExpenses = (transactions||[])
     .filter(t=>t && !t.voided && t.type==='expense' && t.status==='unpaid' && t.dueDate && t.dueDate>=todayIso && t.dueDate<=horizonIso)
     .map(t=>({
@@ -6657,7 +6688,7 @@ ${(()=>{
       kind: 'expense',
       label: t.supplier || t.category || t.note || 'Unpaid expense',
       sub: `${t.category||'—'}${t.supplier?' · '+t.supplier:''}`,
-      amount: Number(t.amount)||0,
+      amount: _grossOf(t),
       onclick: `editTransaction('${t.id}')`
     }));
   const upcomingPayables = (payables||[])
@@ -6677,7 +6708,7 @@ ${(()=>{
       kind: 'expense',
       label: t.supplier || t.category || t.note || 'Overdue expense',
       sub: `${t.category||'—'}${t.supplier?' · '+t.supplier:''}`,
-      amount: Number(t.amount)||0,
+      amount: _grossOf(t),
       overdue: true,
       onclick: `editTransaction('${t.id}')`
     }));
@@ -10550,10 +10581,17 @@ ${(()=>{
    PAYABLES PAGE
 ═══════════════════════════════════════════════ */
 function pgPayables(){
+  /* GROSS display: each unpaid expense is stored NET (its Input VAT lives in a
+     linked withdrawal tx that this page's type==='expense' filter would drop).
+     What you hand the supplier is net + VAT — so all amounts/totals here fold
+     the linked VAT back in. Payment logic needs no change: markExpensePaid
+     already flips the VAT half with its parent. */
+  const _vatMap=linkedVatByExpense();
+  const _grossOf=t=>round2((Number(t.amount)||0)+(_vatMap[t.id]||0));
   /* Unfiltered baseline — for the "Total Outstanding" Option C card so the
      user always sees the full picture even when narrowing the list below. */
   const accrualPayablesAll=transactions.filter(t=>t.type==='expense'&&t.status==='unpaid'&&!t.voided);
-  const totalAccrualAll=accrualPayablesAll.reduce((s,t)=>s+t.amount,0);
+  const totalAccrualAll=accrualPayablesAll.reduce((s,t)=>s+_grossOf(t),0);
   const openPayablesAll=payables.filter(p=>p.status!=='paid');
   const totalManualAll=openPayablesAll.reduce((s,p)=>s+p.balance,0);
   const totalOwedAll=totalAccrualAll+totalManualAll;
@@ -10585,7 +10623,7 @@ function pgPayables(){
   };
   const openPayables = openPayablesAll.filter(matchPayable);
   const accrualPayables = accrualPayablesAll.filter(matchAccrual);
-  const totalAccrual=accrualPayables.reduce((s,t)=>s+t.amount,0);
+  const totalAccrual=accrualPayables.reduce((s,t)=>s+_grossOf(t),0);
   const totalManual=openPayables.reduce((s,p)=>s+p.balance,0);
   const totalOwed=totalAccrual+totalManual;
   const filterActive = !!(payableFilters.search||payableFilters.type||payableFilters.supplier);
@@ -10651,11 +10689,13 @@ function pgPayables(){
   const accrualRows = accrPaged.slice.length
     ? accrPaged.slice.map(t=>{
         const noteLine = t.note ? `<div style="font-size:.7rem;color:var(--muted2);margin-top:2px">${esc(t.note)}</div>` : '';
+        const _vat=_vatMap[t.id]||0;
+        const vatHint=_vat>0?`<div style="font-size:.65rem;color:var(--muted2)">incl. ${fmt(_vat)} VAT</div>`:'';
         return `<tr>
           <td style="font-size:.82rem"><div>${esc(t.category)}</div>${noteLine}</td>
           <td style="font-size:.78rem;color:var(--muted2)">${esc(t.supplier||'—')}</td>
           <td style="font-size:.76rem;color:var(--muted2)">${fmtDate(t.date)}</td>
-          <td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(t.amount)}</td>
+          <td class="mono" style="text-align:right;font-size:.82rem;color:var(--red)">${fmt(_grossOf(t))}${vatHint}</td>
           <td style="font-size:.76rem;color:${t.dueDate&&t.dueDate<today()?'var(--red)':'var(--muted2)'}">${t.dueDate?fmtDate(t.dueDate):fmtDate(t.date)}</td>
           <td><button class="btn btn-primary btn-xs" onclick="markExpensePaid('${t.id}')">Pay Now</button></td>
         </tr>`;
@@ -10919,10 +10959,17 @@ function runForecast(days=30, opts){
     if(opts.excludeLongTerm && _LT.has(p.type||'')) return;
     addScheduled(p.dueDate, Number(p.balance)||0, p.name || p.type || 'Payable');
   });
+  /* GROSS per due date: the linked Input VAT half has no dueDate of its own
+     (it pays WITH its parent expense), so without folding it in here the net
+     expense moved to its due date while the VAT stayed smeared into day-0
+     cash — end-of-horizon total was right, but each cliff understated the
+     actual payment. obligationsTotal (from _getObligations) already includes
+     the VAT halves, so subtracting the gross back out below stays symmetric. */
+  const _fcVatMap = linkedVatByExpense();
   (transactions||[]).forEach(t=>{
     if(!t || t.voided || t.type!=='expense' || t.status!=='unpaid' || !t.dueDate) return;
     if(t.dueDate < todayIso || t.dueDate > horizonEnd) return;
-    addScheduled(t.dueDate, Number(t.amount)||0, t.supplier || t.category || 'Expense');
+    addScheduled(t.dueDate, (Number(t.amount)||0)+(_fcVatMap[t.id]||0), t.supplier || t.category || 'Expense');
   });
   /* Restore the future-dated portion to starting cash — they'll hit on their
      real day. Clamped at zero in case of accounting quirks (shouldn't happen
@@ -11656,7 +11703,28 @@ function pgSystemHealth(){
       try{
         const ls = localStorage.getItem(LEDGER_CACHE_KEY);
         if (!ls) return '0 KB (no cache — quota full or never written)';
-        return Math.round(ls.length/1024) + ' KB (browser limit ≈ 5,120 KB)';
+        /* ×2 — browsers meter the localStorage quota in UTF-16 bytes, so the
+           practical budget is ~2.5M chars, not 5M. Report in the same unit. */
+        return Math.round(ls.length*2/1024) + ' KB of ≈5,120 KB browser quota';
+      }catch(e){ return 'n/a'; }
+    })(),
+    'State size breakdown': (()=>{
+      /* What the local backup would cost per key, as-stored (UTF-16 ×2).
+         This is the map for deciding what to trim/archive when the quota
+         warning appears — the biggest names here are the culprits. */
+      try{
+        const sz=v=>{ try{ return JSON.stringify(v===undefined?null:v).length*2; }catch(e){ return 0; } };
+        const parts={
+          transactions:sz(transactions), activityLog:sz(activityLog), auditLog:sz(auditLog),
+          dsrEntries:sz(dsrEntries), shifts:sz(shifts), payrollRuns:sz(payrollRuns),
+          dailyMetrics:sz(dailyMetrics), weeklyMetrics:sz(weeklyMetrics), monthlyMetrics:sz(monthlyMetrics),
+          forecastSnapshots:sz(forecastSnapshots), cashCounts:sz(cashCounts), tabs:sz(tabs),
+          payables:sz(payables), staffPayables:sz(staffPayables), cashVarianceHistory:sz(cashVarianceHistory)
+        };
+        const total=sz(collectState());
+        const top=Object.entries(parts).filter(([,v])=>v>0).sort((a,b)=>b[1]-a[1]).slice(0,6)
+          .map(([k,v])=>k+' '+Math.round(v/1024)+'KB').join(' · ');
+        return 'full state ≈ '+Math.round(total/1024)+' KB — top: '+(top||'(empty)');
       }catch(e){ return 'n/a'; }
     })(),
     /* Phase 2 safety net — what the blob∪rows merge did on the last load.
