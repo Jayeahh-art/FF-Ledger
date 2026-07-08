@@ -4992,7 +4992,14 @@ function renderModal(){
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="${isEdit?`saveEditRoster('${d.id}')`:'submitAddRoster()'}">` +`${isEdit?'Save Changes':'Add Employee'}</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
 
   }else if(type==='addShift'){
-    const empOpts=roster.map(e=>`<option value="${e.id}">${esc(e.name)} — ${esc(e.position)}</option>`).join('');
+    /* Active employees first (the common case), inactive grouped separately
+       below so backfilling a former employee's shift (e.g. their last days
+       before deactivation) stays possible without reactivating them first. */
+    const _activeRoster=roster.filter(e=>e.status!=='inactive');
+    const _inactiveRoster=roster.filter(e=>e.status==='inactive');
+    const _optOf=e=>`<option value="${e.id}">${esc(e.name)} — ${esc(e.position)}</option>`;
+    const empOpts=_activeRoster.map(_optOf).join('')
+      + (_inactiveRoster.length?`<optgroup label="Inactive">${_inactiveRoster.map(_optOf).join('')}</optgroup>`:'');
     if(!roster.length){body=`<div class="warn-box">No employees on roster yet. <button class="btn btn-ghost btn-sm" onclick="closeModal();openModal('addRoster')">Add an employee first</button></div>`;
     }else{
     body=`<div class="form-row"><div class="form-group"><label>Employee</label><select id="m-shift-emp" onchange="_recomputeShiftRestDayDefault()">${empOpts}</select></div><div class="form-group"><label>Date</label><input id="m-shift-date" type="date" value="${window._laborDate||today()}" onchange="_recomputeShiftRestDayDefault()"></div></div>
@@ -5161,7 +5168,14 @@ function renderModal(){
 
   }else if(type==='giveAdvance'){
     const d=data||{};
-    const empOpts=(roster||[]).filter(r=>r.status!=='inactive').map(e=>{const bal=employeeAdvanceBalance(e.id);return `<option value="${e.id}" ${d.employeeId===e.id?'selected':''}>${esc(e.name)} — ${esc(e.position)}${bal>0?` (owes ${fmt(bal)})`:''}</option>`}).join('');
+    /* Active employees first (the common case); inactive grouped separately
+       below so a past advance can still be backfilled for someone who has
+       since left, mirroring the addShift employee picker. */
+    const _advOptOf=e=>{const bal=employeeAdvanceBalance(e.id);return `<option value="${e.id}" ${d.employeeId===e.id?'selected':''}>${esc(e.name)} — ${esc(e.position)}${bal>0?` (owes ${fmt(bal)})`:''}</option>`};
+    const _advActive=(roster||[]).filter(r=>r.status!=='inactive');
+    const _advInactive=(roster||[]).filter(r=>r.status==='inactive');
+    const empOpts=_advActive.map(_advOptOf).join('')
+      + (_advInactive.length?`<optgroup label="Inactive">${_advInactive.map(_advOptOf).join('')}</optgroup>`:'');
     const acctOpts=(accounts||[]).filter(a=>a&&a.type!=='clearing').map(a=>`<option value="${a.id}">${esc(a.name)}</option>`).join('');
     body=`<div class="form-group" style="margin-bottom:8px"><label>Employee</label><select id="m-adv-emp">${empOpts}</select></div>
     <div class="form-row">
