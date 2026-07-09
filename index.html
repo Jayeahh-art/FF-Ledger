@@ -620,6 +620,111 @@ function onVatModeChange(){
    NOT for P&L / expense metrics: Input VAT is a claimable asset, not an
    expense — those stay net on purpose. Status needs no filter here because
    the VAT half always mirrors its parent (created together, paid together). */
+/* Usage stats per distinct supplier name — feeds the "Supplier name cleanup"
+   tool on System Health so the user can spot which spelling is the real one
+   (highest count/total) before merging typo-duplicates into it. Includes
+   voided transactions — this is a display aid, not a financial figure. */
+function supplierUsageStats(){
+  const stats={};
+  (transactions||[]).forEach(t=>{
+    if(!t||!t.supplier)return;
+    const k=t.supplier;
+    (stats[k]=stats[k]||{name:k,txCount:0,payCount:0,total:0});
+    stats[k].txCount++;
+    stats[k].total+=Number(t.amount)||0;
+  });
+  (payables||[]).forEach(p=>{
+    if(!p||!p.supplier)return;
+    const k=p.supplier;
+    (stats[k]=stats[k]||{name:k,txCount:0,payCount:0,total:0});
+    stats[k].payCount++;
+    stats[k].total+=Number(p.balance)||0;
+  });
+  return Object.values(stats).sort((a,b)=>(b.txCount+b.payCount)-(a.txCount+a.payCount));
+}
+/* Merge-picker state — session-only UI state (not persisted/synced), mirrors
+   window._cashCountDate. picks = Set of supplier NAMES currently checked;
+   canonicalDraft survives re-renders (checkbox clicks re-render the whole
+   page) so typing the target spelling isn't wiped mid-edit. */
+function toggleSupplierMergePick(i){
+  const stats=window._supplierMergeStats||[];
+  const s=stats[i]; if(!s) return;
+  if(!window._supplierMergePicks) window._supplierMergePicks=new Set();
+  const set=window._supplierMergePicks;
+  if(set.has(s.name)) set.delete(s.name); else set.add(s.name);
+  /* render() rebuilds the whole page, resetting the list's scroll to the top —
+     with a long supplier list the user would have to re-scroll after every
+     single checkbox. Preserve the container's scroll position across the
+     rebuild (defer to next tick so the new DOM exists before we restore). */
+  const _scroll=document.getElementById('supplier-merge-list')?.scrollTop||0;
+  render();
+  if(_scroll) setTimeout(()=>{const el=document.getElementById('supplier-merge-list');if(el)el.scrollTop=_scroll;},0);
+}
+function useSupplierCanonical(i){
+  const stats=window._supplierMergeStats||[];
+  const s=stats[i]; if(!s) return;
+  window._supplierMergeCanonicalDraft=s.name;
+  const el=document.getElementById('supplier-merge-canonical');
+  if(el) el.value=s.name;
+}
+/* Rewrites the supplier LABEL only — never touches amount, date, status,
+   account, or coaId — so it cannot move any total, balance, or P&L figure.
+   Deliberately bypasses assertPeriodUnlocked/period-lock checks (user
+   decision, July 2026): those guards protect FINANCIAL figures in closed
+   periods, and supplier text carries none, while old/backfilled data is
+   exactly where typo-duplicates accumulate — excluding locked periods would
+   defeat most of the point. One summary activity-log line, not one per
+   record, so a large merge doesn't flood the log. modifiedAt is bumped on
+   changed transactions (not payables, which have no such field) so the
+   change actually propagates through the row-tab dual-write on next save. */
+function mergeSupplierNames(){
+  const picks=[...(window._supplierMergePicks||new Set())];
+  const canonical=(document.getElementById('supplier-merge-canonical')?.value||'').trim();
+  if(picks.length<2){toast('Pick at least 2 supplier names to merge','error');return;}
+  if(!canonical){toast('Enter the canonical spelling to merge into','error');return;}
+  const fromSet=new Set(picks.filter(p=>p!==canonical));
+  if(!fromSet.size){toast('Nothing to change — picks already match the canonical spelling','error');return;}
+  const txCount=(transactions||[]).filter(t=>t&&fromSet.has(t.supplier)).length;
+  const payCount=(payables||[]).filter(p=>p&&fromSet.has(p.supplier)).length;
+  if(!txCount && !payCount){toast('No matching records found','error');return;}
+  const fromList=[...fromSet].map(n=>`"${n}"`).join(', ');
+  if(!confirm(`Merge ${fromList} → "${canonical}"?\n\nThis renames the supplier label on ${txCount} transaction(s) and ${payCount} payable(s). It does NOT change any amount, date, status, account, or total — only the supplier text.\n\nThis cannot be undone automatically. Continue?`)) return;
+  const stamp=new Date().toISOString();
+  /* Locked months touched by this merge — captured BEFORE the rename (the
+     fromSet match stops working after). assertLockedPeriodIntegrity flags any
+     locked-month tx with modifiedAt newer than the lock's lockedAt; bumping
+     modifiedAt below would otherwise make every future integrity check
+     cry wolf on these txs forever. Since this rename is a user-sanctioned
+     mutation, re-affirm the affected locks at the same stamp (modTs > lockTs
+     is a strict inequality, so equal stamps pass). The locks stay fully
+     enforced against anything that mutates AFTER the merge. */
+  const _lockedMonthsTouched=(()=>{
+    const months=new Set((transactions||[]).filter(t=>t&&fromSet.has(t.supplier)&&t.date).map(t=>t.date.slice(0,7)));
+    return [...months].filter(mk=>(periodLocks||[]).some(p=>p&&p.locked&&p.period===mk));
+  })();
+  transactions=transactions.map(t=>(t&&fromSet.has(t.supplier))?{...t,supplier:canonical,modifiedAt:stamp,modifiedBy:currentUser}:t);
+  payables=payables.map(p=>(p&&fromSet.has(p.supplier))?{...p,supplier:canonical}:p);
+  if(_lockedMonthsTouched.length){
+    periodLocks=periodLocks.map(p=>(p&&p.locked&&_lockedMonthsTouched.includes(p.period))?{...p,lockedAt:stamp}:p);
+  }
+  logActivity(`Supplier names merged: ${fromList} → "${canonical}" (${txCount} tx, ${payCount} payable)${_lockedMonthsTouched.length?` · lock timestamps re-affirmed for ${_lockedMonthsTouched.join(', ')}`:''}`);
+  window._supplierMergePicks=new Set();
+  window._supplierMergeCanonicalDraft='';
+  scheduleSave();render();
+  toast(`Merged ✓ — ${txCount} transaction(s) + ${payCount} payable(s) updated`,'success');
+}
+/* Every distinct supplier name already used anywhere (transactions + manual
+   payables), for the Supplier-field datalist. Autocomplete only — the field
+   stays free text so a genuinely new supplier can still be typed; this just
+   makes the correctly-spelled existing name one click away instead of a
+   retype, so typo-duplicates ("Coca cola" vs "Coca-Cola") stop multiplying
+   going forward. Does not touch or dedupe past entries. */
+function allSupplierNames(){
+  const set=new Set();
+  (transactions||[]).forEach(t=>{ if(t&&t.supplier) set.add(t.supplier); });
+  (payables||[]).forEach(p=>{ if(p&&p.supplier) set.add(p.supplier); });
+  return [...set].sort();
+}
 function linkedVatByExpense(){
   const m={};
   (transactions||[]).forEach(t=>{
@@ -4847,7 +4952,7 @@ function renderModal(){
          </div></div>`
       : '';
     body=`<div class="form-row"><div class="form-group"><label>Name / Description</label><input id="m-pay-name" placeholder="e.g. BDO Loan" value="${esc(d.name||'')}"></div><div class="form-group"><label>Type</label><select id="m-pay-type">${typeOpts}</select></div></div>
-    <div class="form-row"><div class="form-group"><label>Creditor / Supplier</label><input id="m-pay-supplier" placeholder="e.g. BDO Bank" value="${esc(d.supplier||'')}"></div><div class="form-group"><label>Balance (₱)</label><input id="m-pay-balance" type="number" step="0.01" min="0" placeholder="0.00" value="${d.balance||''}"></div></div>
+    <div class="form-row"><div class="form-group"><label>Creditor / Supplier</label><input id="m-pay-supplier" list="supplier-names-list" placeholder="e.g. BDO Bank" value="${esc(d.supplier||'')}" autocomplete="off"><datalist id="supplier-names-list">${allSupplierNames().map(s=>`<option value="${esc(s)}">`).join('')}</datalist></div><div class="form-group"><label>Balance (₱)</label><input id="m-pay-balance" type="number" step="0.01" min="0" placeholder="0.00" value="${d.balance||''}"></div></div>
     <div class="form-row"><div class="form-group"><label>Due Date</label><input id="m-pay-due" type="date" value="${d.dueDate||''}"></div><div class="form-group"><label>Note</label><input id="m-pay-note" placeholder="" value="${esc(d.note||'')}"></div></div>
     ${depositField}
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="${isEdit?`saveEditPayable('${d.id}')`:'submitAddPayable()'}">Save</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
@@ -5410,7 +5515,7 @@ function renderModal(){
     const _vatMode=(()=>{ try{return localStorage.getItem('ledger_vat_mode')||'manual';}catch(e){return 'manual';} })();
     const accrualFields=isExpense?`
       <div class="form-row">
-        <div class="form-group"><label>Supplier / Vendor</label><input id="m-supplier" placeholder="e.g. Sysco, Meralco" value="${esc(data?.supplier||'')}"></div>
+        <div class="form-group"><label>Supplier / Vendor</label><input id="m-supplier" list="supplier-names-list" placeholder="e.g. Sysco, Meralco" value="${esc(data?.supplier||'')}" autocomplete="off"><datalist id="supplier-names-list">${allSupplierNames().map(s=>`<option value="${esc(s)}">`).join('')}</datalist></div>
         <div class="form-group"><label>Expense Type</label><select id="m-exptype"><option value="">—</option><option value="fixed" ${data?.expenseType==='fixed'?'selected':''}>Fixed</option><option value="variable" ${data?.expenseType==='variable'?'selected':''}>Variable</option></select></div>
       </div>
       <div class="form-row">
@@ -11882,6 +11987,34 @@ function pgSystemHealth(){
       <table><tbody>${rows}</tbody></table>
     </div>`;
   })()}
+
+  <!-- ═══ SUPPLIER NAME CLEANUP ═══
+       Editing tool, not a "safe/re-derive" maintenance action — kept in its
+       own card with its own warning rather than folded into the footer note
+       below that promises those actions never destroy data. -->
+  <div class="card" style="margin-bottom:14px">
+    <div class="sec-title" style="margin-bottom:4px">Supplier name cleanup</div>
+    <div style="font-size:.72rem;color:var(--muted2);margin-bottom:10px;line-height:1.45">Merge typo/duplicate spellings (e.g. "Coca cola" and "Coca-Cola") into one name across every transaction and payable. Cosmetic only — never changes any amount, date, status, or total. Not automatically reversible, so review the counts in the confirm dialog before continuing.</div>
+    ${(()=>{
+      const stats=supplierUsageStats();
+      window._supplierMergeStats=stats;
+      if(!stats.length) return '<div class="muted" style="font-size:.78rem">No suppliers recorded yet.</div>';
+      const picks=window._supplierMergePicks||new Set();
+      const rows=stats.map((s,i)=>`
+        <div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">
+          <input type="checkbox" ${picks.has(s.name)?'checked':''} onchange="toggleSupplierMergePick(${i})">
+          <div style="flex:1;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</div>
+          <div style="font-size:.7rem;color:var(--muted2);white-space:nowrap">${s.txCount} tx${s.payCount?` · ${s.payCount} payable`:''} · ${fmt(s.total)}</div>
+          <button class="btn btn-ghost btn-xs" onclick="useSupplierCanonical(${i})" title="Fill the canonical field below with this exact spelling">Use spelling</button>
+        </div>`).join('');
+      return `<div id="supplier-merge-list" style="max-height:220px;overflow-y:auto;margin-bottom:10px">${rows}</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input id="supplier-merge-canonical" placeholder="Canonical spelling to merge into" value="${esc(window._supplierMergeCanonicalDraft||'')}" oninput="window._supplierMergeCanonicalDraft=this.value" style="flex:1;min-width:180px">
+        <button class="btn btn-primary btn-sm" onclick="mergeSupplierNames()">Merge selected → canonical</button>
+      </div>
+      <div style="font-size:.7rem;color:var(--muted2);margin-top:6px">${picks.size} selected</div>`;
+    })()}
+  </div>
 
   <!-- ═══ ACTIONS ═══ -->
   <div class="card" style="margin-bottom:14px">
