@@ -12002,7 +12002,7 @@ function pgSystemHealth(){
       const picks=window._supplierMergePicks||new Set();
       const rows=stats.map((s,i)=>`
         <div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">
-          <input type="checkbox" ${picks.has(s.name)?'checked':''} onchange="toggleSupplierMergePick(${i})">
+          <input type="checkbox" ${picks.has(s.name)?'checked':''} onchange="toggleSupplierMergePick(${i})" style="width:auto;flex-shrink:0">
           <div style="flex:1;font-size:.8rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.name)}</div>
           <div style="font-size:.7rem;color:var(--muted2);white-space:nowrap">${s.txCount} tx${s.payCount?` · ${s.payCount} payable`:''} · ${fmt(s.total)}</div>
           <button class="btn btn-ghost btn-xs" onclick="useSupplierCanonical(${i})" title="Fill the canonical field below with this exact spelling">Use spelling</button>
