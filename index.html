@@ -5251,7 +5251,15 @@ function renderModal(){
 
   }else if(type==='addPayrollAdj'){
     const d=data||{};
-    const empOpts=(roster||[]).map(e=>`<option value="${e.id}" ${d.employeeId===e.id?'selected':''}>${esc(e.name)} — ${esc(e.position)}</option>`).join('');
+    /* Active employees first, inactive grouped below — same pattern as the
+       addShift/giveAdvance pickers. Inactive stay selectable because a
+       final-pay adjustment (e.g. last deductions, 13th-month catch-up) can
+       legitimately target someone already off the roster. */
+    const _adjOptOf=e=>`<option value="${e.id}" ${d.employeeId===e.id?'selected':''}>${esc(e.name)} — ${esc(e.position)}</option>`;
+    const _adjActive=(roster||[]).filter(r=>r.status!=='inactive');
+    const _adjInactive=(roster||[]).filter(r=>r.status==='inactive');
+    const empOpts=_adjActive.map(_adjOptOf).join('')
+      + (_adjInactive.length?`<optgroup label="Inactive">${_adjInactive.map(_adjOptOf).join('')}</optgroup>`:'');
     const catOpts=PAYROLL_ADJUSTMENT_TYPES.map(c=>`<option value="${c}">${c.replace(/_/g,' ').replace(/\b\w/g,l=>l.toUpperCase())}</option>`).join('');
     body=`<div class="form-row">
       <div class="form-group" style="grid-column:1/-1"><label>Employee</label><select id="m-adj-emp">${empOpts}</select></div>
