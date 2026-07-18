@@ -1364,6 +1364,12 @@ return [
 {id:'o8110',code:'8110',name:'Loan Charges',group:'Other Expenses',type:'expense',isDefault:true},
 {id:'o8120',code:'8120',name:'Depreciation Expense',group:'Other Expenses',type:'expense',isDefault:true},
 {id:'o8130',code:'8130',name:'Amortization Expense',group:'Other Expenses',type:'expense',isDefault:true},
+/* BIR revenue/income taxes — deliberately in Other Expenses (below the EBITDA
+   line) so they flow into Net Profit, not operating cost. Permits/registration
+   stay in Compliance & Licenses (x75xx, inside EBITDA); the split keeps EBITDA
+   a true "before income taxes" number. */
+{id:'o8140',code:'8140',name:'Percentage Tax (BIR)',group:'Other Expenses',type:'expense',isDefault:true},
+{id:'o8150',code:'8150',name:'Income Tax (BIR)',group:'Other Expenses',type:'expense',isDefault:true},
 
 ];
 }
