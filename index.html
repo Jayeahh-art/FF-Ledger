@@ -5099,9 +5099,12 @@ function renderModal(){
   }else if(type==='addShift'){
     /* Active employees first (the common case), inactive grouped separately
        below so backfilling a former employee's shift (e.g. their last days
-       before deactivation) stays possible without reactivating them first. */
-    const _activeRoster=roster.filter(e=>e.status!=='inactive');
-    const _inactiveRoster=roster.filter(e=>e.status==='inactive');
+       before deactivation) stays possible without reactivating them first.
+       Staff picker also excludes MGT employees — staff can't see manager
+       shift rows, so they shouldn't log shifts for them either. */
+    const _pickable=e=>userRole!=='staff'||((e.department||defaultDepartmentForPosition(e.position||''))!=='MGT');
+    const _activeRoster=roster.filter(e=>e.status!=='inactive'&&_pickable(e));
+    const _inactiveRoster=roster.filter(e=>e.status==='inactive'&&_pickable(e));
     const _optOf=e=>`<option value="${e.id}">${esc(e.name)} — ${esc(e.position)}</option>`;
     const empOpts=_activeRoster.map(_optOf).join('')
       + (_inactiveRoster.length?`<optgroup label="Inactive">${_inactiveRoster.map(_optOf).join('')}</optgroup>`:'');
@@ -9886,22 +9889,27 @@ function renderShiftsTab(vd,co){
      (operational + their own money); peso WAGE amounts are hidden — a full
      shift's grossPay effectively reveals the daily rate. UI-hiding only. */
   const isStaff=userRole==='staff';
+  /* Staff also don't see MANAGER shift rows (schedule privacy, July 2026).
+     Rows/hours/counts are filtered; Labor % and costs stay computed from ALL
+     shifts — the aggregate % is the true number and reveals no one's rate. */
+  const _isMgtShift=s=>{const e=roster.find(r=>r.id===s.employeeId);return !!(e&&((e.department||defaultDepartmentForPosition(e.position||''))==='MGT'));};
+  const _vis=list=>isStaff?list.filter(s=>!_isMgtShift(s)):list;
   const ws=isoWeekStart(new Date(vd+'T12:00:00'));const wd=Array.from({length:7},(_,i)=>addDays(ws,i));
-  const wShifts=shifts.filter(s=>wd.includes(s.date));
+  const wShifts=_vis(shifts.filter(s=>wd.includes(s.date)));
   /* Labor cost = sum of each day's actual prorated shift pay (base+OT+ND+premium
      −tardiness), so partial shifts no longer overstate cost. Matches payroll. */
   const wCost=wd.reduce((s,date)=>s+dayLaborCostFromShifts(date),0);
   const wHrs=wShifts.reduce((s,x)=>s+x.hoursWorked,0);
   const wSales=transactions.filter(t=>wd.includes(t.date)&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);
   const lPct=wSales>0?(wCost/wSales*100):0;
-  const dShifts=shifts.filter(s=>s.date===vd);
+  const dShifts=_vis(shifts.filter(s=>s.date===vd));
   const dSales=transactions.filter(t=>t.date===vd&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);
   const dCost=dayLaborCostFromShifts(vd);
   const dayScPayable=staffPayables.filter(p=>p.date===vd&&p.type==='sc'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);
   const dayTipPayable=staffPayables.filter(p=>p.date===vd&&p.type==='tip'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);
   const dist=calcSCTipDistribution(vd);
   const distRows=dist.map(d=>`<tr><td style="font-size:.8rem;font-weight:500">${esc(d.name)}</td><td style="font-size:.75rem;color:var(--muted2)">${esc(d.position)}</td><td class="mono" style="text-align:right;font-size:.79rem">${d.hoursWorked.toFixed(1)}h</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--muted2)">${d.sharePct.toFixed(1)}%</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--purple)">${fmt(d.scShare)}</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--amber)">${fmt(d.tipShare)}</td><td class="mono" style="text-align:right;font-size:.82rem;font-weight:600">${fmt(d.totalShare)}</td></tr>`).join('');
-  const wRows=wd.map(date=>{const ds=shifts.filter(s=>s.date===date);const dc=dayLaborCostFromShifts(date);const dh=ds.reduce((s,x)=>s+x.hoursWorked,0);const dS=transactions.filter(t=>t.date===date&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);const dp=dS>0?(dc/dS*100):0;const hol=getHoliday(date);return`<tr style="${date===vd?'background:rgba(41,37,36,.06)':''}cursor:pointer" onclick="window._laborDate='${date}';renderMain()"><td style="font-size:.79rem;white-space:nowrap">${new Date(date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})}${date===today()?'<span style="font-size:.63rem;color:var(--amber);margin-left:3px">today</span>':''}${hol?`<span class="holiday-badge ${hol.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${hol.type==='regular'?'RH':'SH'}</span>`:''}</td><td style="text-align:center;font-size:.79rem">${ds.length}</td><td class="mono" style="text-align:right;font-size:.79rem">${dh.toFixed(1)}h</td>${isStaff?'':`<td class="mono" style="text-align:right;font-size:.79rem">${fmt(dc)}</td>`}<td class="mono" style="text-align:right;font-size:.79rem;color:${dS>0?(dp<=32?'var(--green)':dp<=38?'var(--amber)':'var(--red)'):'var(--muted2)'}">${dS>0?dp.toFixed(1)+'%':'—'}</td></tr>`;}).join('');
+  const wRows=wd.map(date=>{const ds=_vis(shifts.filter(s=>s.date===date));const dc=dayLaborCostFromShifts(date);const dh=ds.reduce((s,x)=>s+x.hoursWorked,0);const dS=transactions.filter(t=>t.date===date&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);const dp=dS>0?(dc/dS*100):0;const hol=getHoliday(date);return`<tr style="${date===vd?'background:rgba(41,37,36,.06)':''}cursor:pointer" onclick="window._laborDate='${date}';renderMain()"><td style="font-size:.79rem;white-space:nowrap">${new Date(date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})}${date===today()?'<span style="font-size:.63rem;color:var(--amber);margin-left:3px">today</span>':''}${hol?`<span class="holiday-badge ${hol.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${hol.type==='regular'?'RH':'SH'}</span>`:''}</td><td style="text-align:center;font-size:.79rem">${ds.length}</td><td class="mono" style="text-align:right;font-size:.79rem">${dh.toFixed(1)}h</td>${isStaff?'':`<td class="mono" style="text-align:right;font-size:.79rem">${fmt(dc)}</td>`}<td class="mono" style="text-align:right;font-size:.79rem;color:${dS>0?(dp<=32?'var(--green)':dp<=38?'var(--amber)':'var(--red)'):'var(--muted2)'}">${dS>0?dp.toFixed(1)+'%':'—'}</td></tr>`;}).join('');
   const dRows=dShifts.length?dShifts.map(s=>{const e=roster.find(r=>r.id===s.employeeId);const pay=computeShiftPay(s,e);return`<div class="shift-row"><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:.83rem">${esc(e?.name||'Unknown')}</div><div style="font-size:.69rem;color:var(--muted2)">${esc(e?.position||'')} · ${s.timeIn}–${s.timeOut}${s.breakMins?` · ${s.breakMins}m break`:''}${pay&&pay.lateMinutes>0?`<span class="late-badge" style="margin-left:4px">${pay.lateMinutes}m late → ${pay.tardinessBracketMins}m</span>`:''}${pay&&pay.undertimeHrs>0?`<span class="late-badge" style="margin-left:4px">UT ${pay.undertimeHrs.toFixed(1)}h</span>`:''}${pay?.isHoliday?`<span class="holiday-badge ${pay.holiday?.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${pay.holidayNote}</span>`:''}</div></div><span class="mono" style="font-size:.8rem;color:var(--muted2);white-space:nowrap">${s.hoursWorked.toFixed(1)}h</span>${pay&&pay.otHrs>0?`<span style="font-size:.72rem;color:var(--blue);white-space:nowrap">OT:${pay.otHrs.toFixed(1)}h</span>`:''}${pay&&pay.ndHrs>0?`<span style="font-size:.72rem;color:var(--purple);white-space:nowrap">ND:${pay.ndHrs.toFixed(1)}h</span>`:''}${isStaff?'':`<span class="mono" style="font-size:.82rem;color:var(--green);white-space:nowrap">${fmt(pay?.grossPay||0)}</span>`}<button class="row-btn" onclick="openModal('editShift','${s.id}')" title="Edit">✎</button>${isStaff?'':`<button class="row-btn del" onclick="deleteShift('${s.id}')" title="Delete">✕</button>`}</div>`}).join(''):`<div class="empty" style="padding:14px">No shifts logged. <button class="btn btn-ghost btn-sm" onclick="openModal('addShift')">+ Log Shift</button></div>`;
   return`<div class="g5" style="margin-bottom:12px">${isStaff
     ?`<div class="card"><div class="stat-label">Week Hours</div><div class="stat-value">${wHrs.toFixed(1)}h</div><div class="stat-sub">${wShifts.length} shift${wShifts.length===1?'':'s'}</div></div>`
@@ -12079,28 +12087,40 @@ function pgPulse(){
   const td=today();
   const ws=isoWeekStart(new Date(td+'T12:00:00'));
   const ms=td.slice(0,8)+'01';
+  /* Role split (July 2026): managers see the peso amounts under each % —
+     "cost ÷ base" — staff see % only (wage/cost pesos are manager-only). */
+  const isStaff=userRole==='staff';
+  /* Custom date range — session-only (window vars, mirrors _laborDate).
+     Both ends set & ordered → a single custom column replaces WTD/MTD. */
+  const cf=window._pulseFrom||'', ct=window._pulseTo||'';
+  const customActive=!!(cf&&ct&&cf<=ct);
   const live=(transactions||[]).filter(t=>t&&!t.voided);
   /* Category matching by coaId with name fallback (legacy txs pre-coaId). */
   const FOOD_S=new Set(['r4000','Food Sales']), FOOD_C=new Set(['c5000','Food COGS']);
   const BEV_S=new Set(['r4010','r4020','Non-Alcoholic Beverage Sales','Alcohol Sales']);
   const BEV_C=new Set(['c5010','c5020','Non-Alcoholic Beverage COGS','Alcohol COGS']);
   const CONS_C=new Set(['c5040','Packaging & Takeout Supplies']);
-  const sumTx=(type,from,ids)=>live.filter(t=>t.type===type&&t.date>=from&&t.date<=td&&(!ids||ids.has(t.coaId)||ids.has(t.category))).reduce((s,t)=>s+(Number(t.amount)||0),0);
+  const sumTx=(type,from,to,ids)=>live.filter(t=>t.type===type&&t.date>=from&&t.date<=to&&(!ids||ids.has(t.coaId)||ids.has(t.category))).reduce((s,t)=>s+(Number(t.amount)||0),0);
   /* Labor = shift-based day costs (same engine as the Labor page), accrual —
      counts worked shifts whether or not payroll has been finalized. */
-  const laborFor=from=>{const seen={};let sum=0;(shifts||[]).forEach(s=>{if(!s||!s.date||seen[s.date]||s.date<from||s.date>td)return;seen[s.date]=true;sum+=dayLaborCostFromShifts(s.date)||0;});return sum;};
-  const calc=from=>{
-    const totalSales=sumTx('sale',from,null);
-    const foodS=sumTx('sale',from,FOOD_S), bevS=sumTx('sale',from,BEV_S);
+  const laborFor=(from,to)=>{const seen={};let sum=0;(shifts||[]).forEach(s=>{if(!s||!s.date||seen[s.date]||s.date<from||s.date>to)return;seen[s.date]=true;sum+=dayLaborCostFromShifts(s.date)||0;});return sum;};
+  const calc=(from,to)=>{
+    const totalSales=sumTx('sale',from,to,null);
+    const foodS=sumTx('sale',from,to,FOOD_S), bevS=sumTx('sale',from,to,BEV_S);
+    const foodC=sumTx('expense',from,to,FOOD_C), bevC=sumTx('expense',from,to,BEV_C);
+    const consC=sumTx('expense',from,to,CONS_C), laborC=laborFor(from,to);
     return {
       totalSales,
-      food:  foodS>0 ? sumTx('expense',from,FOOD_C)/foodS*100 : null,
-      bev:   bevS>0  ? sumTx('expense',from,BEV_C)/bevS*100   : null,
-      cons:  totalSales>0 ? sumTx('expense',from,CONS_C)/totalSales*100 : null,
-      labor: totalSales>0 ? laborFor(from)/totalSales*100     : null
+      food:  {pct: foodS>0?foodC/foodS*100:null,           cost:foodC,  base:foodS},
+      bev:   {pct: bevS>0?bevC/bevS*100:null,              cost:bevC,   base:bevS},
+      cons:  {pct: totalSales>0?consC/totalSales*100:null, cost:consC,  base:totalSales},
+      labor: {pct: totalSales>0?laborC/totalSales*100:null,cost:laborC, base:totalSales}
     };
   };
-  const wk=calc(ws), mo=calc(ms);
+  const cols=customActive
+    ? [{label:`${fmtDate(cf)} – ${fmtDate(ct)}`,from:cf,to:ct}]
+    : [{label:'This Week',from:ws,to:td},{label:'This Month',from:ms,to:td}];
+  const data=cols.map(cl=>calc(cl.from,cl.to));
   const laborT=_getEffectiveTargets().labor;
   const KPIS=[
     {key:'food', label:'Food Cost', sub:'food purchases ÷ food sales', green:35, amber:40,
@@ -12112,10 +12132,12 @@ function pgPulse(){
     {key:'labor', label:'Labor Cost', sub:'shift wages ÷ total sales', green:laborT, amber:laborT+4,
      notes:{green:'✓ on target', amber:'Above target — review scheduling', red:'Well above target — trim or shorten shifts'}}
   ];
-  const cell=(v,k)=>{
+  const cell=(d,k)=>{
+    const v=d[k.key].pct;
     if(v===null)return `<td class="mono" style="text-align:right;color:var(--muted2)">—</td>`;
     const color=v<=k.green?'var(--green)':v<=k.amber?'var(--amber)':'var(--red)';
-    return `<td class="mono" style="text-align:right;font-weight:600;color:${color}">${v.toFixed(1)}%</td>`;
+    const pesos=isStaff?'':`<div style="font-size:.66rem;color:var(--muted2);font-weight:400">${fmt(d[k.key].cost)} ÷ ${fmt(d[k.key].base)}</div>`;
+    return `<td class="mono" style="text-align:right;font-weight:600;color:${color}">${v.toFixed(1)}%${pesos}</td>`;
   };
   const note=(v,k)=>{
     if(v===null)return '<span style="color:var(--muted2)">no sales yet</span>';
@@ -12125,14 +12147,25 @@ function pgPulse(){
   };
   const rows=KPIS.map(k=>`<tr>
     <td><div style="font-weight:600;font-size:.84rem">${k.label}</div><div style="font-size:.68rem;color:var(--muted2)">${k.sub}</div></td>
-    ${cell(wk[k.key],k)}${cell(mo[k.key],k)}
-    <td style="font-size:.75rem">${note(wk[k.key],k)}</td>
+    ${data.map(d=>cell(d,k)).join('')}
+    <td style="font-size:.75rem">${note(data[0][k.key].pct,k)}</td>
   </tr>`).join('');
-  return `<div class="page-header"><div class="page-hd-left"><div class="page-title">Pulse</div><div class="page-sub">Running cost KPIs · live — updates as DSR, expenses and shifts are logged</div></div></div>
+  const headCols=cols.map(cl=>`<th style="text-align:right">${cl.label}</th>`).join('');
+  return `<div class="page-header"><div class="page-hd-left"><div class="page-title">Pulse</div><div class="page-sub">Running cost KPIs · live — updates as DSR, expenses and shifts are logged</div></div>
+  <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+    <span style="font-size:.72rem;color:var(--muted2);font-weight:500">Custom range:</span>
+    <input type="date" value="${cf}" onchange="window._pulseFrom=this.value;renderMain()" style="font-size:.78rem;padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg);width:auto">
+    <span style="color:var(--muted2)">–</span>
+    <input type="date" value="${ct}" onchange="window._pulseTo=this.value;renderMain()" style="font-size:.78rem;padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg);width:auto">
+    ${(cf||ct)?`<button class="btn btn-ghost btn-xs" onclick="window._pulseFrom=null;window._pulseTo=null;renderMain()">↺ Week/Month</button>`:''}
+    ${(cf&&ct&&cf>ct)?'<span style="font-size:.7rem;color:var(--red)">from is after to</span>':''}
+  </div></div>
   <div class="card-flush" style="margin-bottom:12px">
-    <table><thead><tr><th>KPI</th><th style="text-align:right">This Week</th><th style="text-align:right">This Month</th><th>Note (this week)</th></tr></thead><tbody>${rows}</tbody></table>
+    <table><thead><tr><th>KPI</th>${headCols}<th>Note${customActive?'':' (this week)'}</th></tr></thead><tbody>${rows}</tbody></table>
   </div>
-  <div style="font-size:.72rem;color:var(--muted2);line-height:1.5">Week starts ${fmtDate(ws)} · month from ${fmtDate(ms)} · sales this week ${fmt(wk.totalSales)} · this month ${fmt(mo.totalSales)}.<br>Numbers are only as fresh as the logging — post the DSR and log expenses with the right category same-day for a true live view.</div>`;
+  <div style="font-size:.72rem;color:var(--muted2);line-height:1.5">${customActive
+    ? `Showing ${fmtDate(cf)} – ${fmtDate(ct)} · sales in range ${fmt(data[0].totalSales)}.`
+    : `Week starts ${fmtDate(ws)} · month from ${fmtDate(ms)} · sales this week ${fmt(data[0].totalSales)} · this month ${fmt(data[1].totalSales)}.`}<br>Numbers are only as fresh as the logging — post the DSR and log expenses with the right category same-day for a true live view.</div>`;
 }
 
 function renderMain(){
