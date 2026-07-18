@@ -5112,13 +5112,15 @@ function renderModal(){
     <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="09:00"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="8"></div><div class="form-group"><label>Note</label><input id="m-shift-note" placeholder="e.g. OT, half-day…"></div></div>
     <!-- Per-shift daily-rate override: blank = use the employee's current roster
          rate (normal). Fill in to log a PAST shift at its HISTORICAL rate so
-         weekly labor KPIs stay correct after a raise. Frozen on the shift. -->
-    <div class="form-row">
+         weekly labor KPIs stay correct after a raise. Frozen on the shift.
+         Hidden for staff (rates are manager-only); submitAddShift handles the
+         absent field as "no override". -->
+    ${userRole==='staff'?'':`<div class="form-row">
       <div class="form-group" style="grid-column:1/-1">
         <label>Daily rate override (₱) <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· blank = use current rate · set for historical shifts at the old rate</span></label>
         <input id="m-shift-rate" type="number" min="0" step="1" placeholder="(uses employee's current rate)">
       </div>
-    </div>
+    </div>`}
     <!-- Rest-day premium toggle (Approach A): per-shift flag, defaulted from the
          selected employee's restDay vs the shift date. Editable so user can
          override (e.g. employee voluntarily works on their rest day → 130%
@@ -5136,7 +5138,7 @@ function renderModal(){
     <div class="info-box" style="margin-bottom:4px;font-size:.76rem">Tardiness is auto-detected: clock-in after Scheduled In is docked per policy (1–29m→30m · 30–59m→1h · 60m+→4h). Leaving early / a short day shows as Undertime. Set Scheduled hrs to 4 for a half-day.</div>
     <div style="display:flex;gap:14px;justify-content:flex-end;padding:6px 4px;font-size:.78rem;color:var(--muted2);margin-bottom:6px">
       <span>Hours worked: <b id="sp-hours" class="mono" style="color:var(--text)">—</b></span>
-      <span>Daily rate: <b id="sp-rate" class="mono" style="color:var(--text)">—</b></span>
+      ${userRole==='staff'?'':`<span>Daily rate: <b id="sp-rate" class="mono" style="color:var(--text)">—</b></span>`}
     </div>
     <div class="modal-footer"><button class="btn btn-primary" style="flex:1" onclick="submitAddShift()">Log Shift</button><button class="btn btn-ghost" onclick="closeModal()">Cancel</button></div>`;
     setTimeout(()=>{const upd=()=>{const e=roster.find(r=>r.id===document.getElementById('m-shift-emp')?.value);const ti=document.getElementById('m-shift-in')?.value;const to=document.getElementById('m-shift-out')?.value;const br=parseInt(document.getElementById('m-shift-break')?.value||0)||0;const hrs=calcShiftHours(ti,to,br);const el=document.getElementById('sp-hours');const re=document.getElementById('sp-rate');const rateEl=document.getElementById('m-shift-rate');const ovr=Number(rateEl?.value)||0;if(el)el.textContent=hrs.toFixed(2)+'h';if(re)re.textContent=ovr>0?fmt(ovr)+' (override)':(e?fmt(e.dailyRate):'-');if(rateEl&&e&&!rateEl.value)rateEl.placeholder=`(current: ${fmt(e.dailyRate)})`;};['m-shift-emp','m-shift-in','m-shift-out','m-shift-break','m-shift-rate'].forEach(id=>{const el=document.getElementById(id);if(el)el.addEventListener('input',upd)});upd();_recomputeShiftRestDayDefault();},80);
@@ -5159,13 +5161,16 @@ function renderModal(){
       <div class="form-row"><div class="form-group"><label>Time In</label><input id="m-shift-in" type="time" value="${s.timeIn}"></div><div class="form-group"><label>Time Out</label><input id="m-shift-out" type="time" value="${s.timeOut}"></div><div class="form-group"><label>Break (mins)</label><input id="m-shift-break" type="number" min="0" max="240" step="15" value="${s.breakMins||0}"></div></div>
       <div class="form-row"><div class="form-group"><label>Scheduled In</label><input id="m-shift-schedin" type="time" value="${s.scheduledIn||s.timeIn||'09:00'}"></div><div class="form-group"><label>Scheduled hrs</label><input id="m-shift-sched" type="number" min="0" max="12" step="0.5" value="${s.scheduledHours||8}"></div><div class="form-group"><label>Note</label><input id="m-shift-note" value="${esc(s.note||'')}"></div></div>
       <!-- Per-shift daily-rate override (mirrors addShift). Pre-filled from the
-           shift's stored rateOverride; blank = uses the employee's current rate. -->
-      <div class="form-row">
+           shift's stored rateOverride; blank = uses the employee's current rate.
+           Hidden for staff — saveEditShift PRESERVES the stored rateOverride
+           when the field is absent (a staff edit must not silently wipe a
+           manager-set historical rate). -->
+      ${userRole==='staff'?'':`<div class="form-row">
         <div class="form-group" style="grid-column:1/-1">
           <label>Daily rate override (₱) <span style="text-transform:none;font-weight:400;color:var(--muted2);font-size:.7rem;letter-spacing:0;margin-left:4px">· blank = current rate (${fmt(emp?.dailyRate||0)})</span></label>
           <input id="m-shift-rate" type="number" min="0" step="1" value="${Number(s.rateOverride)>0?s.rateOverride:''}" placeholder="(uses ${fmt(emp?.dailyRate||0)})">
         </div>
-      </div>
+      </div>`}
       <!-- Rest-day premium toggle (Approach A): per-shift flag, mirrors addShift.
            grid-column:1/-1 — full-width checkbox block (see Edit Employee note). -->
       <div class="form-row">
@@ -7144,7 +7149,10 @@ const DSR_TAG='[DSR]';   /* tag to identify DSR-generated transactions */
 /* Hotfix M8: cleaned stale trailing comment that misattributed STAFF_PAGES
    as a DSR tag. STAFF_PAGES gates the sidebar/page navigation for the
    non-manager role; manager has access to every page. */
-const STAFF_PAGES=['dsr','tabs','transactions','cash'];
+/* labor: staff get the Shifts & Hours tab only (log + edit; rates, pay amounts,
+   payroll and roster stay manager-only — UI-hiding by user decision July 2026,
+   accepted that data is still client-side). pulse: simplified KPI page. */
+const STAFF_PAGES=['dsr','tabs','transactions','cash','labor','pulse'];
 
 function getDSRPosted(date){
   return transactions.filter(t=>t.date===date&&String(t.note||'').startsWith(DSR_TAG)&&!t.voided);
@@ -9720,6 +9728,7 @@ function addShift(s){
   scheduleSave();render();closeModal();toast('Shift logged ✓');
 }
 function deleteShift(id){
+  if(userRole==='staff'){toast('Deleting a shift is manager-only — ask your manager','error');return;}
   const s=shifts.find(x=>x.id===id);if(!s)return;
   /* Finalized-period guard — shift hours fed a finalized run; deleting now
      means a re-finalize would compute different labor. The run snapshot stays
@@ -9759,9 +9768,13 @@ function saveEditShift(id){
      edit onward, the shift owns its own rest-day truth. */
   const isRestDay = document.getElementById('m-shift-restday')?.checked === true;
   /* Per-shift rate override: positive → store the historical rate; blank/0 →
-     store null so computeShiftPay falls back to the employee's current rate. */
-  const _rateRaw = Number(document.getElementById('m-shift-rate')?.value)||0;
-  const rateOverride = _rateRaw>0 ? round2(_rateRaw) : null;
+     store null so computeShiftPay falls back to the employee's current rate.
+     Field is ABSENT in the staff edit modal (rates hidden) — preserve the
+     stored value then, otherwise a staff time-fix would silently wipe a
+     manager-set historical rate. */
+  const _rateEl = document.getElementById('m-shift-rate');
+  const _rateRaw = Number(_rateEl?.value)||0;
+  const rateOverride = _rateEl ? (_rateRaw>0 ? round2(_rateRaw) : null) : (s.rateOverride??null);
   // Phase 2.7: no direct tx manipulation — shift records only.
   // Tardiness is derived in computeShiftPay from scheduledIn vs timeIn — no stored lateMinutes.
   shifts=shifts.map(x=>x.id===id?{...x,date,timeIn:ti,timeOut:to,breakMins:br,scheduledHours:sched,scheduledIn:schedIn,note,hoursWorked:hrs,isRestDay,rateOverride}:x);
@@ -9849,14 +9862,19 @@ function deleteHoliday(date){
 }
 let _laborTab='shifts';
 function pgLabor(){
-  const vd=window._laborDate||today();const co=getCutoffPeriod(vd);const at=_laborTab||'shifts';
-  const tabs2=[['shifts','Shifts & Hours'],['payroll','Payroll'],['history','Payroll History'],['holidays','Holidays'],['roster','Roster']];
+  const vd=window._laborDate||today();const co=getCutoffPeriod(vd);
+  /* Staff variant: Shifts & Hours ONLY — payroll/history/roster are rate- and
+     pay-laden end to end. Force the tab so a manager's saved _laborTab can't
+     leak another tab's markup into a staff render. */
+  const isStaff=userRole==='staff';
+  const at=isStaff?'shifts':(_laborTab||'shifts');
+  const tabs2=isStaff?[['shifts','Shifts & Hours']]:[['shifts','Shifts & Hours'],['payroll','Payroll'],['history','Payroll History'],['holidays','Holidays'],['roster','Roster']];
   const tabBar=`<div class="tab-bar" style="margin-bottom:14px">${tabs2.map(([v,l])=>`<div class="tab ${at===v?'active':''}" onclick="_laborTab='${v}';renderMain()">${l}</div>`).join('')}</div>`;
   const hdr=`<div class="page-header"><div class="page-hd-left"><div class="page-title">Labor</div><div class="page-sub">Cut-off: <b>${co.label}</b> · Pay day: <b>${fmtDate(co.payDay)}</b></div></div><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
     <span style="font-size:.72rem;color:var(--muted2);font-weight:500">Jump to:</span>
     <input type="date" value="${vd}" onchange="window._laborDate=this.value;renderMain()" title="Jump to a different date — the cut-off below auto-updates to the period containing this date" style="font-size:.78rem;padding:4px 8px;border-radius:5px;border:1px solid var(--border2);background:var(--bg)">
     ${vd!==today()?`<button class="btn btn-ghost btn-xs" onclick="window._laborDate=null;renderMain()" title="Jump back to today">↺ Today</button>`:''}
-    <button class="btn btn-primary btn-sm" onclick="openModal('addShift')">+ Log Shift</button><button class="btn btn-ghost btn-sm" onclick="openModal('addRoster')">+ Add Employee</button><button class="btn btn-ghost btn-sm" onclick="openModal('payrollSettings')">⚙ Payroll Settings</button></div></div>`;
+    <button class="btn btn-primary btn-sm" onclick="openModal('addShift')">+ Log Shift</button>${isStaff?'':`<button class="btn btn-ghost btn-sm" onclick="openModal('addRoster')">+ Add Employee</button><button class="btn btn-ghost btn-sm" onclick="openModal('payrollSettings')">⚙ Payroll Settings</button>`}</div></div>`;
   if(at==='shifts')return hdr+tabBar+renderShiftsTab(vd,co);
   if(at==='payroll')return hdr+tabBar+renderPayrollTab(co);
   if(at==='history')return hdr+tabBar+renderPayrollHistoryTab();
@@ -9864,6 +9882,10 @@ function pgLabor(){
   return hdr+tabBar+renderRosterTab();
 }
 function renderShiftsTab(vd,co){
+  /* Staff variant: hours, tardiness, Labor % and SC/Tip pools stay visible
+     (operational + their own money); peso WAGE amounts are hidden — a full
+     shift's grossPay effectively reveals the daily rate. UI-hiding only. */
+  const isStaff=userRole==='staff';
   const ws=isoWeekStart(new Date(vd+'T12:00:00'));const wd=Array.from({length:7},(_,i)=>addDays(ws,i));
   const wShifts=shifts.filter(s=>wd.includes(s.date));
   /* Labor cost = sum of each day's actual prorated shift pay (base+OT+ND+premium
@@ -9879,12 +9901,16 @@ function renderShiftsTab(vd,co){
   const dayTipPayable=staffPayables.filter(p=>p.date===vd&&p.type==='tip'&&p.status==='unpaid').reduce((s,p)=>s+p.amount,0);
   const dist=calcSCTipDistribution(vd);
   const distRows=dist.map(d=>`<tr><td style="font-size:.8rem;font-weight:500">${esc(d.name)}</td><td style="font-size:.75rem;color:var(--muted2)">${esc(d.position)}</td><td class="mono" style="text-align:right;font-size:.79rem">${d.hoursWorked.toFixed(1)}h</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--muted2)">${d.sharePct.toFixed(1)}%</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--purple)">${fmt(d.scShare)}</td><td class="mono" style="text-align:right;font-size:.79rem;color:var(--amber)">${fmt(d.tipShare)}</td><td class="mono" style="text-align:right;font-size:.82rem;font-weight:600">${fmt(d.totalShare)}</td></tr>`).join('');
-  const wRows=wd.map(date=>{const ds=shifts.filter(s=>s.date===date);const dc=dayLaborCostFromShifts(date);const dh=ds.reduce((s,x)=>s+x.hoursWorked,0);const dS=transactions.filter(t=>t.date===date&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);const dp=dS>0?(dc/dS*100):0;const hol=getHoliday(date);return`<tr style="${date===vd?'background:rgba(41,37,36,.06)':''}cursor:pointer" onclick="window._laborDate='${date}';renderMain()"><td style="font-size:.79rem;white-space:nowrap">${new Date(date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})}${date===today()?'<span style="font-size:.63rem;color:var(--amber);margin-left:3px">today</span>':''}${hol?`<span class="holiday-badge ${hol.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${hol.type==='regular'?'RH':'SH'}</span>`:''}</td><td style="text-align:center;font-size:.79rem">${ds.length}</td><td class="mono" style="text-align:right;font-size:.79rem">${dh.toFixed(1)}h</td><td class="mono" style="text-align:right;font-size:.79rem">${fmt(dc)}</td><td class="mono" style="text-align:right;font-size:.79rem;color:${dS>0?(dp<=32?'var(--green)':dp<=38?'var(--amber)':'var(--red)'):'var(--muted2)'}">${dS>0?dp.toFixed(1)+'%':'—'}</td></tr>`;}).join('');
-  const dRows=dShifts.length?dShifts.map(s=>{const e=roster.find(r=>r.id===s.employeeId);const pay=computeShiftPay(s,e);return`<div class="shift-row"><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:.83rem">${esc(e?.name||'Unknown')}</div><div style="font-size:.69rem;color:var(--muted2)">${esc(e?.position||'')} · ${s.timeIn}–${s.timeOut}${s.breakMins?` · ${s.breakMins}m break`:''}${pay&&pay.lateMinutes>0?`<span class="late-badge" style="margin-left:4px">${pay.lateMinutes}m late → ${pay.tardinessBracketMins}m</span>`:''}${pay&&pay.undertimeHrs>0?`<span class="late-badge" style="margin-left:4px">UT ${pay.undertimeHrs.toFixed(1)}h</span>`:''}${pay?.isHoliday?`<span class="holiday-badge ${pay.holiday?.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${pay.holidayNote}</span>`:''}</div></div><span class="mono" style="font-size:.8rem;color:var(--muted2);white-space:nowrap">${s.hoursWorked.toFixed(1)}h</span>${pay&&pay.otHrs>0?`<span style="font-size:.72rem;color:var(--blue);white-space:nowrap">OT:${pay.otHrs.toFixed(1)}h</span>`:''}${pay&&pay.ndHrs>0?`<span style="font-size:.72rem;color:var(--purple);white-space:nowrap">ND:${pay.ndHrs.toFixed(1)}h</span>`:''}<span class="mono" style="font-size:.82rem;color:var(--green);white-space:nowrap">${fmt(pay?.grossPay||0)}</span><button class="row-btn" onclick="openModal('editShift','${s.id}')" title="Edit">✎</button><button class="row-btn del" onclick="deleteShift('${s.id}')" title="Delete">✕</button></div>`}).join(''):`<div class="empty" style="padding:14px">No shifts logged. <button class="btn btn-ghost btn-sm" onclick="openModal('addShift')">+ Log Shift</button></div>`;
-  return`<div class="g5" style="margin-bottom:12px"><div class="card"><div class="stat-label">Week Labor Cost</div><div class="stat-value red">${fmt(wCost)}</div><div class="stat-sub">${wHrs.toFixed(1)}h total</div></div><div class="card"><div class="stat-label">Labor % (Week)</div><div class="stat-value">${wSales>0?lPct.toFixed(1):'—'}%</div>${wSales>0?pctBadge(lPct,'labor'):''}</div><div class="card"><div class="stat-label">Today Labor Cost</div><div class="stat-value red">${fmt(dCost)}</div><div class="stat-sub">Labor %: ${dSales>0?(dCost/dSales*100).toFixed(1)+'%':'—'}</div></div><div class="card"><div class="stat-label">SC Pool</div><div class="stat-value" style="color:var(--purple)">${fmt(dayScPayable)}</div><div class="stat-sub">${fmtDate(vd)}</div></div><div class="card"><div class="stat-label">Tips Pool</div><div class="stat-value" style="color:var(--amber)">${fmt(dayTipPayable)}</div><div class="stat-sub">${fmtDate(vd)}</div></div></div>
+  const wRows=wd.map(date=>{const ds=shifts.filter(s=>s.date===date);const dc=dayLaborCostFromShifts(date);const dh=ds.reduce((s,x)=>s+x.hoursWorked,0);const dS=transactions.filter(t=>t.date===date&&t.type==='sale'&&!t.voided).reduce((s,t)=>s+t.amount,0);const dp=dS>0?(dc/dS*100):0;const hol=getHoliday(date);return`<tr style="${date===vd?'background:rgba(41,37,36,.06)':''}cursor:pointer" onclick="window._laborDate='${date}';renderMain()"><td style="font-size:.79rem;white-space:nowrap">${new Date(date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})}${date===today()?'<span style="font-size:.63rem;color:var(--amber);margin-left:3px">today</span>':''}${hol?`<span class="holiday-badge ${hol.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${hol.type==='regular'?'RH':'SH'}</span>`:''}</td><td style="text-align:center;font-size:.79rem">${ds.length}</td><td class="mono" style="text-align:right;font-size:.79rem">${dh.toFixed(1)}h</td>${isStaff?'':`<td class="mono" style="text-align:right;font-size:.79rem">${fmt(dc)}</td>`}<td class="mono" style="text-align:right;font-size:.79rem;color:${dS>0?(dp<=32?'var(--green)':dp<=38?'var(--amber)':'var(--red)'):'var(--muted2)'}">${dS>0?dp.toFixed(1)+'%':'—'}</td></tr>`;}).join('');
+  const dRows=dShifts.length?dShifts.map(s=>{const e=roster.find(r=>r.id===s.employeeId);const pay=computeShiftPay(s,e);return`<div class="shift-row"><div style="flex:1;min-width:0"><div style="font-weight:600;font-size:.83rem">${esc(e?.name||'Unknown')}</div><div style="font-size:.69rem;color:var(--muted2)">${esc(e?.position||'')} · ${s.timeIn}–${s.timeOut}${s.breakMins?` · ${s.breakMins}m break`:''}${pay&&pay.lateMinutes>0?`<span class="late-badge" style="margin-left:4px">${pay.lateMinutes}m late → ${pay.tardinessBracketMins}m</span>`:''}${pay&&pay.undertimeHrs>0?`<span class="late-badge" style="margin-left:4px">UT ${pay.undertimeHrs.toFixed(1)}h</span>`:''}${pay?.isHoliday?`<span class="holiday-badge ${pay.holiday?.type==='regular'?'hol-regular':'hol-special'}" style="margin-left:4px">${pay.holidayNote}</span>`:''}</div></div><span class="mono" style="font-size:.8rem;color:var(--muted2);white-space:nowrap">${s.hoursWorked.toFixed(1)}h</span>${pay&&pay.otHrs>0?`<span style="font-size:.72rem;color:var(--blue);white-space:nowrap">OT:${pay.otHrs.toFixed(1)}h</span>`:''}${pay&&pay.ndHrs>0?`<span style="font-size:.72rem;color:var(--purple);white-space:nowrap">ND:${pay.ndHrs.toFixed(1)}h</span>`:''}${isStaff?'':`<span class="mono" style="font-size:.82rem;color:var(--green);white-space:nowrap">${fmt(pay?.grossPay||0)}</span>`}<button class="row-btn" onclick="openModal('editShift','${s.id}')" title="Edit">✎</button>${isStaff?'':`<button class="row-btn del" onclick="deleteShift('${s.id}')" title="Delete">✕</button>`}</div>`}).join(''):`<div class="empty" style="padding:14px">No shifts logged. <button class="btn btn-ghost btn-sm" onclick="openModal('addShift')">+ Log Shift</button></div>`;
+  return`<div class="g5" style="margin-bottom:12px">${isStaff
+    ?`<div class="card"><div class="stat-label">Week Hours</div><div class="stat-value">${wHrs.toFixed(1)}h</div><div class="stat-sub">${wShifts.length} shift${wShifts.length===1?'':'s'}</div></div>`
+    :`<div class="card"><div class="stat-label">Week Labor Cost</div><div class="stat-value red">${fmt(wCost)}</div><div class="stat-sub">${wHrs.toFixed(1)}h total</div></div>`}<div class="card"><div class="stat-label">Labor % (Week)</div><div class="stat-value">${wSales>0?lPct.toFixed(1):'—'}%</div>${wSales>0?pctBadge(lPct,'labor'):''}</div>${isStaff
+    ?`<div class="card"><div class="stat-label">Today Hours</div><div class="stat-value">${dShifts.reduce((s,x)=>s+x.hoursWorked,0).toFixed(1)}h</div><div class="stat-sub">Labor %: ${dSales>0?(dCost/dSales*100).toFixed(1)+'%':'—'}</div></div>`
+    :`<div class="card"><div class="stat-label">Today Labor Cost</div><div class="stat-value red">${fmt(dCost)}</div><div class="stat-sub">Labor %: ${dSales>0?(dCost/dSales*100).toFixed(1)+'%':'—'}</div></div>`}<div class="card"><div class="stat-label">SC Pool</div><div class="stat-value" style="color:var(--purple)">${fmt(dayScPayable)}</div><div class="stat-sub">${fmtDate(vd)}</div></div><div class="card"><div class="stat-label">Tips Pool</div><div class="stat-value" style="color:var(--amber)">${fmt(dayTipPayable)}</div><div class="stat-sub">${fmtDate(vd)}</div></div></div>
 <div style="display:grid;grid-template-columns:1fr 1.4fr;gap:12px;margin-bottom:12px">
-<div class="card-flush"><div style="padding:8px 12px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border)"><span class="sec-title">Week Overview</span><div style="display:flex;gap:4px"><button class="btn btn-ghost btn-xs" onclick="window._laborDate=addDays('${ws}',-7);renderMain()">← Prev</button><button class="btn btn-ghost btn-xs" onclick="window._laborDate=addDays('${ws}',7);renderMain()">Next →</button></div></div><table class="labor-table"><thead><tr><th>Date</th><th style="text-align:center">Staff</th><th style="text-align:right">Hrs</th><th style="text-align:right">Cost</th><th style="text-align:right">Labor%</th></tr></thead><tbody>${wRows}</tbody><tfoot><tr style="font-weight:700;background:var(--bg3)"><td>Total</td><td style="text-align:center">${wShifts.length}</td><td class="mono" style="text-align:right">${wHrs.toFixed(1)}h</td><td class="mono" style="text-align:right">${fmt(wCost)}</td><td class="mono" style="text-align:right;color:${lPct<=32?'var(--green)':lPct<=38?'var(--amber)':'var(--red)'}">${wSales>0?lPct.toFixed(1)+'%':'—'}</td></tr></tfoot></table></div>
-<div><div class="card" style="margin-bottom:10px"><div class="sec-hd"><span class="sec-title">Shifts — ${new Date(vd+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'short',day:'numeric'})}</span><button class="btn btn-ghost btn-xs" onclick="openModal('addShift')">+ Add</button></div>${dRows}${dShifts.length?`<div class="divider"></div><div style="display:flex;justify-content:space-between;font-size:.82rem;font-weight:600"><span>Total</span><div style="display:flex;gap:14px"><span class="mono">${dShifts.reduce((s,x)=>s+x.hoursWorked,0).toFixed(1)}h</span><span class="mono green">${fmt(dCost)}</span></div></div>`:''}</div>
+<div class="card-flush"><div style="padding:8px 12px;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border)"><span class="sec-title">Week Overview</span><div style="display:flex;gap:4px"><button class="btn btn-ghost btn-xs" onclick="window._laborDate=addDays('${ws}',-7);renderMain()">← Prev</button><button class="btn btn-ghost btn-xs" onclick="window._laborDate=addDays('${ws}',7);renderMain()">Next →</button></div></div><table class="labor-table"><thead><tr><th>Date</th><th style="text-align:center">Staff</th><th style="text-align:right">Hrs</th>${isStaff?'':'<th style="text-align:right">Cost</th>'}<th style="text-align:right">Labor%</th></tr></thead><tbody>${wRows}</tbody><tfoot><tr style="font-weight:700;background:var(--bg3)"><td>Total</td><td style="text-align:center">${wShifts.length}</td><td class="mono" style="text-align:right">${wHrs.toFixed(1)}h</td>${isStaff?'':`<td class="mono" style="text-align:right">${fmt(wCost)}</td>`}<td class="mono" style="text-align:right;color:${lPct<=32?'var(--green)':lPct<=38?'var(--amber)':'var(--red)'}">${wSales>0?lPct.toFixed(1)+'%':'—'}</td></tr></tfoot></table></div>
+<div><div class="card" style="margin-bottom:10px"><div class="sec-hd"><span class="sec-title">Shifts — ${new Date(vd+'T12:00:00').toLocaleDateString('en-US',{weekday:'long',month:'short',day:'numeric'})}</span><button class="btn btn-ghost btn-xs" onclick="openModal('addShift')">+ Add</button></div>${dRows}${dShifts.length?`<div class="divider"></div><div style="display:flex;justify-content:space-between;font-size:.82rem;font-weight:600"><span>Total</span><div style="display:flex;gap:14px"><span class="mono">${dShifts.reduce((s,x)=>s+x.hoursWorked,0).toFixed(1)}h</span>${isStaff?'':`<span class="mono green">${fmt(dCost)}</span>`}</div></div>`:''}</div>
 <div class="card-flush"><div style="padding:8px 12px;background:var(--bg3);border-bottom:1px solid var(--border);display:flex;justify-content:space-between"><span class="sec-title">SC & Tip Distribution — ${fmtDate(vd)}</span><span style="font-size:.73rem;color:var(--muted2)">Proportional by hours</span></div>${dist.length?`<table class="labor-table"><thead><tr><th>Employee</th><th>Position</th><th style="text-align:right">Hrs</th><th style="text-align:right">Share%</th><th style="text-align:right">SC</th><th style="text-align:right">Tips</th><th style="text-align:right">Total</th></tr></thead><tbody>${distRows}</tbody><tfoot><tr style="font-weight:700;background:var(--bg3)"><td colspan="4">Total</td><td class="mono" style="text-align:right;color:var(--purple)">${fmt(dayScPayable)}</td><td class="mono" style="text-align:right;color:var(--amber)">${fmt(dayTipPayable)}</td><td class="mono" style="text-align:right">${fmt(dayScPayable+dayTipPayable)}</td></tr></tfoot></table>`:`<div class="empty">No eligible shifts for this day</div>`}</div></div></div>`;
 }
 function renderPayrollTab(co){
@@ -12037,8 +12063,80 @@ function pgSystemHealth(){
   </div>`;
 }
 
+/* ═══════════════════════════════════════════════
+   PAGE: PULSE — simplified running KPIs
+   ─────────────────────────────────────────────
+   Supervisor-facing glanceable view (also in the manager nav): category-
+   matched cost ratios + live shift-based labor, week-to-date and month-to-
+   date, % only (no peso wage amounts — rates are manager-only) with a short
+   advisory note per KPI. Freshness = logging discipline: costs appear when
+   expenses are logged with the right category, sales when the DSR is posted,
+   labor as shifts are logged. Advisory bands are fixed v1 values (food 35/40,
+   bev 30/35, consumables 5/8 of total sales); labor uses the configured
+   target from Weekly Check/monthly budget.
+═══════════════════════════════════════════════ */
+function pgPulse(){
+  const td=today();
+  const ws=isoWeekStart(new Date(td+'T12:00:00'));
+  const ms=td.slice(0,8)+'01';
+  const live=(transactions||[]).filter(t=>t&&!t.voided);
+  /* Category matching by coaId with name fallback (legacy txs pre-coaId). */
+  const FOOD_S=new Set(['r4000','Food Sales']), FOOD_C=new Set(['c5000','Food COGS']);
+  const BEV_S=new Set(['r4010','r4020','Non-Alcoholic Beverage Sales','Alcohol Sales']);
+  const BEV_C=new Set(['c5010','c5020','Non-Alcoholic Beverage COGS','Alcohol COGS']);
+  const CONS_C=new Set(['c5040','Packaging & Takeout Supplies']);
+  const sumTx=(type,from,ids)=>live.filter(t=>t.type===type&&t.date>=from&&t.date<=td&&(!ids||ids.has(t.coaId)||ids.has(t.category))).reduce((s,t)=>s+(Number(t.amount)||0),0);
+  /* Labor = shift-based day costs (same engine as the Labor page), accrual —
+     counts worked shifts whether or not payroll has been finalized. */
+  const laborFor=from=>{const seen={};let sum=0;(shifts||[]).forEach(s=>{if(!s||!s.date||seen[s.date]||s.date<from||s.date>td)return;seen[s.date]=true;sum+=dayLaborCostFromShifts(s.date)||0;});return sum;};
+  const calc=from=>{
+    const totalSales=sumTx('sale',from,null);
+    const foodS=sumTx('sale',from,FOOD_S), bevS=sumTx('sale',from,BEV_S);
+    return {
+      totalSales,
+      food:  foodS>0 ? sumTx('expense',from,FOOD_C)/foodS*100 : null,
+      bev:   bevS>0  ? sumTx('expense',from,BEV_C)/bevS*100   : null,
+      cons:  totalSales>0 ? sumTx('expense',from,CONS_C)/totalSales*100 : null,
+      labor: totalSales>0 ? laborFor(from)/totalSales*100     : null
+    };
+  };
+  const wk=calc(ws), mo=calc(ms);
+  const laborT=_getEffectiveTargets().labor;
+  const KPIS=[
+    {key:'food', label:'Food Cost', sub:'food purchases ÷ food sales', green:35, amber:40,
+     notes:{green:'✓ on track', amber:'Creeping up — watch portions & waste', red:'High — review portions, waste, supplier prices'}},
+    {key:'bev', label:'Beverage Cost', sub:'bev + alcohol purchases ÷ bev + alcohol sales', green:30, amber:35,
+     notes:{green:'✓ on track', amber:'Creeping up — check pours & stock', red:'High — check pours, spillage, missing stock'}},
+    {key:'cons', label:'Consumables', sub:'packaging & takeout ÷ total sales', green:5, amber:8,
+     notes:{green:'✓ on track', amber:'Rising — check takeout packaging use', red:'High — packaging leaking out or over-ordered'}},
+    {key:'labor', label:'Labor Cost', sub:'shift wages ÷ total sales', green:laborT, amber:laborT+4,
+     notes:{green:'✓ on target', amber:'Above target — review scheduling', red:'Well above target — trim or shorten shifts'}}
+  ];
+  const cell=(v,k)=>{
+    if(v===null)return `<td class="mono" style="text-align:right;color:var(--muted2)">—</td>`;
+    const color=v<=k.green?'var(--green)':v<=k.amber?'var(--amber)':'var(--red)';
+    return `<td class="mono" style="text-align:right;font-weight:600;color:${color}">${v.toFixed(1)}%</td>`;
+  };
+  const note=(v,k)=>{
+    if(v===null)return '<span style="color:var(--muted2)">no sales yet</span>';
+    const band=v<=k.green?'green':v<=k.amber?'amber':'red';
+    const color=band==='green'?'var(--green)':band==='amber'?'var(--amber)':'var(--red)';
+    return `<span style="color:${color}">${k.notes[band]}</span>`;
+  };
+  const rows=KPIS.map(k=>`<tr>
+    <td><div style="font-weight:600;font-size:.84rem">${k.label}</div><div style="font-size:.68rem;color:var(--muted2)">${k.sub}</div></td>
+    ${cell(wk[k.key],k)}${cell(mo[k.key],k)}
+    <td style="font-size:.75rem">${note(wk[k.key],k)}</td>
+  </tr>`).join('');
+  return `<div class="page-header"><div class="page-hd-left"><div class="page-title">Pulse</div><div class="page-sub">Running cost KPIs · live — updates as DSR, expenses and shifts are logged</div></div></div>
+  <div class="card-flush" style="margin-bottom:12px">
+    <table><thead><tr><th>KPI</th><th style="text-align:right">This Week</th><th style="text-align:right">This Month</th><th>Note (this week)</th></tr></thead><tbody>${rows}</tbody></table>
+  </div>
+  <div style="font-size:.72rem;color:var(--muted2);line-height:1.5">Week starts ${fmtDate(ws)} · month from ${fmtDate(ms)} · sales this week ${fmt(wk.totalSales)} · this month ${fmt(mo.totalSales)}.<br>Numbers are only as fresh as the logging — post the DSR and log expenses with the right category same-day for a true live view.</div>`;
+}
+
 function renderMain(){
-  const map={dashboard:pgDashboard,tabs:pgTabs,transactions:pgTransactions,funds:pgFunds,weekly:pgWeeklyCheck,payables:pgPayables,coa:pgCOA,dsr:pgDSR,cash:(typeof pgCash==='function'?pgCash:()=>'<div class="card">Cash module unavailable</div>'),labor:pgLabor,reports:pgReports,activity:pgActivity,forecast:pgForecast,treasury:pgCashPosition,cashposition:pgCashPosition,system:pgSystemHealth};
+  const map={dashboard:pgDashboard,tabs:pgTabs,transactions:pgTransactions,funds:pgFunds,weekly:pgWeeklyCheck,payables:pgPayables,coa:pgCOA,dsr:pgDSR,cash:(typeof pgCash==='function'?pgCash:()=>'<div class="card">Cash module unavailable</div>'),labor:pgLabor,pulse:pgPulse,reports:pgReports,activity:pgActivity,forecast:pgForecast,treasury:pgCashPosition,cashposition:pgCashPosition,system:pgSystemHealth};
   document.getElementById('main').innerHTML=(map[currentPage]||pgDashboard)();
   /* Cash Count pre-fills the drawer from a saved count via input values; run the
      recompute once so subtotals, Counted and Over/Short reflect them on load
@@ -12075,6 +12173,7 @@ function renderNav(){
   const pages=[
     {id:'dashboard',icon:'▦',label:'Dashboard'},
     {id:'dsr',icon:'📋',label:'Daily Summary'},
+    {id:'pulse',icon:'✦',label:'Pulse'},
     {id:'tabs',icon:'⬜',label:'Tabs'},
     {id:'transactions',icon:'⇄',label:'Transactions'},
     {id:'cash',icon:'💵',label:'Cash Count'},
