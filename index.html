@@ -12089,6 +12089,31 @@ function pgSystemHealth(){
    bev 30/35, consumables 5/8 of total sales); labor uses the configured
    target from Weekly Check/monthly budget.
 ═══════════════════════════════════════════════ */
+/* Monthly peso budgets for the Pulse staff-spend rows (Staff Meals, Uniforms &
+   Staff Welfare). Stored on kpiTargets (already persisted + synced) — global
+   monthly amounts, not per-month rows, so they carry forward without re-entry.
+   Manager-only setter; staff see the amounts read-only (user decision: spend
+   vs budget is fine to show staff — it's monitoring, not rates). */
+function setPulseBudget(key,val){
+  if(userRole==='staff'){toast('Budgets are manager-only','error');return;}
+  const v=Math.max(0,parseFloat(val)||0);
+  if(!kpiTargets||typeof kpiTargets!=='object')kpiTargets={};
+  kpiTargets.pulseBudgets={...(kpiTargets.pulseBudgets||{}),[key]:v};
+  scheduleSave();renderMain();
+}
+/* Per-KPI cost-band overrides for Pulse (food/bev/consumables — labor stays
+   wired to the Weekly Check target, single source of truth). which: 'g'
+   (green ceiling) or 'a' (amber ceiling). 0/blank = fall back to the built-in
+   default for that KPI. Same storage + role rules as the spend budgets. */
+function setPulseBand(key,which,val){
+  if(userRole==='staff'){toast('Targets are manager-only','error');return;}
+  const v=Math.max(0,Math.min(100,parseFloat(val)||0));
+  if(!kpiTargets||typeof kpiTargets!=='object')kpiTargets={};
+  const bands={...(kpiTargets.pulseBands||{})};
+  bands[key]={...(bands[key]||{}),[which]:v};
+  kpiTargets.pulseBands=bands;
+  scheduleSave();renderMain();
+}
 function pgPulse(){
   const td=today();
   const ws=isoWeekStart(new Date(td+'T12:00:00'));
@@ -12128,16 +12153,38 @@ function pgPulse(){
     : [{label:'This Week',from:ws,to:td},{label:'This Month',from:ms,to:td}];
   const data=cols.map(cl=>calc(cl.from,cl.to));
   const laborT=_getEffectiveTargets().labor;
+  /* Band resolution: manager-set overrides (kpiTargets.pulseBands) win over
+     the built-in defaults; 0/blank falls back. Amber is clamped to ≥ green so
+     a mis-ordered pair can never make the amber band unreachable. */
+  const _bands=(kpiTargets&&kpiTargets.pulseBands)||{};
+  const bandOf=(key,defG,defA)=>{
+    const b=_bands[key]||{};
+    const g=Number(b.g)>0?Number(b.g):defG;
+    const a=Number(b.a)>0?Number(b.a):defA;
+    return {green:g, amber:Math.max(a,g)};
+  };
+  const fb=bandOf('food',35,40), bb=bandOf('bev',30,35), cb=bandOf('cons',5,8);
   const KPIS=[
-    {key:'food', label:'Food Cost', sub:'food purchases ÷ food sales', green:35, amber:40,
+    {key:'food', label:'Food Cost', sub:'food purchases ÷ food sales', green:fb.green, amber:fb.amber, editable:true,
      notes:{green:'✓ on track', amber:'Creeping up — watch portions & waste', red:'High — review portions, waste, supplier prices'}},
-    {key:'bev', label:'Beverage Cost', sub:'bev + alcohol purchases ÷ bev + alcohol sales', green:30, amber:35,
+    {key:'bev', label:'Beverage Cost', sub:'bev + alcohol purchases ÷ bev + alcohol sales', green:bb.green, amber:bb.amber, editable:true,
      notes:{green:'✓ on track', amber:'Creeping up — check pours & stock', red:'High — check pours, spillage, missing stock'}},
-    {key:'cons', label:'Consumables', sub:'packaging & takeout ÷ total sales', green:5, amber:8,
+    {key:'cons', label:'Consumables', sub:'packaging & takeout ÷ total sales', green:cb.green, amber:cb.amber, editable:true,
      notes:{green:'✓ on track', amber:'Rising — check takeout packaging use', red:'High — packaging leaking out or over-ordered'}},
-    {key:'labor', label:'Labor Cost', sub:'shift wages ÷ total sales', green:laborT, amber:laborT+4,
+    {key:'labor', label:'Labor Cost', sub:'shift wages ÷ total sales', green:laborT, amber:laborT+4, editable:false,
      notes:{green:'✓ on target', amber:'Above target — review scheduling', red:'Well above target — trim or shorten shifts'}}
   ];
+  /* Inline band editor (manager only): green ceiling + amber ceiling per KPI.
+     Labor shows its source instead — it's owned by Weekly Check / monthly
+     budget, not edited here (single source of truth). */
+  const bandEditor=k=>{
+    if(isStaff)return '';
+    if(!k.editable)return `<div style="font-size:.62rem;color:var(--muted2);margin-top:3px">target from Weekly Check: ≤${k.green}%</div>`;
+    return `<div style="display:flex;gap:3px;align-items:center;margin-top:3px;font-size:.62rem;color:var(--muted2)">
+      ≤<input type="number" min="0" max="100" step="0.5" value="${k.green}" onchange="setPulseBand('${k.key}','g',this.value)" title="Green ceiling — at or below this % is on track (0 = reset to default)" style="width:52px;padding:2px 4px;font-size:.7rem;text-align:right">%
+      <span style="color:var(--green)">ok</span> · ≤<input type="number" min="0" max="100" step="0.5" value="${k.amber}" onchange="setPulseBand('${k.key}','a',this.value)" title="Amber ceiling — between green and this % is a warning; above is red (0 = reset to default)" style="width:52px;padding:2px 4px;font-size:.7rem;text-align:right">%
+      <span style="color:var(--amber)">warn</span></div>`;
+  };
   const cell=(d,k)=>{
     const v=d[k.key].pct;
     if(v===null)return `<td class="mono" style="text-align:right;color:var(--muted2)">—</td>`;
@@ -12152,11 +12199,37 @@ function pgPulse(){
     return `<span style="color:${color}">${k.notes[band]}</span>`;
   };
   const rows=KPIS.map(k=>`<tr>
-    <td><div style="font-weight:600;font-size:.84rem">${k.label}</div><div style="font-size:.68rem;color:var(--muted2)">${k.sub}</div></td>
+    <td><div style="font-weight:600;font-size:.84rem">${k.label}</div><div style="font-size:.68rem;color:var(--muted2)">${k.sub}</div>${bandEditor(k)}</td>
     ${data.map(d=>cell(d,k)).join('')}
     <td style="font-size:.75rem">${note(data[0][k.key].pct,k)}</td>
   </tr>`).join('');
   const headCols=cols.map(cl=>`<th style="text-align:right">${cl.label}</th>`).join('');
+  /* Staff-spend rows — PESO amounts, visible to all roles (user decision:
+     these are monitored against a budget, not a ratio, and reveal no rates).
+     Note always tracks MONTH-to-date vs the monthly budget, pace-aware:
+     over budget → red; spending faster than the month is elapsing (+10pt
+     grace) → amber; else green with the remaining amount. */
+  const SPEND=[
+    {key:'meals',  label:'Staff Meals',              ids:new Set(['x6090','Staff Meals'])},
+    {key:'welfare',label:'Uniforms & Staff Welfare', ids:new Set(['x6100','Uniforms & Staff Welfare'])}
+  ];
+  const _pb=(kpiTargets&&kpiTargets.pulseBudgets)||{};
+  const dim=new Date(parseInt(td.slice(0,4)),parseInt(td.slice(5,7)),0).getDate();
+  const elapsedP=parseInt(td.slice(8,10))/dim*100;
+  const spendRows=SPEND.map(k=>{
+    const perCol=cols.map(cl=>`<td class="mono" style="text-align:right">${fmt(sumTx('expense',cl.from,cl.to,k.ids))}</td>`).join('');
+    const budget=Number(_pb[k.key])||0;
+    const mtd=sumTx('expense',ms,td,k.ids);
+    let note,color;
+    if(!budget){ note=isStaff?'no budget set':'set a monthly budget →'; color='var(--muted2)'; }
+    else if(mtd>budget){ note=`Over budget by ${fmt(mtd-budget)}`; color='var(--red)'; }
+    else if(mtd/budget*100>elapsedP+10){ note=`Ahead of pace — ${fmt(budget-mtd)} left, ${(100-elapsedP).toFixed(0)}% of month to go`; color='var(--amber)'; }
+    else{ note=`On pace · ${fmt(budget-mtd)} left this month`; color='var(--green)'; }
+    const budgetCell=isStaff
+      ? `<td class="mono" style="text-align:right;color:var(--muted2)">${budget?fmt(budget):'—'}</td>`
+      : `<td style="text-align:right"><input type="number" min="0" step="100" value="${budget||''}" placeholder="0" onchange="setPulseBudget('${k.key}',this.value)" title="Monthly budget for ${k.label} — saves on change" style="width:110px;text-align:right;padding:4px 8px;font-size:.8rem"></td>`;
+    return `<tr><td style="font-weight:600;font-size:.84rem">${k.label}</td>${perCol}${budgetCell}<td style="font-size:.75rem;color:${color}">${note}</td></tr>`;
+  }).join('');
   return `<div class="page-header"><div class="page-hd-left"><div class="page-title">Pulse</div><div class="page-sub">Running cost KPIs · live — updates as DSR, expenses and shifts are logged</div></div>
   <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
     <span style="font-size:.72rem;color:var(--muted2);font-weight:500">Custom range:</span>
@@ -12168,6 +12241,9 @@ function pgPulse(){
   </div></div>
   <div class="card-flush" style="margin-bottom:12px">
     <table><thead><tr><th>KPI</th>${headCols}<th>Note${customActive?'':' (this week)'}</th></tr></thead><tbody>${rows}</tbody></table>
+  </div>
+  <div class="card-flush" style="margin-bottom:12px">
+    <table><thead><tr><th>Staff Spend</th>${headCols}<th style="text-align:right">Monthly Budget</th><th>Note (month vs budget)</th></tr></thead><tbody>${spendRows}</tbody></table>
   </div>
   <div style="font-size:.72rem;color:var(--muted2);line-height:1.5">${customActive
     ? `Showing ${fmtDate(cf)} – ${fmtDate(ct)} · sales in range ${fmt(data[0].totalSales)}.`
