@@ -12131,9 +12131,11 @@ function pgPulse(){
   const BEV_S=new Set(['r4010','r4020','Non-Alcoholic Beverage Sales','Alcohol Sales']);
   const BEV_C=new Set(['c5010','c5020','Non-Alcoholic Beverage COGS','Alcohol COGS']);
   const CONS_C=new Set(['c5040','Packaging & Takeout Supplies']);
-  /* Output VAT rides a dsr_adjustment to l2100; discounts/refunds ride
-     contra-revenue dsr_adjustments (matched dynamically so user-added contra
-     accounts count too). Both must come OFF the sale denominators below. */
+  /* Output VAT rides a dsr_adjustment to l2100 — it comes OFF the sale
+     denominators. CONTRA_ALL (contra-revenue COAs, matched dynamically) is
+     used ONLY for MANUAL contra entries (type sale/deposit); DSR-posted
+     discount/refund dsr_adjustments are memos already netted out of the sale
+     rows and must NOT be subtracted again (see calc's Option A note). */
   const VAT_ADJ=new Set(['l2100','VAT Payable']);
   const CONTRA_ALL=new Set();
   (coa||[]).forEach(x=>{ if(x&&x.type==='contra_revenue'){ CONTRA_ALL.add(x.id); CONTRA_ALL.add(x.name); } });
@@ -12147,18 +12149,21 @@ function pgPulse(){
      counts worked shifts whether or not payroll has been finalized. */
   const laborFor=(from,to)=>{const seen={};let sum=0;(shifts||[]).forEach(s=>{if(!s||!s.date||seen[s.date]||s.date<from||s.date>to)return;seen[s.date]=true;sum+=dayLaborCostFromShifts(s.date)||0;});return sum;};
   const calc=(from,to)=>{
-    /* NET basis (July 2026 fix): DSR sale rows are VAT-INCLUSIVE — the actual
-       Output VAT from the Z-reading rides a separate dsr_adjustment (l2100),
-       and discounts/refunds ride contra dsr_adjustments. The dashboard nets
-       both out of revenue before any margin math (netRevenue = gross − contra
-       − VAT); Pulse must sit on the same base or every ratio reads ~10.7%
-       (12/112) too LOW and a dashboard-red KPI can show green here.
-       VAT/contra aren't recorded per category, so category denominators are
-       netted PROPORTIONALLY via netFactor — exact when all categories are
-       VATable (this shop's case). */
+    /* NET basis (July 2026 fix, corrected): DSR sale rows are the category
+       breakdown of NET SALES — ALREADY net of discounts, SC and refunds (the
+       DSR's variance check enforces this), but still VAT-INCLUSIVE. So the
+       only thing to strip is Output VAT (the dsr_adjustment to l2100), plus
+       MANUAL contra entries (sale/deposit typed with a contra COA — rare;
+       usually ~0). DSR-posted discount/refund adjustments are MEMOS — the
+       amounts are already absent from the sale rows, and subtracting them
+       again double-counts (that bug made Pulse read HIGH vs the DSR page).
+       This mirrors _calcMetricsImpl's "Option A" exactly: netRevenue =
+       gross − manualContra − outputVat. VAT isn't recorded per category, so
+       category denominators are netted PROPORTIONALLY via netFactor — exact
+       when all categories are VATable (this shop's case). */
     const gross=sumTx('sale',from,to,null);
     const vat=sumTx('dsr_adjustment',from,to,VAT_ADJ);
-    const contra=sumTx('dsr_adjustment',from,to,CONTRA_ALL);
+    const contra=live.filter(t=>(t.type==='sale'||t.type==='deposit')&&t.date>=from&&t.date<=to&&(CONTRA_ALL.has(t.coaId)||CONTRA_ALL.has(t.category))).reduce((s,t)=>s+(Number(t.amount)||0),0);
     const netFactor=gross>0?Math.max(0,(gross-vat-contra)/gross):1;
     const totalSales=gross*netFactor;
     const foodS=sumTx('sale',from,to,FOOD_S)*netFactor, bevS=sumTx('sale',from,to,BEV_S)*netFactor;
@@ -12280,7 +12285,7 @@ function pgPulse(){
   </div>
   <div style="font-size:.72rem;color:var(--muted2);line-height:1.5">${customActive
     ? `Showing ${fmtDate(cf)} – ${fmtDate(ct)} · net sales in range ${fmt(data[0].totalSales)}.`
-    : `Week starts ${fmtDate(ws)} · month from ${fmtDate(ms)} · net sales this week ${fmt(data[0].totalSales)} · this month ${fmt(data[1].totalSales)}.`}<br>All denominators are NET of Output VAT and discounts — same basis as the dashboard and DSR, so the numbers tie. Only as fresh as the logging: post the DSR and log expenses with the right category same-day for a true live view.</div>`;
+    : `Week starts ${fmtDate(ws)} · month from ${fmtDate(ms)} · net sales this week ${fmt(data[0].totalSales)} · this month ${fmt(data[1].totalSales)}.`}<br>All denominators are NET of Output VAT (discounts/SC/refunds are already excluded from the DSR's category figures) — same basis as the DSR's "VATable Sales" and the dashboard's Net Sales, so the numbers tie. Counts POSTED days only — an entered-but-unposted DSR isn't included yet. Only as fresh as the logging: post the DSR and log expenses with the right category same-day.</div>`;
 }
 
 function renderMain(){
