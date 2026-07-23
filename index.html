@@ -12145,9 +12145,27 @@ function pgPulse(){
      COGS instead of a hardcoded id list that goes stale. */
   const COGS_ALL=new Set();
   (coa||[]).forEach(x=>{ if(x&&x.type==='cogs'){ COGS_ALL.add(x.id); COGS_ALL.add(x.name); } });
-  /* Labor = shift-based day costs (same engine as the Labor page), accrual —
-     counts worked shifts whether or not payroll has been finalized. */
-  const laborFor=(from,to)=>{const seen={};let sum=0;(shifts||[]).forEach(s=>{if(!s||!s.date||seen[s.date]||s.date<from||s.date>to)return;seen[s.date]=true;sum+=dayLaborCostFromShifts(s.date)||0;});return sum;};
+  /* Labor = shift wages + ANCILLARY labor, replicating the dashboard's "live
+     shifts + ancillaries" definition exactly (July 2026 fix — shift-only made
+     Pulse labor read low vs the dashboard):
+       1. shift wages — dayLaborCostFromShifts per day (accrual; counts worked
+          shifts whether or not payroll is finalized)
+       2. ancillaries — Labor-group expense txs EXCLUDING direct wage accounts
+          x6000–x6070 (those are already in the shift portion; including them
+          would double-count on payroll-finalize dates). Catches Staff Meals,
+          Uniforms & Welfare, Training, Payroll Taxes & Benefits (net of the
+          eeShare employee-deducted portion), MGT Salaries, 13th Month. */
+  const _WAGE_IDS=new Set(['x6000','x6010','x6020','x6030','x6040','x6050','x6060','x6070']);
+  const LABOR_ANC=new Set();
+  (coa||[]).forEach(x=>{ if(x&&x.group==='Labor'&&x.type==='expense'&&!_WAGE_IDS.has(x.id)){ LABOR_ANC.add(x.id); LABOR_ANC.add(x.name); } });
+  const ancLaborFor=(from,to)=>live
+    .filter(t=>t.type==='expense'&&t.date>=from&&t.date<=to&&!_WAGE_IDS.has(t.coaId)&&(LABOR_ANC.has(t.coaId)||LABOR_ANC.has(t.category)))
+    .reduce((s,t)=>s+Math.max(0,(Number(t.amount)||0)-(Number(t.eeShare)||0)),0);
+  const laborFor=(from,to)=>{
+    const seen={};let sum=0;
+    (shifts||[]).forEach(s=>{if(!s||!s.date||seen[s.date]||s.date<from||s.date>to)return;seen[s.date]=true;sum+=dayLaborCostFromShifts(s.date)||0;});
+    return sum+ancLaborFor(from,to);
+  };
   const calc=(from,to)=>{
     /* NET basis (July 2026 fix, corrected): DSR sale rows are the category
        breakdown of NET SALES — ALREADY net of discounts, SC and refunds (the
@@ -12207,7 +12225,7 @@ function pgPulse(){
      notes:{green:'✓ on track', amber:'Rising — check takeout packaging use', red:'High — packaging leaking out or over-ordered'}},
     {key:'cogs', label:'Total COGS', sub:'all COGS purchases ÷ net total sales', green:cogsT, amber:cogsT+5, editable:false,
      notes:{green:'✓ on target', amber:'Above target — check the category rows above for the culprit', red:'Well above target — purchasing/waste problem, drill into the rows above'}},
-    {key:'labor', label:'Labor Cost', sub:'shift wages ÷ net total sales', green:laborT, amber:laborT+4, editable:false,
+    {key:'labor', label:'Labor Cost', sub:'shift wages + ancillaries ÷ net total sales', green:laborT, amber:laborT+4, editable:false,
      notes:{green:'✓ on target', amber:'Above target — review scheduling', red:'Well above target — trim or shorten shifts'}},
     {key:'prime', label:'Prime Cost', sub:'COGS + labor ÷ net total sales', green:primeT, amber:primeT+5, editable:false,
      notes:{green:'✓ on target', amber:'Above target — margin is tightening', red:'Well above target — margin squeeze, act on COGS or labor now'}}
@@ -12241,6 +12259,64 @@ function pgPulse(){
     ${data.map(d=>cell(d,k)).join('')}
     <td style="font-size:.75rem">${note(data[0][k.key].pct,k)}</td>
   </tr>`).join('');
+  /* ── RECONCILE vs DSR (manager-only diagnostic) ──
+     Per-day: the DSR entry's own "VATable Sales" (tNet − tVAT, from the raw
+     form fields) vs Pulse's ledger-derived net for that day, with a flag
+     column naming WHY they differ: not posted, entry variance (categories
+     don't sum to Net Sales), non-DSR sale txs (manual/backfill entries the
+     DSR page never sees), missing VAT row. Scoped to the FIRST column's
+     range (This Week or the custom range) to keep it bounded. */
+  const reconPanel=(()=>{
+    if(isStaff)return '';
+    const rFrom=cols[0].from, rTo=cols[0].to;
+    const num=v=>Number(v)||0;
+    const days=[];
+    for(let d=rFrom; d<=rTo; d=addDays(d,1)) days.push(d);
+    let sumVatable=0, sumLedger=0, anyRow=false;
+    const rws=days.map(d=>{
+      const e=(dsrEntries||{})[d];
+      const dayTx=live.filter(t=>t.date===d);
+      const sales=dayTx.filter(t=>t.type==='sale');
+      const saleSum=sales.reduce((s,t)=>s+(Number(t.amount)||0),0);
+      if(!e && saleSum<0.005) return '';
+      anyRow=true;
+      const dsrTagged=sales.filter(t=>String(t.note||'').startsWith(DSR_TAG)).reduce((s,t)=>s+(Number(t.amount)||0),0);
+      const manualSales=round2(saleSum-dsrTagged);
+      const vatAdj=dayTx.filter(t=>t.type==='dsr_adjustment'&&(t.coaId==='l2100'||t.category==='VAT Payable')).reduce((s,t)=>s+(Number(t.amount)||0),0);
+      const mContra=dayTx.filter(t=>(t.type==='sale'||t.type==='deposit')&&(CONTRA_ALL.has(t.coaId)||CONTRA_ALL.has(t.category))).reduce((s,t)=>s+(Number(t.amount)||0),0);
+      const ledgerNet=round2(saleSum-vatAdj-mContra);
+      const flags=[];
+      let vatable=null;
+      if(e){
+        const tNet=(num(e.nGross)-num(e.nDisc)-num(e.nSC)-num(e.nRefund))+(num(e.lGross)-num(e.lDisc)-num(e.lSC)-num(e.lRefund));
+        const tVAT=num(e.nVAT)+num(e.lVAT);
+        vatable=round2(tNet-tVAT);
+        const catSum=num(e.nFood)+num(e.lFood)+num(e.nAlc)+num(e.lAlc)+num(e.nBev)+num(e.lBev);
+        if(Math.abs(catSum-tNet)>0.01) flags.push(`entry variance ${fmt(round2(catSum-tNet))} (Food+Alc+Bev ≠ Net Sales)`);
+        if(!e.posted && dsrTagged<0.005) flags.push('NOT POSTED — in DSR page, not in Pulse');
+        if(tVAT>0.005 && vatAdj<0.005 && dsrTagged>0.005) flags.push('VAT row missing in ledger');
+      }else{
+        flags.push('no DSR entry — sales are manual/backfill');
+      }
+      if(manualSales>0.005) flags.push(`non-DSR sale txs ${fmt(manualSales)} (not on the DSR page)`);
+      if(vatable!==null) sumVatable+=vatable;
+      sumLedger+=ledgerNet;
+      const delta=vatable===null?null:round2(ledgerNet-vatable);
+      const dColor=delta===null?'var(--muted2)':Math.abs(delta)<=1?'var(--green)':'var(--red)';
+      return `<tr>
+        <td style="font-size:.76rem;white-space:nowrap">${fmtDate(d)}</td>
+        <td class="mono" style="text-align:right;font-size:.76rem">${vatable===null?'—':fmt(vatable)}</td>
+        <td class="mono" style="text-align:right;font-size:.76rem">${fmt(ledgerNet)}</td>
+        <td class="mono" style="text-align:right;font-size:.76rem;color:${dColor}">${delta===null?'—':(delta>0?'+':'')+fmt(delta)}</td>
+        <td style="font-size:.7rem;color:${flags.length?'var(--amber)':'var(--green)'}">${flags.length?flags.join(' · '):'✓ ties'}</td>
+      </tr>`;
+    }).join('');
+    if(!anyRow) return '';
+    const totDelta=round2(sumLedger-sumVatable);
+    return `<details class="card-flush" style="margin-bottom:12px"><summary style="padding:9px 13px;cursor:pointer;font-size:.8rem;font-weight:600">🔍 Reconcile vs DSR — ${cols[0].label} <span style="font-weight:400;color:${Math.abs(totDelta)<=1?'var(--green)':'var(--red)'}">(Δ ${totDelta>0?'+':''}${fmt(totDelta)})</span></summary>
+      <table><thead><tr><th>Day</th><th style="text-align:right">DSR VATable</th><th style="text-align:right">Pulse net</th><th style="text-align:right">Δ</th><th>Why</th></tr></thead><tbody>${rws}</tbody>
+      <tfoot><tr style="font-weight:700;background:var(--bg3)"><td>Total</td><td class="mono" style="text-align:right">${fmt(round2(sumVatable))}</td><td class="mono" style="text-align:right">${fmt(round2(sumLedger))}</td><td class="mono" style="text-align:right;color:${Math.abs(totDelta)<=1?'var(--green)':'var(--red)'}">${totDelta>0?'+':''}${fmt(totDelta)}</td><td style="font-size:.7rem;color:var(--muted2)">compare against the DSR page's VATable Sales line, not "Net Sales" (that one still contains VAT)</td></tr></tfoot></table></details>`;
+  })();
   const headCols=cols.map(cl=>`<th style="text-align:right">${cl.label}</th>`).join('');
   /* Staff-spend rows — PESO amounts, visible to all roles (user decision:
      these are monitored against a budget, not a ratio, and reveal no rates).
@@ -12283,6 +12359,7 @@ function pgPulse(){
   <div class="card-flush" style="margin-bottom:12px">
     <table><thead><tr><th>Staff Spend</th>${headCols}<th style="text-align:right">Monthly Budget</th><th>Note (month vs budget)</th></tr></thead><tbody>${spendRows}</tbody></table>
   </div>
+  ${reconPanel}
   <div style="font-size:.72rem;color:var(--muted2);line-height:1.5">${customActive
     ? `Showing ${fmtDate(cf)} – ${fmtDate(ct)} · net sales in range ${fmt(data[0].totalSales)}.`
     : `Week starts ${fmtDate(ws)} · month from ${fmtDate(ms)} · net sales this week ${fmt(data[0].totalSales)} · this month ${fmt(data[1].totalSales)}.`}<br>All denominators are NET of Output VAT (discounts/SC/refunds are already excluded from the DSR's category figures) — same basis as the DSR's "VATable Sales" and the dashboard's Net Sales, so the numbers tie. Counts POSTED days only — an entered-but-unposted DSR isn't included yet. Only as fresh as the logging: post the DSR and log expenses with the right category same-day.</div>`;
