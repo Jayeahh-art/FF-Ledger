@@ -12132,6 +12132,11 @@ function pgPulse(){
   const BEV_C=new Set(['c5010','c5020','Non-Alcoholic Beverage COGS','Alcohol COGS']);
   const CONS_C=new Set(['c5040','Packaging & Takeout Supplies']);
   const sumTx=(type,from,to,ids)=>live.filter(t=>t.type===type&&t.date>=from&&t.date<=to&&(!ids||ids.has(t.coaId)||ids.has(t.category))).reduce((s,t)=>s+(Number(t.amount)||0),0);
+  /* Total COGS matches by COA TYPE (every cogs account, incl. merchandise and
+     any user-added ones) — dynamic so it tracks the dashboard's notion of
+     COGS instead of a hardcoded id list that goes stale. */
+  const COGS_ALL=new Set();
+  (coa||[]).forEach(x=>{ if(x&&x.type==='cogs'){ COGS_ALL.add(x.id); COGS_ALL.add(x.name); } });
   /* Labor = shift-based day costs (same engine as the Labor page), accrual —
      counts worked shifts whether or not payroll has been finalized. */
   const laborFor=(from,to)=>{const seen={};let sum=0;(shifts||[]).forEach(s=>{if(!s||!s.date||seen[s.date]||s.date<from||s.date>to)return;seen[s.date]=true;sum+=dayLaborCostFromShifts(s.date)||0;});return sum;};
@@ -12140,19 +12145,24 @@ function pgPulse(){
     const foodS=sumTx('sale',from,to,FOOD_S), bevS=sumTx('sale',from,to,BEV_S);
     const foodC=sumTx('expense',from,to,FOOD_C), bevC=sumTx('expense',from,to,BEV_C);
     const consC=sumTx('expense',from,to,CONS_C), laborC=laborFor(from,to);
+    const cogsC=sumTx('expense',from,to,COGS_ALL);
     return {
       totalSales,
       food:  {pct: foodS>0?foodC/foodS*100:null,           cost:foodC,  base:foodS},
       bev:   {pct: bevS>0?bevC/bevS*100:null,              cost:bevC,   base:bevS},
       cons:  {pct: totalSales>0?consC/totalSales*100:null, cost:consC,  base:totalSales},
-      labor: {pct: totalSales>0?laborC/totalSales*100:null,cost:laborC, base:totalSales}
+      /* Rollups — same denominator as labor so prime = cogs% + labor% exactly. */
+      cogs:  {pct: totalSales>0?cogsC/totalSales*100:null, cost:cogsC,  base:totalSales},
+      labor: {pct: totalSales>0?laborC/totalSales*100:null,cost:laborC, base:totalSales},
+      prime: {pct: totalSales>0?(cogsC+laborC)/totalSales*100:null, cost:cogsC+laborC, base:totalSales}
     };
   };
   const cols=customActive
     ? [{label:`${fmtDate(cf)} – ${fmtDate(ct)}`,from:cf,to:ct}]
     : [{label:'This Week',from:ws,to:td},{label:'This Month',from:ms,to:td}];
   const data=cols.map(cl=>calc(cl.from,cl.to));
-  const laborT=_getEffectiveTargets().labor;
+  const _eff=_getEffectiveTargets();
+  const laborT=_eff.labor, cogsT=_eff.cogs, primeT=_eff.prime;
   /* Band resolution: manager-set overrides (kpiTargets.pulseBands) win over
      the built-in defaults; 0/blank falls back. Amber is clamped to ≥ green so
      a mis-ordered pair can never make the amber band unreachable. */
@@ -12171,8 +12181,12 @@ function pgPulse(){
      notes:{green:'✓ on track', amber:'Creeping up — check pours & stock', red:'High — check pours, spillage, missing stock'}},
     {key:'cons', label:'Consumables', sub:'packaging & takeout ÷ total sales', green:cb.green, amber:cb.amber, editable:true,
      notes:{green:'✓ on track', amber:'Rising — check takeout packaging use', red:'High — packaging leaking out or over-ordered'}},
+    {key:'cogs', label:'Total COGS', sub:'all COGS purchases ÷ total sales', green:cogsT, amber:cogsT+5, editable:false,
+     notes:{green:'✓ on target', amber:'Above target — check the category rows above for the culprit', red:'Well above target — purchasing/waste problem, drill into the rows above'}},
     {key:'labor', label:'Labor Cost', sub:'shift wages ÷ total sales', green:laborT, amber:laborT+4, editable:false,
-     notes:{green:'✓ on target', amber:'Above target — review scheduling', red:'Well above target — trim or shorten shifts'}}
+     notes:{green:'✓ on target', amber:'Above target — review scheduling', red:'Well above target — trim or shorten shifts'}},
+    {key:'prime', label:'Prime Cost', sub:'COGS + labor ÷ total sales', green:primeT, amber:primeT+5, editable:false,
+     notes:{green:'✓ on target', amber:'Above target — margin is tightening', red:'Well above target — margin squeeze, act on COGS or labor now'}}
   ];
   /* Inline band editor (manager only): green ceiling + amber ceiling per KPI.
      Labor shows its source instead — it's owned by Weekly Check / monthly
